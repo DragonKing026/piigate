@@ -520,6 +520,29 @@ class TestGate(unittest.TestCase):
         )
 
 
+class TestLinkHook(unittest.TestCase):
+    """SessionStart hook: ~/.local/bin/piigate → bin/piigate of the INSTALLED plugin copy only."""
+
+    def run_link(self, root: Path, home: Path) -> None:
+        subprocess.run(["bash", str(root / "hooks" / "link.sh")], env={**os.environ, "HOME": str(home)}, check=True, timeout=30)
+
+    def test_link_only_from_installed_copy(self):
+        home = TMP / "link-home"
+        (home / ".local/bin").mkdir(parents=True, exist_ok=True)
+        link = home / ".local/bin/piigate"
+        self.run_link(ROOT, home)  # development checkout (--plugin-dir): no link
+        self.assertFalse(link.exists() or link.is_symlink())
+        installed = home / ".claude/plugins/cache/piigate/piigate/1.0.0"
+        shutil.copytree(ROOT / "hooks", installed / "hooks", dirs_exist_ok=True)
+        shutil.copytree(ROOT / "bin", installed / "bin", dirs_exist_ok=True)
+        self.run_link(installed, home)
+        self.assertEqual(os.readlink(link), str(installed / "bin/piigate"))
+        link.unlink()
+        link.write_text("mine\n")  # a regular file the user put there is never overwritten
+        self.run_link(installed, home)
+        self.assertEqual(link.read_text(), "mine\n")
+
+
 class TestProtectedFiles(unittest.TestCase):
     def test_engine_socket_directory_protected(self):
         """A model must not bind its own engine socket (it could answer "nothing found" to every analysis)."""
