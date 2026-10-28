@@ -122,6 +122,42 @@ def _mcp_blocks(response) -> list:
     return [{"type": "text", "text": json.dumps(response, ensure_ascii=False)}]
 
 
+ENCODED_RUN = re.compile(
+    r"(?:=[0-9A-F]{2}){2,}"  # quoted-printable bytes (UTF-8 letters: =C5=82)
+    r"|[A-Za-z0-9+/]{40,}={0,2}"  # base64
+    r"|(?:%[0-9A-Fa-f]{2}){2,}"  # percent-encoding
+)
+
+
+def _filtered_mail_block(t: str, cfg: dict, pseudonym_map) -> tuple[str, dict[str, int]]:
+    """One mail MCP text block through the filter. A raw RFC 2822 source (the whole block, or a JSON field such as
+    `rawSource`) is rendered exactly like `piigate_show` of an .eml: decoded body, attachment list without content.
+    Quoted-printable (`=C5=82`) and base64 would otherwise hide names from the rules and NER, and the same values get
+    the same pseudonyms in both tools."""
+    from piigate import files, text
+
+    def show(raw: str) -> str:
+        return files.describe_data("message.eml", files.raw_mail_bytes(raw), cfg, source="mail", pseudonym_map=pseudonym_map)
+
+    if files.looks_like_raw_mail(t):
+        return show(t), {}
+    try:
+        parsed = json.loads(t)
+    except ValueError:
+        parsed = None
+    raw = [k for k, v in parsed.items() if isinstance(v, str) and files.looks_like_raw_mail(v)] if isinstance(parsed, dict) else []
+    if not raw:
+        return text.filter_text(t, cfg, source="mail", pseudonym_map=pseudonym_map)
+    rest = {k: v for k, v in parsed.items() if k not in raw}
+    head, counts = text.filter_text(json.dumps(rest, ensure_ascii=False), cfg, source="mail", pseudonym_map=pseudonym_map)
+    return head + "\n\n" + "\n".join(show(parsed[k]) for k in raw), counts
+
+
+def _hide_encoded(t: str) -> str:
+    """Last line of defence: encoded runs left after decoding could carry data past the filter — hidden."""
+    return ENCODED_RUN.sub("[encoded content hidden by piigate]", t)
+
+
 def output_filter(data: dict):
     from piigate import gate as gate_mod
     from piigate import sensors, config, text
@@ -158,7 +194,8 @@ def output_filter(data: dict):
         overall: dict[str, int] = {}
         for b in _mcp_blocks(resp):
             if isinstance(b, dict) and b.get("type") == "text":
-                t, counts = text.filter_text(str(b.get("text", "")), cfg, source="mail", pseudonym_map=pseudonym_map)
+                t, counts = _filtered_mail_block(str(b.get("text", "")), cfg, pseudonym_map)
+                t = _hide_encoded(t)
                 for k, v in counts.items():
                     overall[k] = overall.get(k, 0) + v
                 blocks.append({"type": "text", "text": t})

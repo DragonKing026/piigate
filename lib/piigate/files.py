@@ -75,6 +75,23 @@ def mail(data: bytes) -> tuple[tuple[list[tuple[str, str]], str], list[tuple[str
     return (headers, t), attachments
 
 
+RFC2822 = re.compile(r"(?im)^(?:mime-version|content-type|content-transfer-encoding|received|message-id):")
+
+
+def looks_like_raw_mail(t: str) -> bool:
+    """The RFC 2822 source of a message (e.g. a mail MCP server's `rawSource`): headers, then a blank line."""
+    head = t[:20000].split("\n\n", 1)[0].split("\r\n\r\n", 1)[0]
+    return bool(RFC2822.search(head))
+
+
+def raw_mail_bytes(t: str) -> bytes:
+    """Mail MCP servers pass the RFC 2822 source as a Latin-1 string (bytes 1:1); a decoded string falls back to UTF-8."""
+    try:
+        return t.encode("latin-1")
+    except UnicodeEncodeError:
+        return t.encode("utf-8")
+
+
 def _attachment_forbidden(name: str, data: bytes) -> set[str]:
     """Words from the cells of a spreadsheet attachment — a surname in the file name (Recepty_Kowalska.xlsx) is data too."""
     ext = Path(name).suffix.casefold()

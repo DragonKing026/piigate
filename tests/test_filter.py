@@ -74,8 +74,23 @@ PRESIDIO = PRESIDIO_HEALTH.startswith("running")
 PRESIDIO_SKIP = f"Presidio is not reachable at {PRESIDIO_URL} ({PRESIDIO_HEALTH})"
 
 
+def encoded_forms(value: str) -> set[str]:
+    """A value as it can appear inside raw mail or a URL: quoted-printable, base64 (UTF-8), percent-encoding."""
+    import base64
+    import quopri
+    import urllib.parse
+
+    raw = value.encode("utf-8")
+    forms = {value, urllib.parse.quote(value)}
+    forms.add(quopri.encodestring(raw).decode("ascii").replace("=\n", ""))
+    if len(raw) >= 6:  # shorter base64 runs are too likely to occur by chance
+        forms.add(base64.b64encode(raw).decode("ascii").rstrip("="))
+    return forms
+
+
 def leaks(text: str) -> list[str]:
-    return [w for w in VALUES if w in text]
+    """Values found in the text — also in encoded form (a model decodes quoted-printable or base64 easily)."""
+    return [w for w in VALUES if any(f in text for f in encoded_forms(w))]
 
 
 def hook(mode: str, data: dict, env: dict | None = None) -> dict | None:
@@ -237,6 +252,31 @@ class TestText(unittest.TestCase):
         self.assertEqual(leaks(result_text), [])
         self.assertEqual(leaks(json.dumps(result["hookSpecificOutput"]["updatedToolOutput"])), [])
         self.assertIn("PERSON_", result_text)
+
+    def test_hook_mail_raw_source(self):
+        """getMessage with rawSource: the RFC 2822 source (quoted-printable body, base64 attachments) is decoded
+        before filtering — encoded Polish letters (=C5=82) would otherwise hide names from the rules and NER."""
+        raw = FILES["eml"].read_bytes().decode("latin-1")
+        data = mcp_mail("")
+        data["tool_input"] = {"messageId": "1", "rawSource": True}
+        data["tool_response"] = [{"type": "text", "text": json.dumps({"id": "1", "rawSource": raw})}]
+        result = hook("filter", data)
+        out = result["hookSpecificOutput"]["updatedToolOutput"]
+        result_text = json.dumps(out, ensure_ascii=False)
+        self.assertEqual(leaks(result_text), [])
+        self.assertEqual(leaks(json.dumps(out)), [])
+        self.assertIn("PERSON_", result_text)
+        self.assertNotIn("Content-Transfer-Encoding: base64", result_text)  # attachments are listed, not passed on
+        self.assertIn("--attachment", result_text)  # … with the way to show them through the filter
+
+    def test_hook_mail_encoded_backstop(self):
+        """Encoded runs the decoder did not catch (a quoted-printable body pasted as plain text) are hidden."""
+        p = dt.PATIENTS[1]
+        import quopri
+
+        body = quopri.encodestring(f"Pacjent {p['first_name']} {p['surname']} mieszka: {p['address']}.\n".encode()).decode()
+        result = hook("filter", mcp_mail(body))
+        self.assertEqual(leaks(json.dumps(result["hookSpecificOutput"]["updatedToolOutput"], ensure_ascii=False)), [])
 
     def test_cli_list_file_names_and_number(self):
         directory = FILES["xlsx"].parent
