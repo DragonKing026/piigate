@@ -1,0 +1,11 @@
+{
+  "_description": "Project filters for piigate: copy to <project>/.claude/piigate.json. Patterns only, never real values.",
+  "patterns": [
+    {"pattern": "\\bPAT-\\d{6}\\b", "label": "PATIENT_ID", "description": "patient number in the system"},
+    {"pattern": "\\bORD/\\d{4}/\\d{5}\\b", "label": "ORDER_NUMBER", "description": "order number linked to a person"}
+  ],
+  "sensitive_columns": ["first_name", "last_name", "pesel", "phone", "email", "street"],
+  "directories": ["var/exports"],
+  "tables": ["patient", "patient_address", "customer"],
+  "extensions": [".bak"]
+}

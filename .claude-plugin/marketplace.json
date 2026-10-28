@@ -1,0 +1,12 @@
+{
+  "name": "piigate",
+  "owner": {"name": "Artur Ograbek"},
+  "description": "piigate — personal data (PII/PHI) gate and filter for Claude Code.",
+  "plugins": [
+    {
+      "name": "piigate",
+      "source": "./",
+      "description": "Gate, output filter, pseudonyms and MCP tools that keep personal data (PII/PHI) out of Claude's context."
+    }
+  ]
+}

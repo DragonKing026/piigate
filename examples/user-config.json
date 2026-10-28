@@ -1,0 +1,28 @@
+{
+  "_description": "Example ~/.config/piigate/config.json — copy, adapt, never commit your real one. Lists replace the defaults, so repeat the default entries you want to keep.",
+  "sources": {
+    "directories": [
+      "~/Downloads/thunderbird.tmp",
+      "{documents}/piigate/Sensitive-data",
+      "~/clients/exports"
+    ],
+    "commands": [
+      "\\bssh\\b.*\\b(dbal:run-sql|doctrine:query(:sql|:dql)?)\\b",
+      "\\bssh\\b.*\\b(mysql|mariadb|psql)\\b",
+      "\\bssh\\b.*\\bwp\\s+db\\s+query\\b"
+    ],
+    "exempt_directories": ["~/projects/demo-shop/fixtures"]
+  },
+  "engine": {"mode": "container", "container_url": "http://127.0.0.1:8719"},
+  "ollama": {"enabled": true, "model": "qwen2.5:7b-instruct", "sources": ["mail"]},
+  "analysis": {"agent_command": ["my-local-agent", "--model", "gemma4:12b"]},
+  "unfiltered_tools": [
+    {
+      "name": "local-agent",
+      "commands": ["my-local-agent"],
+      "mcp_tools": "^mcp__.*my-local-agent.*__",
+      "dir_option": "--dir",
+      "dir_param": "dir"
+    }
+  ]
+}
