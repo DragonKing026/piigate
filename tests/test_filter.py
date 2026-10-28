@@ -2310,6 +2310,67 @@ class TestFalseAlarms(unittest.TestCase):
             with self.subTest(command):
                 self.assertIsNotNone(b.bash(command))
 
+    def test_quoted_heredoc_text_is_not_a_pattern(self):
+        """Issue #1: `name.*` in the body of a heredoc fed to a non-shell is text (the shell expands no globs there, and
+        no substitutions with a quoted delimiter) — not a pattern matching every data extension."""
+        for where in (self.public, self.phi):
+            b = self.gate(where)
+            for command in (
+                "python3 - <<'EOF'\nprint('zgoda.*')\nEOF",
+                "cd x && python3 - <<'EOF'\ns = s.replace('a', \"only `kanal.*` and broadcast\")\nEOF",
+                "gh issue create --title t --body-file - <<'EOF'\nonly `kanal.*` and `zgoda.*` here\nEOF",
+                'python3 - <<"EOF"\nevents = ["kanal.*", "zgoda.*"]\nEOF',
+            ):
+                with self.subTest(where=where.name, command=command):
+                    self.assertIsNone(b.bash(command))
+        b = self.gate(self.phi)
+        for command in (  # still denied: a shell runs the body, a real glob, a data file named in the body
+            "bash <<'EOF'\ncat people.*\nEOF",
+            "cat people.* <<'EOF'\npeople.*\nEOF",
+            "python3 - <<'EOF'\nprint(open('people.csv').read())\nEOF",
+            "python3 - <<EOF\nprint(\"`cat people.*`\")\nEOF",
+            "cat *.*",
+        ):
+            with self.subTest(command):
+                self.assertIsNotNone(b.bash(command))
+
+    def test_pattern_under_plugin_cache(self):
+        """Issue #1: a pattern under the plugin cache is denied only when it can reach piigate's own copy, not for
+        other plugins' files (`cache/*/superpowers/…`)."""
+        cache = self.base / "plugins" / "cache"
+        own = cache / "piigate" / "piigate" / "1.0.3"
+        other = cache / "official" / "superpowers" / "5.0.0" / "skills" / "brainstorming"
+        for d in (own, other):
+            d.mkdir(parents=True)
+        saved = os.environ.get("CLAUDE_PLUGIN_ROOT")
+        os.environ["CLAUDE_PLUGIN_ROOT"] = str(own)
+        try:
+            b = self.gate(self.public)
+            for command in (
+                f"ls -d {cache}/*/superpowers/*/skills/brainstorming",
+                f"ls {cache}/official/*/5.0.0",
+                f"bash {other}/start-server.sh",
+                f"ls {cache}",
+            ):
+                with self.subTest(command):
+                    self.assertIsNone(b.bash(command))
+            for command in (  # still denied: the pattern can name piigate's copy or a directory above it
+                f"ls {cache}/*/piigate",
+                f"cat {cache}/*/*/*/config.json",
+                f"cat {cache}/pii*/*/*/config.json",
+                f"cat {cache}/**/config.json",
+                f"cat {cache}/official/../*/piigate/1.0.3/config.json",
+                f"grep -r x {cache}/*",
+                f"cat {own}/config.json",
+            ):
+                with self.subTest(command):
+                    self.assertIsNotNone(b.bash(command))
+        finally:
+            if saved is None:
+                os.environ.pop("CLAUDE_PLUGIN_ROOT", None)
+            else:
+                os.environ["CLAUDE_PLUGIN_ROOT"] = saved
+
     def test_relative_paths_against_tool_cwd(self):
         """The hook resolves relative paths against the tool call's cwd, not its own working directory."""
         def bash(command: str) -> dict | None:

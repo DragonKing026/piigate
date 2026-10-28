@@ -661,12 +661,15 @@ class Gate:
             return False
         return any(os.path.isdir(k) and not (searching and self._hidden_by_gitignore(k, anywhere=True)) for k in candidates)
 
-    def path_kind(self, s: str, *, ancestor: bool = False, content: bool = True, searching: bool = False) -> str | None:
+    def path_kind(
+        self, s: str, *, ancestor: bool = False, content: bool = True, searching: bool = False, protected: bool = True
+    ) -> str | None:
         """'protected' | 'sensitive' | 'extension' | None; ancestor=True — also a directory containing a sensitive one.
         content=True: a file with an extension whose content the rules found clean is not 'extension'.
-        searching=True (Grep): in-project data directories hidden by `.gitignore` do not make an ancestor sensitive."""
+        searching=True (Grep): in-project data directories hidden by `.gitignore` do not make an ancestor sensitive.
+        protected=False: protected directories are not checked (a pattern that cannot reach them)."""
         p = _path(s, self.cwd)
-        if _inside(p, self.protected) or (ancestor and _ancestor(p, self.protected)):
+        if protected and (_inside(p, self.protected) or (ancestor and _ancestor(p, self.protected))):
             return "protected"
         if (
             _inside(p, self.sensitive)
@@ -798,6 +801,38 @@ class Gate:
                 if not (words and Path(words[0]).name in LAUNCHERS):
                     end.append(m.group(2))
         return "\n".join(result)
+
+    def _heredoc_text(self, command: str) -> tuple[str, set[str]]:
+        """Heredoc bodies read by a non-shell (`python3 - <<'X'`, `gh … --body-file - <<X`): the shell expands no globs
+        there, and nothing at all with a quoted delimiter. Returns the command without the quoted bodies (where
+        substitutions are looked for) and the tokens found only in the bodies (no glob — `name.*` is text). A body fed
+        to a shell or a launcher is a script — unchanged."""
+        outside: list[str] = []  # without quoted text bodies
+        shell: list[str] = []  # without any text bodies
+        body: list[str] = []
+        end: list[tuple[str, bool | None]] = []
+        for line in command.split("\n"):
+            if end and line.strip() != end[0][0] and end[0][1] is not None:
+                body.append(line)
+                if not end[0][1]:
+                    outside.append(line)  # unquoted delimiter: $(…) and `…` still run
+                continue
+            if end and line.strip() == end[0][0]:
+                end.pop(0)
+            elif not end:
+                for m in HEREDOC.finditer(line):
+                    stage = re.split(r"[|;&()]", line[: m.start()])[-1].split()
+                    words = [s for s in stage if s not in SHELL_KEYWORDS and not re.match(r"^\w+=", s)]
+                    script = not words or Path(words[0]).name in LAUNCHERS
+                    # (delimiter, text body: quoted delimiter or not; None — a script)
+                    end.append((m.group(2), None if script else bool(m.group(1))))
+            outside.append(line)
+            shell.append(line)
+        if end or not body:
+            return command, set()  # an unterminated heredoc — unchanged
+        inner = self._tokens("\n".join(body)) or "\n".join(body).split()
+        rest = self._tokens("\n".join(shell)) or "\n".join(shell).split()
+        return "\n".join(outside), set(inner) - set(rest)
 
     @staticmethod
     def _substitutions(text: str) -> list[str]:
@@ -967,7 +1002,9 @@ class Gate:
         except ValueError:
             return None
 
-    def _token_kind(self, t: str, recursion: bool, content: bool = True) -> tuple[str, str] | None:
+    def _token_kind(self, t: str, recursion: bool, content: bool = True, literal: bool = False) -> tuple[str, str] | None:
+        """literal=True: the token comes from a heredoc body read by a non-shell — the shell expands no globs there, so
+        `name.*` is text, not a pattern for every extension (a fixed data extension `*.csv` still counts)."""
         candidates = [t]
         if "=" in t:  # --file=…, VAR=… — the whole token only when it is an existing path (otherwise a missing file = deny)
             candidates = ([t] if os.path.lexists(_path(t, self.cwd)) else []) + [t.split("=", 1)[1]]
@@ -981,7 +1018,12 @@ class Gate:
                 if re.search(r"[*?\[]", k):  # a pattern: fixed prefix and extension
                     name_prefix = re.split(r"[*?\[]", k, maxsplit=1)[0]
                     directory = name_prefix if name_prefix.endswith("/") else (os.path.dirname(name_prefix) or ".")
-                    r = self.path_kind(directory, ancestor=recursion or "/" in k[len(name_prefix) :])
+                    ancestor = recursion or "/" in k[len(name_prefix) :]
+                    r = self.path_kind(directory, ancestor=ancestor)
+                    rest = k[len(directory) :].lstrip("/") if "/" in name_prefix else k
+                    if r == "protected" and not self._pattern_reaches(directory, rest, self.protected):
+                        # `cache/*/superpowers/…` under the plugin cache does not name piigate's own copy
+                        r = self.path_kind(directory, ancestor=ancestor, protected=False)
                     if not r and not recursion and "/" not in k[len(name_prefix) :]:
                         # a pattern without recursion only reaches entries directly in the directory: `ls *.md` in a
                         # repo with a sensitive directory deeper down passes, `cat ~/Sens*` does not (project dirs in a repo)
@@ -990,7 +1032,7 @@ class Gate:
                         return r, directory
                     if (
                         re.search(r"\.[\w*?\[\]]*$", k)
-                        and (k.casefold().endswith(self.extensions) or self._pattern_hits_extension(k))
+                        and (k.casefold().endswith(self.extensions) or (not literal and self._pattern_hits_extension(k)))
                         and not _inside(_path(directory, self.cwd), self.system)
                         and not self.is_public_tree(directory)
                     ):
@@ -1000,6 +1042,22 @@ class Gate:
                 if r:
                     return r, k
         return None
+
+    def _pattern_reaches(self, directory: str, rest: str, directories: list[str]) -> bool:
+        """Whether the pattern `rest` (relative to `directory`) can name one of `directories`, an entry inside it or a
+        directory above it — compared segment by segment, so `cache/*/superpowers/…` does not reach cache/piigate/….
+        `**`, `.` and `..` reach everything (when in doubt — reaches)."""
+        base = _path(directory, self.cwd)
+        segments = [s for s in rest.split("/") if s]
+        for k in directories:
+            if _inside(base, [k]):
+                return True
+            if not _inside(k, [base]):
+                continue
+            pairs = list(zip(os.path.relpath(k, base).split(os.sep), segments))
+            if any("**" in s or s in (".", "..") for _, s in pairs) or all(fnmatch.fnmatchcase(p, s) for p, s in pairs):
+                return True
+        return False
 
     def _pattern_hits_dir(self, directory: str, pattern: str) -> str | None:
         """A protected/sensitive directory lying directly in `directory` whose name the pattern matches (or lying deeper
@@ -1160,6 +1218,7 @@ class Gate:
         if re.search(r"PIIGATE_\w+|XDG_DOCUMENTS_DIR", text):
             return "protected", "PIIGATE_* / XDG_DOCUMENTS_DIR variables (they change where the filter looks)"
         stages = self._strip_prefixes(self._stages_loose(tokens))
+        outside, literal = self._heredoc_text(text)
         kinds: dict[str, str] = {}
         dests = [self._write_targets(stage) for stage in stages]
         # paths the command reads (everything except write targets) — a write target read in the same command
@@ -1197,7 +1256,7 @@ class Gate:
                     if not r and _ancestor(_path(t, self.cwd), self.protected):
                         r = ("protected", t)
                 else:
-                    r = self._token_kind(t, recursion, content=i not in c)
+                    r = self._token_kind(t, recursion, content=i not in c, literal=t in literal)
                 if r and r[0] == "extension" and i in c and _path(r[1], self.cwd) not in read_paths:
                     continue  # write only — no content comes back to the model
                 if r:
@@ -1211,7 +1270,7 @@ class Gate:
             if w.search(queries_text):
                 kinds.setdefault("command", "a database query on a server")
         # substitutions inside quotes (`echo "$(cat x.csv)"`, backticks) stay one token above — checked as commands
-        for inner in self._substitutions(text):
+        for inner in self._substitutions(outside):
             if inner.strip() and inner.strip() != text.strip():
                 r, w = self._touches(inner, self._tokens(inner) or inner.split())
                 if r:
