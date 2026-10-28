@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# piigate — sensitive data through the filter (piigate plugin). Usage: piigate help, the plugin's README.md.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+exec python3 -I "$ROOT/lib/cli.py" "$@"

@@ -1,0 +1,102 @@
+{
+  "_description": "piigate defaults. Your own changes go to ~/.config/piigate/config.json (merged with this file; lists replace). {documents} is the XDG documents directory (XDG_DOCUMENTS_DIR, else ~/Documents). Fields: README.md.",
+  "sources": {
+    "directories": [
+      "~/Downloads/thunderbird.tmp",
+      "{documents}/piigate/Sensitive-data"
+    ],
+    "extensions": [
+      ".eml", ".msg", ".mbox",
+      ".csv", ".tsv", ".xlsx", ".xlsm", ".xls", ".ods",
+      ".pdf", ".docx", ".doc", ".odt", ".rtf",
+      ".sql", ".dump"
+    ],
+    "exempt_directories": [],
+    "only_phi_projects": true,
+    "non_public": ["~/Downloads", "~/Pobrane", "/tmp", "/var/tmp", "/dev/shm"],
+    "public_repo_min_age_h": 24,
+    "system_directories": ["/usr", "/lib", "/lib64", "/bin", "/sbin"],
+    "content_check": {"enabled": true, "limit_mb": 10, "max_files": 50},
+    "commands": [
+      "\\bssh\\b.*\\b(dbal:run-sql|doctrine:query(:sql|:dql)?)\\b",
+      "\\bssh\\b.*\\b(mysql|mariadb|psql)\\b"
+    ],
+    "commands_without_output": [
+      "cp", "mv", "scp", "rsync", "mkdir", "rm", "rmdir", "touch", "chmod", "sha256sum"
+    ]
+  },
+  "protected": [
+    "~/.local/share/piigate",
+    "~/.config/piigate"
+  ],
+  "mail_mcp": [
+    "^mcp__.*thunderbird.*__"
+  ],
+  "unfiltered_tools": [],
+  "tables": {
+    "sample_rows": 0,
+    "plain_columns": []
+  },
+  "engine": {
+    "_description": "NER engine (Presidio Analyzer + spaCy). local: in memory of the piigate MCP server (models downloaded on first use, sha256-checked); hooks reach it through a private Unix socket. container: Presidio REST API at container_url (loopback only, see docker/).",
+    "mode": "local",
+    "languages": ["pl", "en"],
+    "container_url": "http://127.0.0.1:8719",
+    "threshold": 0.3,
+    "timeout_s": 150
+  },
+  "text": {
+    "auto_english": true,
+    "dates": "all",
+    "drugs": true,
+    "organizations": true,
+    "plain_words": [
+      "Ollama", "Ollamy", "Ollamie", "Ollamę", "Ollamą", "Anthropic",
+      "Presidio", "Thunderbird", "Thunderbirda", "PHI", "PII", "RODO", "MCP", "PESEL", "NIP", "REGON", "KRS"
+    ],
+    "labels": {
+      "PERSON": "PERSON",
+      "ADDRESS": "ADDRESS",
+      "PHONE": "PHONE",
+      "EMAIL": "EMAIL",
+      "PESEL": "PESEL",
+      "DATE": "DATE",
+      "PRESCRIPTION": "PRESCRIPTION",
+      "NIP": "NIP",
+      "ACCOUNT": "ACCOUNT",
+      "CARD": "CARD",
+      "DOCUMENT": "DOCUMENT",
+      "NUMBER": "NUMBER",
+      "ORG": "ORG",
+      "DRUG": "DRUG",
+      "IP": "IP"
+    }
+  },
+  "ollama": {
+    "enabled": false,
+    "url": "http://127.0.0.1:11434",
+    "model": "qwen2.5:7b-instruct",
+    "sources": ["mail", "files"],
+    "timeout_s": 240
+  },
+  "project_directories": {
+    "_description": "In the project directory (session directory, git root): <project>/<sensitive> is a sensitive directory, <project>/<anonymized> the copy directory; both get a .gitignore with '*'. An empty name disables it.",
+    "sensitive": "Sensitive-data",
+    "anonymized": "Anonymized-data"
+  },
+  "analysis": {
+    "agent_command": null,
+    "timeout_s": 900
+  },
+  "anonymization": {
+    "directory": "{documents}/piigate/Anonymized-data",
+    "mail_mcp": null,
+    "model_rows": 200,
+    "model_chars": 80000
+  },
+  "sensors": {
+    "pesel": true,
+    "account": true,
+    "card": true
+  }
+}

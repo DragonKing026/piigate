@@ -1,0 +1,78 @@
+# Presidio Analyzer configuration for piigate: Polish (pl_core_news_lg) + English (en_core_web_lg).
+# Presidio provides NER (people, places, organizations, dates) and a few generic patterns; Polish rules with checksums
+# (PESEL, NIP, REGON, phone, postcode, prescription, ID documents) run in piigate itself, also without this engine.
+supported_languages:
+  - pl
+  - en
+default_score_threshold: 0
+
+nlp_configuration:
+  nlp_engine_name: spacy
+  models:
+    - lang_code: pl
+      model_name: pl_core_news_lg
+    - lang_code: en
+      model_name: en_core_web_lg
+  ner_model_configuration:
+    model_to_presidio_entity_mapping:
+      # pl_core_news_lg (NKJP): persName, placeName, geogName, orgName, date, time
+      persName: PERSON
+      placeName: LOCATION
+      geogName: LOCATION
+      orgName: ORGANIZATION
+      date: DATE_TIME
+      # en_core_web_lg (OntoNotes)
+      PER: PERSON
+      PERSON: PERSON
+      FAC: LOCATION
+      LOC: LOCATION
+      GPE: LOCATION
+      ORG: ORGANIZATION
+      DATE: DATE_TIME
+      NORP: NRP
+    low_confidence_score_multiplier: 0.4
+    low_score_entity_names: []
+    labels_to_ignore:
+      - time
+      - TIME
+      - CARDINAL
+      - EVENT
+      - LANGUAGE
+      - LAW
+      - MONEY
+      - ORDINAL
+      - PERCENT
+      - PRODUCT
+      - QUANTITY
+      - WORK_OF_ART
+
+recognizer_registry:
+  supported_languages:
+    - pl
+    - en
+  global_regex_flags: 26
+  recognizers:
+    - name: SpacyRecognizer
+      type: predefined
+      supported_languages: [pl, en]
+    - name: EmailRecognizer
+      type: predefined
+      supported_languages: [pl, en]
+    - name: PhoneRecognizer
+      type: predefined
+      supported_languages: [pl, en]
+    - name: IbanRecognizer
+      type: predefined
+      supported_languages: [pl, en]
+    - name: CreditCardRecognizer
+      type: predefined
+      supported_languages: [pl, en]
+    - name: IpRecognizer
+      type: predefined
+      supported_languages: [pl, en]
+    - name: DateRecognizer
+      type: predefined
+      supported_languages: [pl, en]
+    - name: PlPeselRecognizer
+      type: predefined
+      supported_languages: [pl]

@@ -1,0 +1,16 @@
+# Most common Polish first names (nominative); rules.py adds the inflected forms. Names separated by whitespace.
+Ada Adam Adela Adrian Adrianna Agata Agnieszka Aleksander Aleksandra Alicja Amelia Anastazja Andrzej Aneta Angelika Anita
+Anna Antoni Antonina Arkadiusz Artur Barbara Bartłomiej Bartosz Beata Benedykt Bernard Bogdan Bogdana Bogumiła Bogusław
+Bogusława Bolesław Bożena Bronisław Bronisława Cecylia Celina Czesław Czesława Damian Daniel Daniela Danuta Dariusz Daria
+Dawid Diana Dominik Dominika Dorota Edmund Edward Edyta Elżbieta Emil Emilia Emilian Ewa Ewelina Fabian Feliks Filip
+Franciszek Franciszka Gabriel Gabriela Genowefa Grażyna Grzegorz Halina Hanna Helena Henryk Henryka Hieronim Hubert Ignacy
+Igor Ilona Irena Ireneusz Iwona Izabela Jacek Jadwiga Jakub Jan Janina Janusz Jarosław Jerzy Joanna Jolanta Józef Józefa
+Julia Julian Julianna Juliusz Justyna Kacper Kamil Kamila Karina Karol Karolina Kazimiera Kazimierz Katarzyna Kinga Klaudia
+Konrad Konstanty Krystian Krystyna Krzysztof Ksawery Lech Lena Leokadia Leon Leszek Lidia Liliana Lucjan Ludwik Łucja Łukasz
+Maciej Magdalena Maja Malwina Małgorzata Marcel Marcin Marek Maria Marian Marianna Mariola Mariusz Marlena Marta Martyna
+Marzena Mateusz Maurycy Maksymilian Michał Michalina Mieczysław Mieczysława Mikołaj Milena Mirosław Mirosława Monika Natalia
+Natan Nikola Nikodem Norbert Oliwer Oliwia Olga Oskar Patrycja Patryk Paula Paulina Paweł Piotr Przemysław Rafał Regina
+Renata Robert Roman Romuald Ryszard Ryszarda Sabina Sandra Sebastian Seweryn Sławomir Sławomira Sonia Stanisław Stanisława
+Stefan Stefania Sylwester Sylwia Szymon Tadeusz Teodor Teresa Tomasz Urszula Wacław Waldemar Wanda Weronika Wiesław
+Wiesława Wiktor Wiktoria Wincenty Wioletta Wit Witold Władysław Władysława Włodzimierz Wojciech Zbigniew Zdzisław Zdzisława
+Zenobia Zenon Zofia Zuzanna Zygmunt Żaneta Bożydar Dobromir Jadwiga Lucyna Leonard Olaf Tymon Tymoteusz Wiesław Zenona

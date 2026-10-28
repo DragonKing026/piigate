@@ -1,0 +1,44 @@
+{
+  "description": "piigate: gate (denies direct reads of sensitive sources and unfiltered tools on them), output filter (mail MCP — pseudonyms; PESEL/account/card sensors in Bash/Read/Grep and unfiltered MCP tools) and a ~/.local/bin/piigate symlink to the current version (SessionStart). MCP tools are matched broadly; the hook returns at once, without output, for MCP tools not named in the configuration (mail_mcp, unfiltered_tools).",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^(Read|Grep|Glob|Bash|Edit|Write|NotebookEdit)$|^mcp__",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/run.sh",
+            "args": ["gate"],
+            "timeout": 30,
+            "onFailure": "block"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "^(Bash|Read|Grep)$|^mcp__",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/run.sh",
+            "args": ["filter"],
+            "timeout": 180
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/link.sh",
+            "args": [],
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
