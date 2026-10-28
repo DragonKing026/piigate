@@ -1,3 +1,5 @@
+<p align="center"><img src="logo.svg" width="112" alt="piigate logo"></p>
+
 # piigate
 
 **Keeps personal data (PII/PHI) out of Claude's context.** piigate is a [Claude Code](https://claude.com/claude-code)

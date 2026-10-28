@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <title>piigate</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0f766e"/>
+      <stop offset="1" stop-color="#1e3a8a"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#bg)"/>
+  <!-- shield: the gate in front of the agent's context -->
+  <path d="M128 40 L196 66 V122 C196 166 166 200 128 216 C90 200 60 166 60 122 V66 Z"
+        fill="#ffffff" fill-opacity="0.96"/>
+  <!-- a document line in clear, then redacted personal data -->
+  <rect x="88" y="90" width="80" height="12" rx="6" fill="#94a3b8"/>
+  <rect x="88" y="114" width="34" height="14" rx="3" fill="#0f172a"/>
+  <rect x="128" y="114" width="40" height="14" rx="3" fill="#0f172a"/>
+  <rect x="88" y="140" width="52" height="14" rx="3" fill="#0f172a"/>
+  <rect x="146" y="141" width="22" height="12" rx="6" fill="#94a3b8"/>
+  <!-- pseudonym tag -->
+  <rect x="98" y="166" width="60" height="18" rx="9" fill="#0f766e"/>
+  <circle cx="110" cy="175" r="4" fill="#ffffff"/>
+  <rect x="119" y="172" width="30" height="6" rx="3" fill="#ffffff"/>
+</svg>
