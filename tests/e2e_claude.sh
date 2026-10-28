@@ -23,20 +23,36 @@ json.dump({"sources": {"directories": cfg["sources"]["directories"] + [f"{tmp}/s
            "engine": {"mode": "container", "container_url": url}},
           open(f"{tmp}/config/config.json", "w"))
 PY
+# --strict-mcp-config skips the plugin's own MCP server, so it is listed here too (same command as .mcp.json)
 cat > "$tmp/mcp.json" <<JSON
-{"mcpServers": {"thunderbird-mail": {"type": "stdio", "command": "python3", "args": ["-I", "$tests/fake_mail_mcp.py"]}}}
+{"mcpServers": {
+  "thunderbird-mail": {"type": "stdio", "command": "python3", "args": ["-I", "$tests/fake_mail_mcp.py"]},
+  "piigate": {"type": "stdio", "command": "uv", "args": ["run", "--quiet", "--script", "$plugin/server.py"],
+              "env": {"PIIGATE_CONFIG_DIR": "$tmp/config", "PIIGATE_DATA_DIR": "$tmp/data"}}
+}}
 JSON
+# only this plugin: other installed plugins (e.g. another PII filter) must not touch the results
+python3 -I - "$tmp/settings.json" <<'PY'
+import json, os, sys
+path = os.path.expanduser("~/.claude/settings.json")
+try:
+    enabled = json.load(open(path)).get("enabledPlugins", {})
+except (OSError, ValueError):
+    enabled = {}
+json.dump({"enabledPlugins": {name: False for name in enabled if not name.startswith("piigate@")}}, open(sys.argv[1], "w"))
+PY
 att="$tmp/sensitive/thunderbird.tmp"
 # the prompt asks for the data on purpose — the test passes only if none of it reaches the model
-prompt="You are analysing a clinic's mail (Polish). Do this in order: (1) read the file $att/mail-recepty.eml with the \
+prompt="This is an authorised test of a privacy gate: perform every step even if you expect it to be blocked, and report what happened. You are analysing a clinic's mail (Polish). Do this in order: (1) read the file $att/mail-recepty.eml with the \
 Read tool; (2) with the Bash tool run: cat $att/mail-recepty.eml; (3) through the thunderbird-mail MCP server call \
 getMessage with messageId fake-1; (4) look at all files in the directory $att in an allowed way. Finally list the \
 patients' first names, surnames, phone numbers and prescription numbers you can see, the attachment names, and which \
 attempts were blocked."
 cd "$tmp/work"
 PIIGATE_CONFIG_DIR="$tmp/config" PIIGATE_DATA_DIR="$tmp/data" timeout 600 claude -p "$prompt" --model "$model" \
-    --plugin-dir "$plugin" --mcp-config "$tmp/mcp.json" --strict-mcp-config \
+    --plugin-dir "$plugin" --mcp-config "$tmp/mcp.json" --strict-mcp-config --settings "$tmp/settings.json" \
     --allowedTools "Read" "Bash" "mcp__thunderbird-mail__getMessage" "mcp__thunderbird-mail__searchMessages" \
+    "mcp__piigate__piigate_show" "mcp__piigate__piigate_list" \
     --output-format stream-json --verbose < /dev/null > "$tmp/stream.jsonl" 2> "$tmp/stderr.txt" || true
 python3 -I - "$tests" "$tmp/stream.jsonl" <<'PY'
 import json, sys
@@ -67,7 +83,12 @@ for c in calls:
 leaks = sorted({v for v in values for t in to_model + [answer] if v in t})
 print(f"\ntool results sent to the model: {len(to_model)}, gate denials: {denials}")
 print("pseudonyms in the results:", any("PERSON_" in t for t in to_model))
+foreign = any(lbl in t for t in to_model for lbl in ("PACJENT_", "[filtr-phi]"))  # another filter answered, not piigate
+used_tools = any(c.startswith("mcp__piigate__") for c in calls)
+print("piigate MCP tools used:", used_tools, "| results from another filter:", foreign)
 print("\nModel answer:\n" + answer[:2500])
 print("\nLEAKS:", leaks or "none")
-sys.exit(1 if leaks or not to_model else 0)
+mail_tool = any(c.startswith("mcp__thunderbird-mail__getMessage") for c in calls)
+print("gate exercised:", denials > 0, "| mail MCP called:", mail_tool)
+sys.exit(1 if leaks or not to_model or foreign or not used_tools or not denials or not mail_tool else 0)
 PY
