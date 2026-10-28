@@ -248,10 +248,10 @@ def status(cfg: dict) -> int:
         f"configuration: {config.DEFAULT_CONFIG} + {config.config_dir() / 'config.json'}"
         f" ({'present' if (config.config_dir() / 'config.json').is_file() else 'missing — defaults'})"
     )
-    print(f"sensitive directories: {', '.join(cfg['sources']['directories'])}")
+    print(f"sensitive directories: {', '.join(config.sensitive_dirs(cfg))}")
     if p := cfg.get("project"):
         print("\n".join(_project_description(p)))
-    print(f"Presidio {cfg['text']['presidio_url']}: {engines.presidio_health(cfg)}")
+    print(f"Presidio, {engines.engine_description(cfg)}: {engines.presidio_health(cfg)}")
     o = cfg["ollama"]
     print(
         f"Ollama: {'enabled for ' + ', '.join(o['sources']) + ' — ' + engines.ollama_health(cfg) if o['enabled'] else 'disabled'}"

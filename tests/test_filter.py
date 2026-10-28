@@ -520,6 +520,16 @@ class TestGate(unittest.TestCase):
         )
 
 
+class TestStatus(unittest.TestCase):
+    def test_status_runs(self):
+        """`piigate status`: engine, configuration and log summary — never a denial (it shows no data)."""
+        w = subprocess.run([str(ROOT / "bin" / "piigate"), "status"], capture_output=True, text=True, timeout=120, check=False)
+        self.assertEqual(w.returncode, 0, w.stdout + w.stderr)
+        self.assertNotIn("denied", w.stdout + w.stderr)
+        self.assertIn("Presidio", w.stdout)
+        self.assertNotIn("{documents}", w.stdout)  # placeholders are shown expanded
+
+
 class TestLinkHook(unittest.TestCase):
     """SessionStart hook: ~/.local/bin/piigate → bin/piigate of the INSTALLED plugin copy only."""
 
