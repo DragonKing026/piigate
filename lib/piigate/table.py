@@ -240,19 +240,49 @@ def _symfony(lines: list[str]) -> list[list[str]] | None:
     return result or None
 
 
+FRAME_RE = re.compile(r"\s*(?:\+(?:-+\+)+|-+(?:\+-+)+)\s*")  # mysql +----+ (also one column), psql ----+----
+
+
 def _framed(lines: list[str]) -> list[list[str]] | None:
     """mysql (+----+) and psql (----+----, rows with |)."""
-    if not any(re.fullmatch(r"\s*\+?-+(?:\+-+)+\+?\s*", ln) for ln in lines):
+    if not any(FRAME_RE.fullmatch(ln) for ln in lines):
         return None
     result = []
     for ln in lines:
-        if "|" not in ln or re.fullmatch(r"\s*\+?-+(?:\+-+)+\+?\s*", ln):
+        if "|" not in ln or FRAME_RE.fullmatch(ln):
             continue
         ln = ln.strip()
         ln = ln.removeprefix("|")
         ln = ln.removesuffix("|")
         result.append([c.strip() for c in ln.split("|")])
     return result or None
+
+
+PSQL_FOOTER_RE = re.compile(r"\(\d+ rows?\)")
+
+
+def _psql_one_column(lines: list[str]) -> list[list[str]] | None:
+    """psql with one column: header / '-----' / values / '(N rows)' — the footer makes it unambiguous."""
+    lines = [ln for ln in lines if ln.strip()]
+    if len(lines) < 3 or not re.fullmatch(r"\s*-+\s*", lines[1]) or "|" in lines[0]:
+        return None
+    end = next((i for i, ln in enumerate(lines) if PSQL_FOOTER_RE.fullmatch(ln.strip())), None)
+    if end is None or end < 2:
+        return None
+    return [[ln.strip()] for ln in [lines[0]] + lines[2:end]]
+
+
+# header of a one-column `mysql -B` result: a column name or an expression (count, user_id, COUNT(*)); a capitalised
+# word (a surname from `mysql -B -N`) or prose does not pass
+ONE_COLUMN_HEADER_RE = re.compile(r"[a-z_][\w$.]*|[A-Z_][A-Z0-9_$.]*|[A-Za-z_]\w*\([^()\n]{0,40}\)", re.ASCII)
+
+
+def _bare_one_column(lines: list[str]) -> list[list[str]] | None:
+    """`mysql -B` / CSV with one column: no separators at all, so only a column-name header is accepted."""
+    lines = [ln for ln in lines if ln.strip()]
+    if len(lines) < 2 or any("\t" in ln for ln in lines) or not ONE_COLUMN_HEADER_RE.fullmatch(lines[0].strip()):
+        return None
+    return [[ln] for ln in lines]
 
 
 VAR_DUMP_RE = re.compile(
@@ -285,7 +315,7 @@ def _records(pairs: list[tuple[str, str]]) -> list[list[str]] | None:
 def from_text(content: str, name: str = "result") -> list[Table]:
     """Recognises a table in command output. Not recognized → FilterError (no guessing, the text is not returned)."""
     lines = content.splitlines()
-    for parser, fmt in ((_symfony, "symfony"), (_framed, "framed")):
+    for parser, fmt in ((_symfony, "symfony"), (_framed, "framed"), (_psql_one_column, "psql")):
         rows = parser(lines)
         if rows:
             return [Table(name, rows[0], rows[1:], fmt)]
@@ -309,6 +339,8 @@ def from_text(content: str, name: str = "result") -> list[Table]:
         return [from_csv(content, name, ",")]
     if len(non_empty) >= 2 and len({ln.count(";") for ln in non_empty[:20]}) == 1 and ";" in non_empty[0]:
         return [from_csv(content, name, ";")]
+    if rows := _bare_one_column(lines):
+        return [_from_rows(name, rows, "tsv")]
     raise FilterError(
         f"no table recognized in the output ({len(lines)} lines, {len(content)} characters) — values hidden. "
         "Formats: Symfony table (dbal:run-sql), mysql/psql, var_dump, print_r, CSV/TSV (mysql -B)"

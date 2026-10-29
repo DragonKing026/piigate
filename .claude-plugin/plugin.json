@@ -1,6 +1,6 @@
 {
   "name": "piigate",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "Keeps personal data (PII/PHI) out of Claude's context: a gate on tool calls, a filter on tool output, pseudonyms instead of names, and MCP tools to read sensitive files safely. Polish and English.",
   "author": {"name": "Artur Ograbek"},
   "homepage": "https://github.com/DragonKing026/piigate",

@@ -201,6 +201,40 @@ class TestTables(unittest.TestCase):
     def test_unrecognized_output_is_denial(self):
         with self.assertRaises(FilterError):
             table.from_text(f"Pacjent {dt.PATIENTS[0]['first_name']} {dt.PATIENTS[0]['surname']} ma dług\n")
+        # two lines of prose are not a one-column result (the "header" is not a column name)
+        for content in (
+            f"{dt.PATIENTS[0]['first_name']} {dt.PATIENTS[0]['surname']}\nma dług\n",
+            "ERROR 1045 (28000): Access denied\nmysql: [Warning] Using a password\n",
+        ):
+            with self.subTest(content), self.assertRaises(FilterError):
+                table.from_text(content)
+
+    def test_single_column_results(self):
+        """issue #9: SELECT COUNT(*), SELECT id … — one column in every supported layout."""
+        for name, content in (
+            ("symfony", " ------- \n  count  \n ------- \n  42     \n ------- \n"),
+            ("mysql", "+-------+\n| count |\n+-------+\n|    42 |\n+-------+\n1 row in set (0.00 sec)\n"),
+            ("psql", " count \n-------\n    42\n(1 row)\n"),
+            ("mysql -B", "count\n42\n"),
+            ("mysql -B COUNT(*)", "COUNT(*)\n42\n"),
+        ):
+            with self.subTest(name):
+                tables = table.from_text(content)
+                self.assertEqual(len(tables[0].rows), 1)
+                result = table.describe(tables, CONFIG, source="SQL result", safe_plain=True)
+                self.assertIn("columns: 1", result)
+                self.assertRegex(result, r"\| 42 \|")
+        # a one-column text result is masked like any other column
+        names = [p["first_name"] for p in dt.PATIENTS[:3]]
+        for name, content in (
+            ("mysql", "+------------+\n| first_name |\n+------------+\n" + "".join(f"| {n} |\n" for n in names) + "+------------+\n"),
+            ("psql", " first_name \n------------\n" + "".join(f" {n}\n" for n in names) + f"({len(names)} rows)\n"),
+            ("mysql -B", "first_name\n" + "".join(f"{n}\n" for n in names)),
+        ):
+            with self.subTest(name + " text"):
+                result = table.describe(table.from_text(content), CONFIG, source="SQL result", safe_plain=True)
+                self.assertIn(f"data rows: {len(names)}", result)
+                self.assertEqual(leaks(result), [])
 
     def test_cli_table_from_stdin(self):
         w = subprocess.run(
@@ -803,19 +837,29 @@ class TestAnonymizedLocalDb(unittest.TestCase):
             subprocess.run(
                 ["docker", "exec", name, "psql", "-U", "postgres", "-qc", sql], check=True, capture_output=True
             )
-            result = subprocess.run(
-                f"docker exec {name} psql -U postgres -c 'SELECT * FROM pacjent' 2>&1 | {ROOT}/bin/piigate table "
-                "--rows 4",
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=60,
-                check=False,
-            )
+            def query(sql: str) -> subprocess.CompletedProcess:
+                return subprocess.run(
+                    f"docker exec {name} psql -U postgres -c {shlex.quote(sql)} 2>&1 | "
+                    f"{shlex.quote(str(ROOT / 'bin' / 'piigate'))} table --rows 4",
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    check=False,
+                )
+
+            result = query("SELECT * FROM pacjent")
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("data rows: 4", result.stdout)
             self.assertEqual(leaks(result.stdout), [])
             self.assertNotIn("anon_", result.stdout)
+            # one column (issue #9): a count in plain text, names masked
+            result = query("SELECT count(*) FROM pacjent")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertRegex(result.stdout, rf"\| {len(dt.PATIENTS)} \|")
+            result = query("SELECT imie FROM pacjent")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(leaks(result.stdout), [])
         finally:
             subprocess.run(["docker", "rm", "-f", name], capture_output=True, check=False)
 
