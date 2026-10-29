@@ -9,19 +9,65 @@ work with sensitive files without ever seeing the originals. Built for Polish an
 > **This is not a guarantee.** piigate lowers the risk, it does not remove it — see [Limitations](#limitations). When data
 > is truly sensitive, the safest option is not to open it in an agent session at all.
 
-```text
-                 PreToolUse (gate)                                PostToolUse (filter)
-Read/Grep/Glob ──► sensitive path? ── yes ──► deny + "use piigate_show …"
-               ──► data extension (.csv, .pdf, .sql…)? ──► content by rules: clean → allow; personal data / unreadable → deny
-Bash           ──► sensitive dir / `ssh … mysql`? ──► only `… 2>&1 | piigate table|text`, or cp into a sensitive dir
-Edit/Write     ──► piigate's own files (map, key, config)? ──► deny
-mail MCP        ─────────────────────────────────────────────────► every text block → pseudonyms
-Bash/Read/Grep  ─────────────────────────────────────────────────► sensors: PESEL, bank account, card (checksums)
+## How it works
 
-MCP tools piigate_show / list / search / analyze / anonymize, and `piigate` in Bash:
-  tables (CSV, XLSX, ODS, SQL output) → structure only: columns, types, counts, lengths; values → HMAC masks (t:3fa91c)
-  free text (mail, PDF, DOCX, ODT, TXT) → Polish rules + Presidio NER (pl + en) [+ Ollama] → PERSON_17, ADDRESS_3
+Every tool call passes the **gate** before it runs and the **filter** after it. A denied call never reaches the data —
+the agent is told which piigate tool to use instead.
+
+```mermaid
+flowchart TD
+    call(["Claude calls a tool"]) --> which{"Which tool?"}
+
+    which -->|"Read · Grep · Glob"| path{"Sensitive<br>directory?"}
+    path -->|yes| deny1["⛔ Denied<br><i>use piigate_show instead</i>"]
+    path -->|no| ext{"Data file?<br>.csv .xlsx .pdf .sql …"}
+    ext -->|no| runs
+    ext -->|yes| scan{"Personal data<br>in the file?"}
+    scan -->|"no"| runs
+    scan -->|"yes, or unreadable"| deny2["⛔ Denied"]
+
+    which -->|Bash| bash{"Reads a sensitive directory<br>or a database over ssh?"}
+    bash -->|no| runs
+    bash -->|yes| pipe{"Output piped into<br>piigate table / text,<br>or a copy into a<br>sensitive directory?"}
+    pipe -->|yes| runs
+    pipe -->|no| deny3["⛔ Denied"]
+
+    which -->|"Edit · Write"| own{"piigate's own files?<br>map, key, config"}
+    own -->|yes| deny4["⛔ Denied"]
+    own -->|no| runs
+
+    which -->|"Mail MCP"| runs
+
+    runs["✅ Tool runs"] --> filter["<b>Filter</b><br>mail → names become pseudonyms<br>every result → PESEL, IBAN, card check<br>any error → output hidden"]
+    filter --> ctx(["What Claude sees"])
+
+    classDef deny fill:#fde2e1,stroke:#c0392b,color:#7b1d14
+    classDef ok fill:#e3f4e1,stroke:#2e7d32,color:#1b4d1f
+    classDef step fill:#e8eefc,stroke:#3557b7,color:#1c2f66
+    class deny1,deny2,deny3,deny4 deny
+    class runs,ctx ok
+    class filter step
 ```
+
+## What Claude gets instead of the original
+
+```mermaid
+flowchart LR
+    src[("Sensitive file<br>or e-mail")] --> tools["piigate_show · search<br>analyze · anonymize<br>or <code>… | piigate</code> in Bash"]
+    tools --> kind{"Kind of<br>content"}
+    kind -->|"Table<br>CSV · XLSX · ODS · SQL output"| table["<b>Structure only</b><br>columns, types, counts, lengths<br>values → masks <code>t:3fa91c</code>"]
+    kind -->|"Free text<br>mail · PDF · DOCX · ODT · TXT"| text["<b>Pseudonyms</b><br>Polish rules + Presidio NER<br>(+ optional local Ollama)<br>Jan Kowalski → <code>PERSON_17</code>"]
+    table --> ctx(["Claude's context"])
+    text --> ctx
+
+    classDef ok fill:#e3f4e1,stroke:#2e7d32,color:#1b4d1f
+    classDef step fill:#e8eefc,stroke:#3557b7,color:#1c2f66
+    class ctx ok
+    class table,text step
+```
+
+Tables are never "guessed at": Claude sees their shape and stable masks, so it can still count, join and group. The
+same value always gets the same mask or pseudonym, also across sessions.
 
 ## What it does
 
