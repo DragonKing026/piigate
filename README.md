@@ -18,33 +18,26 @@ the agent is told which piigate tool to use instead.
 flowchart TD
     call(["Claude calls a tool"]) --> which{"Which tool?"}
 
-    which -->|"Read · Grep · Glob"| path{"Sensitive<br>directory?"}
-    path -->|yes| deny1["⛔ Denied<br><i>use piigate_show instead</i>"]
-    path -->|no| ext{"Data file?<br>.csv .xlsx .pdf .sql …"}
-    ext -->|no| runs
-    ext -->|yes| scan{"Personal data<br>in the file?"}
-    scan -->|"no"| runs
-    scan -->|"yes, or unreadable"| deny2["⛔ Denied"]
-
-    which -->|Bash| bash{"Reads a sensitive directory<br>or a database over ssh?"}
-    bash -->|no| runs
-    bash -->|yes| pipe{"Output piped into<br>piigate table / text,<br>or a copy into a<br>sensitive directory?"}
-    pipe -->|yes| runs
-    pipe -->|no| deny3["⛔ Denied"]
-
+    which -->|"Read · Grep · Glob"| read{"Sensitive directory,<br>or a data file<br>(.csv .xlsx .pdf .sql …)<br>with personal data?"}
+    which -->|Bash| bash{"Reads sensitive data<br>without piping it into<br>piigate table / text?"}
     which -->|"Edit · Write"| own{"piigate's own files?<br>map, key, config"}
-    own -->|yes| deny4["⛔ Denied"]
-    own -->|no| runs
-
     which -->|"Mail MCP"| runs
 
-    runs["✅ Tool runs"] --> filter["<b>Filter</b><br>mail → names become pseudonyms<br>every result → PESEL, IBAN, card check<br>any error → output hidden"]
+    read -->|no| runs
+    bash -->|no| runs
+    own -->|no| runs
+    read -->|"yes, or unreadable"| deny
+    bash -->|yes| deny
+    own -->|yes| deny
+
+    deny["⛔ <b>Denied</b><br>Claude is told which<br>piigate tool to use instead"]
+    runs["✅ <b>Tool runs</b>"] --> filter["<b>Filter</b> on the output<br>mail → names become pseudonyms<br>every result → PESEL, IBAN, card check<br>any error → output hidden"]
     filter --> ctx(["What Claude sees"])
 
     classDef deny fill:#fde2e1,stroke:#c0392b,color:#7b1d14
     classDef ok fill:#e3f4e1,stroke:#2e7d32,color:#1b4d1f
     classDef step fill:#e8eefc,stroke:#3557b7,color:#1c2f66
-    class deny1,deny2,deny3,deny4 deny
+    class deny deny
     class runs,ctx ok
     class filter step
 ```
