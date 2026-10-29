@@ -40,6 +40,8 @@ flowchart TD
     class deny deny
     class runs,ctx ok
     class filter step
+    linkStyle 4,5,6,7,12 stroke:#2e7d32,stroke-width:2px
+    linkStyle 8,9,10 stroke:#c0392b,stroke-width:2px
 ```
 
 ## What Claude gets instead of the original
@@ -57,6 +59,7 @@ flowchart LR
     classDef step fill:#e8eefc,stroke:#3557b7,color:#1c2f66
     class ctx ok
     class table,text step
+    linkStyle 4,5 stroke:#2e7d32,stroke-width:2px
 ```
 
 Tables are never "guessed at": Claude sees their shape and stable masks, so it can still count, join and group. The
