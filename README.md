@@ -86,17 +86,75 @@ same value always gets the same mask or pseudonym, also across sessions.
 
 ## Install
 
-Requirements: Claude Code, [uv](https://docs.astral.sh/uv/), Python 3.11–3.14, Linux (macOS untested). For
-`piigate reverse` and `piigate project approve`: sudo with a password and [rootwhy](https://github.com/DragonKing026/rootwhy)
-in `PATH` (password dialog).
+### Requirements
+
+| What | Why | Needed |
+| --- | --- | --- |
+| Linux (macOS untested) | | yes |
+| [Claude Code](https://claude.com/claude-code) | piigate is its plugin | yes |
+| `python3` 3.11–3.14 in `PATH` | the hooks (gate, filter) and the `piigate` command run on it, standard library only | yes |
+| [uv](https://docs.astral.sh/uv/) | starts the piigate MCP server and installs its Python packages (`mcp`, `presidio-analyzer`, `spacy`) on first start | yes |
+| `rg` ([ripgrep](https://github.com/BurntSushi/ripgrep)) | `piigate_search` | yes |
+| `pdftotext` (poppler) | reading PDF files | yes |
+| ~1 GB of disk and network once | the spaCy models, downloaded on first NER use and checked by sha256 — see [Model license](#model-license) | yes |
+| [rootwhy](https://github.com/DragonKing026/rootwhy) + `sudo` with a password | password dialog for `piigate reverse` and `piigate project approve` | optional |
+| [Ollama](https://ollama.com) + a model (default `qwen2.5:7b-instruct`) | second pass of the text filter (`ollama.enabled`) | optional |
+| a local agent command | `piigate_analyze` (`analysis.agent_command`, see [Configuration](#configuration)) | optional |
+| Docker | the `container` engine instead of `local` (see [Engines](#engines)) | optional |
+
+### Step by step
+
+**1. System packages** (Python, ripgrep, poppler, uv):
+
+```bash
+sudo dnf install python3 ripgrep poppler-utils uv                 # Fedora
+sudo apt install python3 ripgrep poppler-utils                    # Debian / Ubuntu (uv: step 2)
+sudo pacman -S --needed python ripgrep poppler uv                 # Arch
+sudo zypper install python3 ripgrep poppler-tools                 # openSUSE (uv: step 2)
+```
+
+**2. uv**, when your distribution has no package:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh                   # installs into ~/.local/bin
+uv --version
+```
+
+**3. The plugin** — in a terminal:
 
 ```bash
 claude plugin marketplace add DragonKing026/piigate
 claude plugin install piigate@piigate --scope user
 ```
 
-The first session that needs NER downloads the spaCy models (~1 GB, once) — see [Model license](#model-license).
-`piigate status` shows the engine, configuration and pseudonym count.
+or inside Claude Code: `/plugin marketplace add DragonKing026/piigate`, then `/plugin install piigate@piigate`.
+
+**4. A new Claude Code session.** On start piigate links its command to `~/.local/bin/piigate` (make sure
+`~/.local/bin` is in `PATH`) and starts the MCP server; the first start installs the Python packages (a minute or two).
+The first text that needs NER downloads the models (~1 GB, once); until then text filtering refuses, the gate works.
+
+**5. Check:**
+
+```bash
+piigate status        # engine, configuration, pseudonym count, decision log (no content)
+```
+
+In Claude Code `/plugin` should list `piigate@piigate` as enabled and `/mcp` the `piigate` server as connected.
+
+**6. Optional:**
+
+- your own settings — `~/.config/piigate/config.json` (only what differs from [config.json](config.json); example
+  [examples/user-config.json](examples/user-config.json)); the agent may not edit it;
+- password dialog for `reverse` / `project approve` — install [rootwhy](https://github.com/DragonKing026/rootwhy#installation);
+- Ollama second pass — `ollama pull qwen2.5:7b-instruct` and `"ollama": {"enabled": true}` in your config;
+- `piigate_analyze` — set `analysis.agent_command` to a local agent (see the contract under [Configuration](#configuration));
+- container engine — see [Engines](#engines).
+
+**Update:** `claude plugin marketplace update piigate && claude plugin update piigate@piigate`, then a new session.
+
+**Uninstall:** `claude plugin uninstall piigate@piigate` and `rm ~/.local/bin/piigate`. Your configuration stays in
+`~/.config/piigate/`, the models and the pseudonym map in `~/.local/share/piigate/` — remove them by hand only if you
+no longer need to reverse pseudonyms in earlier reports.
 
 ## Engines
 
