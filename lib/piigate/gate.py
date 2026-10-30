@@ -494,16 +494,82 @@ class Gate:
 
     @staticmethod
     def _commit_message(stage: list[str]) -> set[int]:
-        """Indices of the `git commit|tag -m …` message — text, not a path (a directory name in a change description)."""
-        if len(stage) < 2 or Path(stage[0]).name != "git" or not ({"commit", "tag"} & set(stage[1:3])):
-            return set()
+        """Indices of message text — not a path (a directory name in a change description): `git commit|tag -m …`,
+        `gh issue|pr … --title/--body/--search/--comment` (not `--body-file`/`-F`, which read a file) and the query of
+        `gh search <kind> …`."""
+        cmd = Path(stage[0]).name if stage else ""
         result = set()
-        for i, t in enumerate(stage[:-1]):
-            if re.fullmatch(r"-[a-zA-Z]*m|--message", t):
-                result.add(i + 1)
-        result |= {i for i, t in enumerate(stage) if t.startswith("--message=")}
+        if len(stage) >= 2 and cmd == "git" and {"commit", "tag"} & set(stage[1:3]):
+            options, long_options = r"-[a-zA-Z]*m|--message", ("--message",)
+        elif len(stage) >= 3 and cmd == "gh" and stage[1] in ("issue", "pr"):
+            options, long_options = r"-[tbSc]|--title|--body|--search|--comment", ("--title", "--body", "--search", "--comment")
+        elif len(stage) >= 3 and cmd == "gh" and stage[1] == "search":
+            options, long_options = r"--(?:repo|owner)|-R", ()
+            values = {i + 1 for i, t in enumerate(stage[:-1]) if re.fullmatch(options, t)}
+            result = {i for i, t in enumerate(stage) if i > 2 and not t.startswith("-") and i not in values}
+        else:
+            return set()
+        if long_options:
+            result |= {i + 1 for i, t in enumerate(stage[:-1]) if re.fullmatch(options, t)}
+            result |= {i for i, t in enumerate(stage) if t.split("=", 1)[0] in long_options and "=" in t}
         # `-m "$(cat …)"` — the shell runs the substitution: such a message is a command, not text
-        return {i for i in result if not SUBSTITUTION.search(stage[i])}
+        return {i for i in result if i < len(stage) and not SUBSTITUTION.search(stage[i])}
+
+    @staticmethod
+    def _program_text(stage: list[str]) -> set[int]:
+        """Indices of the sed/awk program (the first operand or the -e/--expression value; awk -F/-v values): shell
+        quoting already kept it one word and unexpanded, so it is not a glob or braces — but it is still code (sed `r`,
+        awk `getline`), so it stays checked as a plain path and for directory names. `-f` program files stay paths."""
+        cmd = Path(stage[0]).name if stage else ""
+        if cmd not in ("sed", "gsed", "awk", "gawk", "mawk", "nawk"):
+            return set()
+        sed = cmd.endswith("sed")
+        # option → whether its value is program text (True), a file (False); letters that end the cluster with a value
+        values = {"e": True, "f": False} if sed else {"e": True, "f": False, "v": True, "F": True, "E": False, "i": False, "l": False}
+        glued_rest = "il" if sed else ""  # sed -i[SUFFIX], -l N: the rest of the cluster is their value
+        long_values = (
+            {"--expression": True, "--file": False, "--line-length": None}
+            if sed
+            else {"--source": True, "--file": False, "--assign": True, "--field-separator": True, "--include": False,
+                  "--load": False, "--exec": False}
+        )
+        text: set[int] = set()
+        positional: list[int] = []
+        program_option = False
+        i = 1
+        while i < len(stage):
+            t = stage[i]
+            if t in REDIRECTS or re.fullmatch(r"\d*[<>]+&?\d*", t):
+                i += 2
+                continue
+            if t == "--":
+                positional += range(i + 1, len(stage))
+                break
+            if t.startswith("--"):
+                name, eq, _ = t.partition("=")
+                if name in long_values:
+                    program_option |= name in ("--expression", "--file", "--source", "--exec")
+                    if long_values[name]:
+                        text.add(i if eq else i + 1)
+                    i += 0 if eq else 1
+            elif t.startswith("-") and len(t) > 1:
+                for j, c in enumerate(t[1:], 1):
+                    if c in glued_rest:
+                        if c == "l" and j == len(t) - 1:
+                            i += 1
+                        break
+                    if c in values:
+                        program_option |= c in "efE"
+                        if values[c]:
+                            text.add(i if j < len(t) - 1 else i + 1)
+                        i += 0 if j < len(t) - 1 else 1
+                        break
+            else:
+                positional.append(i)
+            i += 1
+        if not program_option and positional:
+            text.add(positional[0])
+        return {i for i in text if i < len(stage)}
 
     def _text_args(self, stage: list[str]) -> set[int]:
         """Indices of tokens that are text, not paths: a commit message, and echo/printf arguments (printed back, not
@@ -802,20 +868,23 @@ class Gate:
                     end.append(m.group(2))
         return "\n".join(result)
 
-    def _heredoc_text(self, command: str) -> tuple[str, set[str]]:
+    def _heredoc_text(self, command: str) -> tuple[str, set[str], set[str], str]:
         """Heredoc bodies read by a non-shell (`python3 - <<'X'`, `gh … --body-file - <<X`): the shell expands no globs
         there, and nothing at all with a quoted delimiter. Returns the command without the quoted bodies (where
-        substitutions are looked for) and the tokens found only in the bodies (no glob — `name.*` is text). A body fed
-        to a shell or a launcher is a script — unchanged."""
+        substitutions are looked for), the tokens found only in the bodies (no glob — `name.*` is text), the subset
+        found only in quoted bodies (no `$VAR` expansion either) and the bodies' text. A body fed to a shell or a
+        launcher is a script — unchanged."""
         outside: list[str] = []  # without quoted text bodies
         shell: list[str] = []  # without any text bodies
         body: list[str] = []
+        unquoted: list[str] = []  # bodies with an unquoted delimiter
         end: list[tuple[str, bool | None]] = []
         for line in command.split("\n"):
             if end and line.strip() != end[0][0] and end[0][1] is not None:
                 body.append(line)
                 if not end[0][1]:
                     outside.append(line)  # unquoted delimiter: $(…) and `…` still run
+                    unquoted.append(line)
                 continue
             if end and line.strip() == end[0][0]:
                 end.pop(0)
@@ -829,10 +898,12 @@ class Gate:
             outside.append(line)
             shell.append(line)
         if end or not body:
-            return command, set()  # an unterminated heredoc — unchanged
-        inner = self._tokens("\n".join(body)) or "\n".join(body).split()
-        rest = self._tokens("\n".join(shell)) or "\n".join(shell).split()
-        return "\n".join(outside), set(inner) - set(rest)
+            return command, set(), set(), ""  # an unterminated heredoc — unchanged
+        text = "\n".join(body)
+        inner = self._tokens(text) or text.split()
+        rest = set(self._tokens("\n".join(shell)) or "\n".join(shell).split())
+        expanded = set(self._tokens("\n".join(unquoted)) or "\n".join(unquoted).split()) if unquoted else set()
+        return "\n".join(outside), set(inner) - rest, set(inner) - rest - expanded, text
 
     @staticmethod
     def _substitutions(text: str) -> list[str]:
@@ -1002,14 +1073,22 @@ class Gate:
         except ValueError:
             return None
 
-    def _token_kind(self, t: str, recursion: bool, content: bool = True, literal: bool = False) -> tuple[str, str] | None:
+    def _token_kind(
+        self, t: str, recursion: bool, content: bool = True, literal: bool = False, verbatim: bool = False
+    ) -> tuple[str, str] | None:
         """literal=True: the token comes from a heredoc body read by a non-shell — the shell expands no globs there, so
-        `name.*` is text, not a pattern for every extension (a fixed data extension `*.csv` still counts)."""
+        `name.*` is text, not a pattern for every extension (a fixed data extension `*.csv` still counts).
+        verbatim=True: a quoted word the shell neither globs nor brace-expands (a sed/awk program) — a plain path."""
         candidates = [t]
         if "=" in t:  # --file=…, VAR=… — the whole token only when it is an existing path (otherwise a missing file = deny)
             candidates = ([t] if os.path.lexists(_path(t, self.cwd)) else []) + [t.split("=", 1)[1]]
         if re.match(r"^[\w.@-]+:[~/]", t):
             candidates.append(t.split(":", 1)[1])  # scp host:path
+        if verbatim:
+            for k in candidates:
+                if r := self.path_kind(k, ancestor=recursion, content=content):
+                    return r, k
+            return None
         for k0 in candidates:
             variants = expand_braces(k0)
             if any(re.search(r"\{[^{}]*(?:,|\.\.)[^{}]*\}", w) for w in variants):
@@ -1041,6 +1120,28 @@ class Gate:
                 r = self.path_kind(k, ancestor=recursion, content=content)
                 if r:
                     return r, k
+        return None
+
+    def _literal_kind(
+        self, t: str, quoted: bool, body: str, recursion: bool, content: bool
+    ) -> tuple[str, str] | None:
+        """A token found only in a heredoc body read by a non-shell. A dotted name that only ever appears as a call
+        (`json.dump(`) is code, not a file. A quoted body gets no `$VAR` expansion — `${CLAUDE_PLUGIN_ROOT}` there is
+        another program's text, not piigate's root. Punctuation around a name (`['/x/map'],`) is stripped for the
+        protected/sensitive check only (a missing `name.csv),` in prose is not a data file)."""
+        if re.fullmatch(r"[A-Za-z_]\w*(?:\.\w+)+", t):
+            uses = list(re.finditer(rf"(?<![\w./~-]){re.escape(t)}(?![\w./-])", body))
+            if uses and all(re.match(r"\s*\(", body[m.end() :]) for m in uses):
+                return None
+        if quoted:
+            t = re.sub(r"\$(?:\{\w+\}|\w+)", "_", t)
+        if r := self._token_kind(t, recursion, content=content, literal=True):
+            return r
+        bare = re.sub(r"[\]),;:}\"'`]+$", "", t)
+        if not re.search(r"[\])}]", bare):
+            bare = re.sub(r"^[\[({\"'`]+", "", bare)
+        if bare and bare != t and (r := self._token_kind(bare, recursion, content=content, literal=True)):
+            return r if r[0] in ("protected", "sensitive") else None
         return None
 
     def _pattern_reaches(self, directory: str, rest: str, directories: list[str]) -> bool:
@@ -1218,7 +1319,7 @@ class Gate:
         if re.search(r"PIIGATE_\w+|XDG_DOCUMENTS_DIR", text):
             return "protected", "PIIGATE_* / XDG_DOCUMENTS_DIR variables (they change where the filter looks)"
         stages = self._strip_prefixes(self._stages_loose(tokens))
-        outside, literal = self._heredoc_text(text)
+        outside, literal, verbatim, body = self._heredoc_text(text)
         kinds: dict[str, str] = {}
         dests = [self._write_targets(stage) for stage in stages]
         # paths the command reads (everything except write targets) — a write target read in the same command
@@ -1242,6 +1343,7 @@ class Gate:
             )
             skip, filters, no_path = self._searcher_args(stage)
             skip |= self._text_args(stage)
+            program = self._program_text(stage)
             for v in filters:  # --include=*.csv, -t csv: the name filter reaches for data files
                 if self._data_filter(v) and not self._stage_public(stage, skip, no_path):
                     kinds.setdefault("extension", v)
@@ -1255,8 +1357,13 @@ class Gate:
                     r = self._token_kind(t, False, content=i not in c)  # sensitive directories under t are skipped (.ignore)
                     if not r and _ancestor(_path(t, self.cwd), self.protected):
                         r = ("protected", t)
+                elif i in program and re.search(rf"(['\"]){re.escape(t)}\1", text):
+                    # quoted in the command: one word, no glob (an unquoted `sed ~/D*` expands into the file operands)
+                    r = self._token_kind(t, False, content=i not in c, verbatim=True)
+                elif t in literal:
+                    r = self._literal_kind(t, t in verbatim, body, recursion, content=i not in c)
                 else:
-                    r = self._token_kind(t, recursion, content=i not in c, literal=t in literal)
+                    r = self._token_kind(t, recursion, content=i not in c)
                 if r and r[0] == "extension" and i in c and _path(r[1], self.cwd) not in read_paths:
                     continue  # write only — no content comes back to the model
                 if r:
@@ -1483,10 +1590,10 @@ class Gate:
                 c is None or (word in c and (word != "approve" or "project" in c))
                 for c in self._invocations(command, {"piigate"})
             )
+            # piigate, bash piigate, python3 lib/cli.py — the program run by the stage (after assignments, launchers,
+            # interpreters and their options), followed by the subcommand; `gh … -R o/piigate --search …` is not a call
             piigate_stage = tokens is not None and any(
-                word in stage
-                and any(Path(t).name in ("piigate", "cli.py") for t in stage)  # piigate, bash piigate, python3 lib/cli.py
-                for stage in self._stages_loose(tokens)
+                word in stage[k + 1 :] for stage in self._stages_loose(tokens) if (k := self._runs_piigate(stage)) is not None
             )
             if suspicious or call or piigate_stage:
                 return (
@@ -1494,6 +1601,21 @@ class Gate:
                     "Show the human the command to run."
                 )
         return None
+
+    @staticmethod
+    def _runs_piigate(stage: list[str]) -> int | None:
+        """Index of `piigate` / `cli.py` when the stage may run it: it is the command word, or the command word is a
+        launcher or an interpreter (`sudo -u x python3 -I lib/cli.py`, `bash piigate` — when in doubt, a call); None
+        when it is an argument of another command (`gh … -R o/piigate`)."""
+        k = next((k for k, t in enumerate(stage) if not (t in SHELL_KEYWORDS or re.match(r"^\w+=", t))), None)
+        if k is None:
+            return None
+        name = Path(stage[k]).name
+        if name not in ("piigate", "cli.py") and not (
+            name in LAUNCHERS or re.fullmatch(r"(?:python|pypy)[\d.]*|uv|uvx|pipx", name)
+        ):
+            return None
+        return next((j for j in range(k, len(stage)) if Path(stage[j]).name in ("piigate", "cli.py")), None)
 
     @staticmethod
     def _strip_file_heredocs(command: str) -> str:

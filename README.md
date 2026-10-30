@@ -258,7 +258,10 @@ through the full text filter.
   (`python -c` with string concatenation, base64, a script written earlier) gets through; only the sensors see the
   output then. Globs without a dot (`cat p*`, `cat *sv`) are not recognised as data-file patterns either, nor is
   `name.*` in a heredoc body read by a program other than a shell (the shell expands no globs there — a script's own
-  `glob('name.*')` is code assembling a path). The gate is a seat belt against mistakes and shortcuts, not a sandbox.
+  `glob('name.*')` is code assembling a path). Text is not read as paths: the title, body and search of `gh issue/pr`
+  (not `--body-file`/`-F`), a dotted name used only as a call (`json.dump(`) and `$VAR` in a quoted heredoc body read
+  by a non-shell, and a quoted sed/awk program as a glob (it is still checked as a plain path and for directory names).
+  The gate is a seat belt against mistakes and shortcuts, not a sandbox.
 - **The engine is trusted by address.** piigate protects the socket directory and refuses non-loopback engines, but a
   process of the same user that answers on the engine socket or port first can make NER report nothing (the rules
   still run). On first use the local engine downloads its models (~1 GB); until that finishes, text filtering refuses.

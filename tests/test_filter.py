@@ -2415,6 +2415,156 @@ class TestFalseAlarms(unittest.TestCase):
             else:
                 os.environ["CLAUDE_PLUGIN_ROOT"] = saved
 
+    def test_gh_text_options_are_text(self):
+        """Issue #2: the title and body of `gh issue/pr create|comment|edit` are text, like a commit message — a
+        sensitive directory name there is not a path (`--body-file`/`-F` read a file and stay checked)."""
+        sens = SENSITIVE_HOME
+        for where in (self.public, self.phi):
+            b = self.gate(where)
+            for command in (
+                (
+                    'gh issue create -R o/r --title "lokalny-agent: nonexistent r/Sensitive-data counts as sensitive" '
+                    "--label bug --body-file body.md"
+                ),
+                "gh pr create -t 'skip Sensitive-data in search' -b 'thunderbird.tmp and Sensitive-data are text'",
+                'gh issue comment 3 --body="see Sensitive-data"',
+                'gh issue edit 3 --title "Sensitive-data" --body "x"',
+            ):
+                with self.subTest(where=where.name, command=command):
+                    self.assertIsNone(b.bash(command))
+        b = self.gate(self.phi)
+        for command in (  # still denied: a file is read, a substitution runs, a data file
+            f"gh issue create --title t --body-file {sens}/x.md",
+            f"gh issue create --title t -F {sens}/x.md",
+            f'gh issue create --title "$(cat {sens}/x.md)" --body x',
+            "gh issue create --title t --body-file people.csv",
+        ):
+            with self.subTest(command):
+                self.assertIsNotNone(b.bash(command))
+
+    def test_call_in_heredoc_is_not_a_file(self):
+        """Issue #4: `json.dump(` in a quoted heredoc fed to a non-shell is a call, not a `.dump` file."""
+        script = (
+            "python3 - out <<'EOF'\nimport json, sys\nd = json.load(open('verdicts.json'))\nout = sys.argv[1]\n"
+            "for k, v in d.items():\n    json.dump(v, open(f'{out}/{k}.json', 'w'), ensure_ascii=False, indent=1)\n"
+            "    pickle.dump (v, f)\nEOF"
+        )
+        for where in (self.public, self.phi):
+            with self.subTest(where=where.name):
+                self.assertIsNone(self.gate(where).bash(script))
+        b = self.gate(self.phi)
+        for command in (  # still denied: a data file named in the body, a body run by a shell
+            "python3 - <<'EOF'\nimport json\njson.dump(1, open('x', 'w'))\nprint(open('people.csv').read())\nEOF",
+            "cat <<'EOF' | bash\ncat people.csv\nEOF",
+            "bash <<'EOF'\npeople.csv() { :; }\ncat people.csv\nEOF",
+            "cat x.dump",
+        ):
+            with self.subTest(command):
+                self.assertIsNotNone(b.bash(command))
+
+    def test_plugin_root_in_quoted_heredoc(self):
+        """Issue #5: `${CLAUDE_PLUGIN_ROOT}` inside a quoted heredoc is not expanded by the shell (it is another
+        plugin's root once Claude Code expands it) — not piigate's protected files; trailing `],` is not a name."""
+        own = self.base / "plugins" / "cache" / "piigate" / "piigate" / "1.0.7"
+        own.mkdir(parents=True)
+        saved = os.environ.get("CLAUDE_PLUGIN_ROOT")
+        os.environ["CLAUDE_PLUGIN_ROOT"] = str(own)
+        try:
+            b = self.gate(self.public)
+            for command in (
+                (
+                    "python3 - <<'EOF'\nimport json\nfrom pathlib import Path\n"
+                    'p = Path("Skills/biblioteka/hooks/hooks.json"); d = json.loads(p.read_text())\n'
+                    'd["hooks"]["PreToolUse"] = [{"matcher": "Bash", "hooks": [{"type": "command", "command": "python3",\n'
+                    '    "args": ["-I", "${CLAUDE_PLUGIN_ROOT}/hooks/straznik.py"], "timeout": 10}]}]\n'
+                    'p.write_text(json.dumps(d, ensure_ascii=False, indent=2) + "\\n")\nEOF'
+                ),
+                (
+                    "gh issue create -R o/r --title t -F - <<'EOF'\nThe hook doesn't match: "
+                    '"${CLAUDE_PLUGIN_ROOT}/hooks/straznik.py"], — it is another plugin\'s root\nEOF'
+                ),
+            ):
+                with self.subTest(command):
+                    self.assertIsNone(b.bash(command))
+            for command in (  # still denied: the shell expands the variable, a literal path to piigate's copy
+                "cat ${CLAUDE_PLUGIN_ROOT}/config.json",
+                'python3 - <<EOF\nopen("${CLAUDE_PLUGIN_ROOT}/config.json")\nEOF',
+                f"python3 - <<'EOF'\nopen('{own}/config.json')\nEOF",
+                f"python3 - <<'EOF'\nfiles = ['{own}/config.json'],\nEOF",
+            ):
+                with self.subTest(command):
+                    self.assertIsNotNone(b.bash(command))
+        finally:
+            if saved is None:
+                os.environ.pop("CLAUDE_PLUGIN_ROOT", None)
+            else:
+                os.environ["CLAUDE_PLUGIN_ROOT"] = saved
+
+    def test_sed_awk_script_is_not_a_path(self):
+        """Issue #10: a quoted sed/awk script (`'/[Ww] trakcie/,/^$/p'`) is a program, not a glob rooted at `/`."""
+        sens = SENSITIVE_HOME
+        for where in (self.public, self.phi):
+            b = self.gate(where)
+            for command in (
+                "printf 'a\\nb\\n' | sed -n '/[Ww] trakcie/,/^$/p'",
+                "sed -n '/[Ww] trakcie/,/^$/p' compose.yml",
+                "sed -E -n -e '/^[A-Z]* x/p' -e '/[0-9] y/d' compose.yml",
+                "awk '/[Ww] trakcie/ {print $1}' compose.yml",
+                "sed -i.bak 's/[a-z]* /x/' compose.yml",
+            ):
+                with self.subTest(where=where.name, command=command):
+                    self.assertIsNone(b.bash(command))
+        b = self.gate(self.phi)
+        for command in (  # still denied: the file operands
+            "sed -n p people.csv",
+            f"sed -n '1p' {sens}/x.txt",
+            f"sed -f {sens}/s.sed compose.yml",
+            f"awk -f {sens}/a.awk compose.yml",
+            "awk '{print}' people.csv",
+            "sed -e p -- people.csv",
+            "sed -n '/[Ww] x/p' /*",
+            "sed ~/Doc*/pii*/Sen*/*",  # unquoted: the shell expands it — the matches after the first are files
+            "sed -n -- ~/Doc*/pii*/Sen*/*",
+        ):
+            with self.subTest(command):
+                self.assertIsNotNone(b.bash(command))
+
+    def test_human_only_subcommand_as_text(self):
+        """Issue #11: the subcommand word in code or a search string is not `piigate <subcommand>`."""
+        word = "rev" + "erse"
+        for where in (self.public, self.phi):
+            b = self.gate(where)
+            for command in (
+                (
+                    f"python3 - <<'EOF'\nrows = [(1, 'a'), (2, 'b')]\nrows.sort(key=lambda r: r[0], {word}=True)\n"
+                    "print(rows)\nEOF"
+                ),
+                f'gh issue list -R o/piigate --state all --search "{word}"',
+                f"gh search issues '{word}' --repo o/piigate",
+                f'python3 todo.py nowe "piigate: bash gate false alarms — {word} subcommand word in text"',
+                f"python3 -c 'print(sorted([2, 1], {word}=True))'",
+                f"git log --{word} --oneline | piigate text",
+            ):
+                with self.subTest(where=where.name, command=command):
+                    self.assertIsNone(b.bash(command))
+        b = self.gate(self.phi)
+        for command in (  # still denied: real calls
+            f"piigate {word} report.md",
+            f"cat x | piigate {word}",
+            f"ls; piigate {word} x",
+            f"true && piigate {word} x",
+            f"echo $(piigate {word} x)",
+            f"xargs piigate {word} < list",
+            f"sh -c 'piigate {word} x'",
+            f"bash <<'EOF'\npiigate {word} x\nEOF",
+            f"python3 lib/cli.py {word} report.md",
+            f"sudo -u me python3 -I lib/cli.py {word} report.md",
+            f"env A=1 nice -n 5 piigate --rows 3 {word} x",
+            f"python3 -c \"import subprocess; subprocess.run(['piigate', '{word}', 'x'])\"",
+        ):
+            with self.subTest(command):
+                self.assertIsNotNone(b.bash(command))
+
     def test_relative_paths_against_tool_cwd(self):
         """The hook resolves relative paths against the tool call's cwd, not its own working directory."""
         def bash(command: str) -> dict | None:
