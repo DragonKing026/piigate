@@ -7,7 +7,9 @@ models on first use) is tested only with PIIGATE_TEST_LOCAL_ENGINE=1 (PIIGATE_WH
 downloaded model wheels, still checked against the pinned sha256).
 """
 
+import contextlib
 import hashlib
+import http.server
 import io
 import json
 import os
@@ -18,6 +20,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import zipfile
 from pathlib import Path
@@ -216,6 +220,41 @@ class TestEnginesLocal(SocketCase):
             engines.presidio("Jan Kowalski", local_cfg(mode="cloud"))
 
 
+@contextlib.contextmanager
+def fake_health(hold_s: float = 0, errors: int = 0, code: int = 503):
+    """Loopback /health of a container behind an on-demand proxy: holds each request `hold_s` seconds, answers
+    `code` (503, or 302 back to /health like Sablier) to the first `errors` requests, then 200 like Presidio."""
+    left = [errors]
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            time.sleep(hold_s)
+            if left[0] > 0:
+                left[0] -= 1
+                self.send_response(code)
+                self.send_header("Location", self.path)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            body = b"Presidio Analyzer service is up"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 class TestEnginesContainer(unittest.TestCase):
     def test_outside_loopback(self):
         cfg = local_cfg(mode="container", container_url="http://example.com:3000")
@@ -228,6 +267,22 @@ class TestEnginesContainer(unittest.TestCase):
         with self.assertRaises(FilterError):
             engines.presidio("Jan Kowalski", cfg)
         self.assertFalse(engines.presidio_health(cfg).startswith("running"))
+
+    def test_health_waits_for_sleeping_container(self):
+        # a container started on demand: the proxy holds the request until it is up (blocking) or answers 503 first
+        with fake_health(hold_s=6) as url:  # longer than the old fixed 5 s limit
+            health = engines.presidio_health(local_cfg(mode="container", container_url=url, timeout_s=15))
+        self.assertTrue(health.startswith("running"), health)
+        with fake_health(errors=2) as url:
+            health = engines.presidio_health(local_cfg(mode="container", container_url=url, timeout_s=15))
+        self.assertTrue(health.startswith("running"), health)
+        with fake_health(errors=1, code=302) as url:
+            health = engines.presidio_health(local_cfg(mode="container", container_url=url, timeout_s=15))
+        self.assertTrue(health.startswith("running"), health)
+        with fake_health(errors=100) as url:
+            health = engines.presidio_health(local_cfg(mode="container", container_url=url, timeout_s=3))
+        self.assertTrue(health.startswith("not responding"), health)
+        self.assertIn("3 s", health)
 
     def test_description(self):
         self.assertIn("127.0.0.1:8719", engines.engine_description(local_cfg(mode="container")))

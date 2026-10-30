@@ -46,11 +46,12 @@ def _loopback_only(url: str) -> None:
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *a, **kw):
-        return None  # 307 from an on-demand proxy (service starting) is handled here: retry the same request
+        return None  # 302/307 from an on-demand proxy (service starting) is handled here: retry the same request
 
 
 _OPENER = urllib.request.build_opener(_NoRedirect)
-RETRY_STATUSES = {307, 308, 502, 503, 504}
+# Sablier (blocking) answers a GET with 302 to the same address once the container is up
+RETRY_STATUSES = {302, 307, 308, 502, 503, 504}
 
 
 def _post(url: str, data: dict, timeout_s: float) -> object:
@@ -199,15 +200,18 @@ def presidio(text: str, cfg: dict) -> list[Fragment]:
     return result
 
 
-def presidio_health(cfg: dict, timeout_s: float = 5) -> str:
-    """"running …" when the engine answers (both modes), otherwise "not responding: …" / "not running: …"."""
+def presidio_health(cfg: dict, timeout_s: float | None = None) -> str:
+    """"running …" when the engine answers (both modes), otherwise "not responding: …" / "not running: …".
+
+    Container mode waits up to `engine.timeout_s` like an analysis does: a container started on demand (reverse proxy
+    holding the request, or answering 307/50x) is still starting, not down."""
     try:
         e = engine_cfg(cfg)
     except FilterError as err:
         return f"not running: {err}"
     if e["mode"] == "local":
         try:
-            answer = engine_socket.request({"op": "health"}, timeout_s)
+            answer = engine_socket.request({"op": "health"}, timeout_s or 5)
         except engine_socket.EngineNotRunning:
             return f"not running: {LOCAL_NOT_RUNNING}"
         except engine_socket.EngineUnavailable as err:
@@ -215,11 +219,27 @@ def presidio_health(cfg: dict, timeout_s: float = 5) -> str:
         status = answer.get("status") if isinstance(answer, dict) else answer
         return f"running (local engine: {status})"
     url = str(e["container_url"]).rstrip("/")
-    try:
-        with urllib.request.urlopen(f"{url}/health", timeout=timeout_s) as resp:
-            return f"running ({resp.read(200).decode('utf-8', 'replace').strip()})"
-    except Exception as e:  # noqa: BLE001 — diagnostics only
-        return f"not responding: {type(e).__name__}: {e}"
+    timeout_s = float(timeout_s or e["timeout_s"])
+    start = time.monotonic()
+    deadline = start + timeout_s
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return f"not responding: no answer within {timeout_s:.0f} s (engine.timeout_s)"
+        try:
+            with _OPENER.open(f"{url}/health", timeout=remaining) as resp:
+                answer = resp.read(200).decode("utf-8", "replace").strip()
+        except urllib.error.HTTPError as err:
+            if err.code in RETRY_STATUSES:
+                time.sleep(min(2.0, max(0.0, deadline - time.monotonic())))
+                continue
+            return f"not responding: HTTP {err.code}"
+        except TimeoutError:
+            return f"not responding: no answer within {timeout_s:.0f} s (engine.timeout_s)"
+        except Exception as err:  # noqa: BLE001 — diagnostics only
+            return f"not responding: {type(err).__name__}: {err}"
+        waited = time.monotonic() - start
+        return f"running ({answer}{f'; woke up in {waited:.0f} s' if waited >= 3 else ''})"
 
 
 OLLAMA_PROMPT = """You are a personal data filter. The text below may be in Polish or English. Some of its data \
