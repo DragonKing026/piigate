@@ -65,7 +65,8 @@ class PseudonymMap:
 
     def mask_value(self, value: str, mask_class: str) -> str:
         """Mask of a table value: same value → same mask (joins, grouping), without the original."""
-        return f"{mask_class}:{self.digest('mask\0' + value)[:6]}"
+        digest = self.digest("mask\0" + value)
+        return f"{mask_class}:{digest[:6]}"
 
     def pseudonym(self, type_: str, label: str, value: str, number: int | None = None) -> str:
         """Stable pseudonym of a value; `number` — assign an existing number (inflected surname, a single name part)."""
