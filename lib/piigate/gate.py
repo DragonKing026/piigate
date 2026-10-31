@@ -204,6 +204,33 @@ def strip_db_services(text: str) -> str:
 
     return DB_CLIENT.sub(substitute, text)
 RECURSIVE_FLAGS = re.compile(r"^-(?:[a-zA-Z]*[rR][a-zA-Z]*|-recursive|-dereference-recursive)$")
+# -r/-R is not recursion here (jq -r raw output, gh -R repository, sort -r reverse, sed -r ERE, curl -r range…) —
+# otherwise a jq filter with `[]` counts as a pattern searched from cwd. Other commands keep the flag (deny by default).
+NOT_RECURSIVE_R = {"jq", "gojq", "yq", "gh", "sort", "sed", "date", "curl", "ssh", "less", "bat", "head", "tail", "tac"}
+# only -R is recursion (ls -r reverse order, chmod -r removes the read permission)
+RECURSIVE_UPPER_ONLY = re.compile(r"^(?:-[a-zA-Z]*R[a-zA-Z]*|--recursive)$")
+UPPER_ONLY_COMMANDS = {"ls", "chmod", "chown", "chgrp"}
+
+
+def _recursive_flag(cmd: str, stage: list[str]) -> bool:
+    """The stage has a flag that makes its command recurse into directories."""
+    if cmd in NOT_RECURSIVE_R:
+        return False
+    flags = RECURSIVE_UPPER_ONLY if cmd in UPPER_ONLY_COMMANDS else RECURSIVE_FLAGS
+    return any(flags.match(t) for t in stage[1:])
+
+
+def _listing_paths(cmd: str, arguments: list[str]) -> list[str]:
+    """Path operands of ls/find/tree/du (none — they list cwd): find — the words before the expression, the others —
+    the words that are not options."""
+    if cmd == "find":
+        paths = []
+        for t in arguments:
+            if t.startswith(("-", "(", "!")):
+                break
+            paths.append(t)
+        return paths
+    return [t for t in arguments if not t.startswith("-")]
 # searchers: family → options whose value is a file-name filter (not a path), and options that supply the pattern
 FAMILIES = {
     "grep": "grep", "egrep": "grep", "fgrep": "grep", "zgrep": "grep",
@@ -633,15 +660,7 @@ class Gate:
                 arguments = arguments[:-2]
             if any(t in REDIRECTS or t in FIND_ACTIONS or "from" in t.casefold() for t in arguments):
                 return False  # tree --fromfile, du --files0-from, find -files0-from read names from a file
-            if cmd == "find":
-                paths = []
-                for t in arguments:
-                    if t.startswith(("-", "(", "!")):
-                        break
-                    paths.append(t)
-            else:
-                paths = [t for t in arguments if not t.startswith("-")] or ["."]
-            for s in paths or ["."]:
+            for s in _listing_paths(cmd, arguments) or ["."]:
                 if re.search(r"[*?\[{]", s):
                     return False  # glob/braces in the path — the inside of a sensitive directory cannot be checked here
                 p = _path(s, self.cwd)
@@ -1338,10 +1357,21 @@ class Gate:
             # does not reach subdirectories; rg, fd, ag, find… search the tree by default
             recursion = (
                 (cmd in SEARCHERS and FAMILIES.get(cmd) != "grep")
-                or any(RECURSIVE_FLAGS.match(t) for t in stage)
+                or _recursive_flag(cmd, stage)
                 or (FAMILIES.get(cmd) == "grep" and GREP_RECURSE.search(" ".join(stage)) is not None)
             )
             skip, filters, no_path = self._searcher_args(stage)
+            if cmd in LISTING_COMMANDS and stage[0] == cmd and not no_path:
+                # `ls -R`, `tree`, `find`, `du -a` without a path list cwd (a redirection — `2 > /dev/null` as the
+                # tokenizer splits it — is not an operand)
+                redirect = [t in REDIRECTS or re.fullmatch(r"\d?>&?|&>>?", t) is not None for t in stage]
+                redirected = {i + 1 for i, r in enumerate(redirect) if r}
+                redirected |= {i for i, t in enumerate(stage[:-1]) if t.isdigit() and redirect[i + 1]}
+                arguments = [
+                    t for i, t in enumerate(stage[1:], 1)
+                    if i not in redirected and t not in REDIRECTS and not re.fullmatch(r"[|<>&;()]+|\d?>&?\d?", t)
+                ]
+                no_path = not _listing_paths(cmd, arguments)
             skip |= self._text_args(stage)
             program = self._program_text(stage)
             for v in filters:  # --include=*.csv, -t csv: the name filter reaches for data files

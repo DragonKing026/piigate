@@ -266,6 +266,9 @@ through the full text filter.
   `glob('name.*')` is code assembling a path). Text is not read as paths: the title, body and search of `gh issue/pr`
   (not `--body-file`/`-F`), a dotted name used only as a call (`json.dump(`) and `$VAR` in a quoted heredoc body read
   by a non-shell, and a quoted sed/awk program as a glob (it is still checked as a plain path and for directory names).
+  `-r`/`-R` is recursion except for commands where it means something else (`jq -r`, `gh -R`, `sort -r`, `sed -r`…;
+  for `ls`/`chmod` only `-R`), so a jq filter with `[]` is not a pattern searched from the working directory; `ls -R`,
+  `tree`, `find` and `du` without a path list the working directory and are checked like `ls -R .`.
   The gate is a seat belt against mistakes and shortcuts, not a sandbox.
 - **The engine is trusted by address.** piigate protects the socket directory and refuses non-loopback engines, but a
   process of the same user that answers on the engine socket or port first can make NER report nothing (the rules
