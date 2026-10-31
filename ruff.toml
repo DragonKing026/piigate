@@ -1,0 +1,12 @@
+# CI runs `ruff check .` with the version pinned in .github/workflows/test.yml.
+target-version = "py311"
+
+[lint]
+# Correctness rules only (pyflakes + the pycodestyle error subset); style rules are not enforced.
+select = ["E4", "E7", "E9", "F"]
+
+[lint.per-file-ignores]
+# Tests and the red-team provider put lib/ on sys.path first, so their imports are intentionally not at the top.
+"tests/**" = ["E402"]
+# Short one-line lambda fixtures.
+"tests/fixtures.py" = ["E731"]

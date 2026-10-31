@@ -1,0 +1,48 @@
+---
+name: test
+
+"on":
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    env:
+      # No Presidio here: the text tests skip themselves
+      # (the full suite runs in test-full.yml).
+      PIIGATE_PRESIDIO_URL: http://127.0.0.1:1
+    steps:
+      # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      # v7.0.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: ${{ matrix.python-version }}
+      # v10.3.0
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884
+        with:
+          enable-cache: false
+      - name: Library, hooks and gate (without Presidio)
+        run: python3 -I tests/test_filter.py
+      - name: MCP server
+        run: uv run --quiet --script tests/test_mcp.py
+      - name: Lint
+        run: |
+          pip install ruff==0.16.10
+          ruff check .
+      - name: Manifests and config are valid JSON
+        run: |
+          for f in .claude-plugin/*.json hooks/hooks.json .mcp.json config.json; do
+            python3 -m json.tool "$f" > /dev/null
+          done

@@ -1,0 +1,55 @@
+---
+name: test-full
+
+# The full suite with the Presidio container engine. The image is built on
+# the runner and never pushed anywhere: it contains the GPL-3.0 model
+# pl_core_news_lg (see README, "Model license").
+"on":
+  schedule:
+    - cron: "53 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  full:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      PIIGATE_PRESIDIO_URL: http://127.0.0.1:8719
+    steps:
+      # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      # v7.0.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.13"
+      # v10.3.0
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884
+        with:
+          enable-cache: false
+      - name: Build the Presidio image (not pushed)
+        run: docker build -t piigate-presidio:ci docker/
+      - name: Start the container on loopback
+        run: >-
+          docker run -d --name piigate-presidio
+          -p 127.0.0.1:8719:3000 piigate-presidio:ci
+      - name: Wait for /health (first start takes ~3 minutes)
+        run: |
+          for _ in $(seq 1 60); do
+            if curl -sf -m 10 -L "$PIIGATE_PRESIDIO_URL/health" > /dev/null; then
+              exit 0
+            fi
+            sleep 5
+          done
+          docker logs piigate-presidio || true
+          echo "Presidio did not become healthy" >&2
+          exit 1
+      - name: Full test suite
+        run: tests/run.sh
+      - name: Container logs on failure
+        if: failure()
+        run: docker logs piigate-presidio || true

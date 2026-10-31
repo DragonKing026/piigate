@@ -2,6 +2,11 @@
 
 # piigate
 
+[![test](https://github.com/DragonKing026/piigate/actions/workflows/test.yml/badge.svg)](https://github.com/DragonKing026/piigate/actions/workflows/test.yml)
+[![CodeQL](https://github.com/DragonKing026/piigate/actions/workflows/codeql.yml/badge.svg)](https://github.com/DragonKing026/piigate/actions/workflows/codeql.yml)
+[![security](https://github.com/DragonKing026/piigate/actions/workflows/security.yml/badge.svg)](https://github.com/DragonKing026/piigate/actions/workflows/security.yml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/DragonKing026/piigate/badge)](https://scorecard.dev/viewer/?uri=github.com/DragonKing026/piigate)
+
 **Keeps personal data (PII/PHI) out of Claude's context.** piigate is a [Claude Code](https://claude.com/claude-code)
 plugin: a gate on tool calls, a filter on tool output, stable pseudonyms instead of names, and MCP tools that let the agent
 work with sensitive files without ever seeing the originals. Built for Polish and English data.
