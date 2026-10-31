@@ -2601,6 +2601,46 @@ class TestFalseAlarms(unittest.TestCase):
                     self.assertIsNone(b.bash(command))
         self.assertIsNotNone(self.gate(self.phi).bash("ls ./*.c*v; cat p*.csv"))  # outside system directories
 
+    def test_r_flag_of_non_searcher_is_not_recursion(self):
+        """jq -r (raw output) and gh -R (repository) are not recursion: a jq filter with `[]` is not a pattern searched
+        from cwd — in a project with a sensitive directory it was denied as `.`. Searches and recursive listings of cwd
+        (also without a path: `ls -R`, `tree`, `find`, `du -a`) are still denied."""
+        (self.public / "Sensitive-data").mkdir()
+        b = self.gate(self.public)
+        for command in (
+            "curl -s https://example.org/x | jq -r '\"score \\(.score)\", (.checks[]|select(.score<10)|\"\\(.name)\")'",
+            "gh issue list -R owner/repo --state all --json number,title -q '.[]|\"#\\(.number) \\(.title)\"'",
+            "jq -r '.a[]' compose.yml",
+            "echo '{\"a\":1}' | jq -r .a",
+            # issue #13 and its comment
+            "gh issue list -R owner/repo --limit 1 --json title -q '.[].title' 2>&1 | piigate text",
+            "gh release view v3.0.0 -R owner/repo --json isDraft,assets -q '\"draft=\\(.isDraft) \" + ([.assets[].name]|join(\" \"))'",
+            "echo \"$(jq -r '.hooks.PreToolUse[0].hooks[0].command' compose.yml)\"",
+            "gh issue comment 13 -R owner/repo --body \"denied: jq -r '.checks[]|.name'\"",
+            "sort -r packages.tsv",
+            "ls -ltr",
+            "ls -R src 2>/dev/null",
+            "find src -name '*.py'",
+        ):
+            with self.subTest(command):
+                self.assertIsNone(b.bash(command))
+        for command in (
+            "grep -r foo",
+            "grep -r foo .",
+            "rg --no-ignore foo",
+            "ls -R",
+            "ls -lR 2>/dev/null",
+            "ls -R .",
+            "tree",
+            "find",
+            "find -name x 2> /dev/null",
+            "du -a",
+            "xargs grep -r foo .",
+            "jq -r . Sensitive-data/x.json",
+        ):
+            with self.subTest(command):
+                self.assertIsNotNone(b.bash(command))
+
     def test_searches_in_repo_without_phi(self):
         b = self.gate(self.public)
         for command in (
