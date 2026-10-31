@@ -2,7 +2,7 @@
 
 The targets are the property tests of tests/test_properties.py: Hypothesis turns the fuzzer's bytes into the same
 generated inputs and runs the same assertions, so a crash or a broken property found by Atheris is a failing test.
-Not part of the quick CI suite (needs atheris and a clang-built interpreter module; see README, "Development"). Run:
+Not part of the quick CI suite (needs atheris and a clang-built interpreter module; see README, "Testing"). Run:
 
     pip install atheris && python3 tests/fuzz_properties.py -max_total_time=60
 
