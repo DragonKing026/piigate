@@ -232,7 +232,7 @@ def fake_health(hold_s: float = 0, errors: int = 0, code: int = 503):
             if left[0] > 0:
                 left[0] -= 1
                 self.send_response(code)
-                self.send_header("Location", self.path)
+                self.send_header("Location", "/health")
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
