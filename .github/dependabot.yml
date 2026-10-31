@@ -10,3 +10,19 @@ updates:
       actions:
         patterns:
           - "*"
+  - package-ecosystem: pip
+    directory: /tests
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 14
+    groups:
+      test-dependencies:
+        patterns:
+          - "*"
+  - package-ecosystem: docker
+    directory: /docker
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 14

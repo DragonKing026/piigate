@@ -1,7 +1,8 @@
 # piigate container engine: Presidio Analyzer (Data Privacy Stack) + Polish spaCy model, built on YOUR machine.
 #
 # The image is never published: pl_core_news_lg is licensed GPL-3.0 (see README, "Model license"); you download it
-# here, at build time, from explosion/spacy-models and the build checks its sha256. piigate itself stays MIT.
+# here, at build time, from explosion/spacy-models; URL and sha256 are in pl-model-requirements.txt and pip checks the
+# hash. piigate itself stays MIT.
 #
 #   docker build -t piigate-presidio:2.2.366 docker/
 #   docker run -d --name piigate-presidio --network none ...   # see README, "Container engine"
@@ -12,12 +13,10 @@ ARG BUILDER=ghcr.io/data-privacy-stack/presidio-analyzer:2.2.366@sha256:036d2f9b
 ARG BASE=ghcr.io/data-privacy-stack/presidio-analyzer:2.2.366-distroless@sha256:84cb78c12a26d7ff4d2f5b980452dd9983c0a5c8c56ee410226bb6bb3f19f7d8
 
 FROM ${BUILDER} AS model
-ARG PL_MODEL_URL=https://github.com/explosion/spacy-models/releases/download/pl_core_news_lg-3.8.0/pl_core_news_lg-3.8.0-py3-none-any.whl
-ARG PL_MODEL_SHA256=3bc7296cd4d67fa9ee0904b25401b0e9a9a772d5c4756edf54143a2ff4c9dcc0
+COPY pl-model-requirements.txt /tmp/pl-model-requirements.txt
 USER root
-RUN python -c "import urllib.request; urllib.request.urlretrieve('${PL_MODEL_URL}', '/tmp/pl_core_news_lg-3.8.0-py3-none-any.whl')" \
- && echo "${PL_MODEL_SHA256}  /tmp/pl_core_news_lg-3.8.0-py3-none-any.whl" | sha256sum -c - \
- && pip install --no-deps --no-compile --target /out /tmp/pl_core_news_lg-3.8.0-py3-none-any.whl
+# pip downloads the wheel itself and refuses it unless its sha256 matches the requirements file (--require-hashes)
+RUN pip install --require-hashes --no-deps --no-compile --target /out -r /tmp/pl-model-requirements.txt
 
 FROM ${BASE}
 COPY --from=model /out/ /usr/lib/python3.12/site-packages/
