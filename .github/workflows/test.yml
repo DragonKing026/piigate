@@ -37,14 +37,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ripgrep poppler-utils
+      - name: Test dependencies (hypothesis, ruff), pinned by hash
+        run: pip install --require-hashes -r tests/requirements.txt
       - name: Library, hooks and gate (without Presidio)
         run: python3 -I tests/test_filter.py
+      - name: Property tests (Hypothesis)
+        run: python3 -I tests/test_properties.py
       - name: MCP server
         run: uv run --quiet --script tests/test_mcp.py
       - name: Lint
-        run: |
-          pip install ruff==0.16.10
-          ruff check .
+        run: ruff check .
       - name: Manifests and config are valid JSON
         run: |
           for f in .claude-plugin/*.json hooks/hooks.json .mcp.json config.json; do

@@ -1,0 +1,4 @@
+# Test and lint dependencies; hashes are required (pip install --require-hashes). Regenerate:
+#   uv pip compile --universal --python-version 3.11 --generate-hashes --exclude-newer <date 2 weeks ago> tests/requirements.in -o tests/requirements.txt
+hypothesis
+ruff==0.16.10

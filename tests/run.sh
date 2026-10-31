@@ -13,6 +13,7 @@ if ! curl -sf -m 10 -L "$presidio/health" >/dev/null 2>&1; then
         "a container start may take ~2 min; set PIIGATE_PRESIDIO_URL for another address)" >&2
 fi
 python3 -I "$dir/test_filter.py"
+python3 -I "$dir/test_properties.py"  # Hypothesis (tests/requirements.txt); skips itself when not installed
 if command -v uv >/dev/null; then
     uv run --quiet --script "$dir/test_mcp.py"
 else
