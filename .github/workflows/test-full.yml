@@ -52,6 +52,8 @@ jobs:
           docker logs piigate-presidio || true
           echo "Presidio did not become healthy" >&2
           exit 1
+      - name: Test dependencies (hypothesis for the property tests), pinned by hash
+        run: pip install --require-hashes -r tests/requirements.txt
       - name: Full test suite
         run: tests/run.sh
       - name: Container logs on failure
