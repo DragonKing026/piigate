@@ -905,6 +905,8 @@ class TestAnonymization(unittest.TestCase):
         self.assertIn("Kwota: plain", anonymization.report(w))
 
     def test_write_only_to_allowed(self):
+        if not PRESIDIO:  # anonymize() runs the text filter, which needs the NER engine
+            self.skipTest(PRESIDIO_SKIP)
         with self.assertRaises(FilterError):
             anonymization.anonymize("a.txt", b"x", self.cfg, dest=str(TMP / "anywhere"))
         w = anonymization.anonymize("a.txt", b"x", self.cfg, dest=str(self.sensitive / "result"))
@@ -918,6 +920,8 @@ class TestAnonymization(unittest.TestCase):
         return base64.b64encode(t.encode()).decode()
 
     def test_symlink_in_output_dir(self):
+        if not PRESIDIO:  # anonymize() runs the text filter, which needs the NER engine
+            self.skipTest(PRESIDIO_SKIP)
         dest = self.sensitive / "result-symlink"
         dest.mkdir(exist_ok=True)
         victim = TMP / "victim.txt"
@@ -2041,6 +2045,8 @@ class TestProjectDataDirs(unittest.TestCase):
         self.assertEqual(config.project_roots(str(self.base)), [])
 
     def test_copy_in_project_with_gitignore(self):
+        if not PRESIDIO:  # anonymize() runs the text filter, which needs the NER engine
+            self.skipTest(PRESIDIO_SKIP)
         k = self.cfg()
         w = anonymization.anonymize("notatka.txt", b"Spotkanie we wtorek.\n", k)
         folder = self.proj / "Anonymized-data"
