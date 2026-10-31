@@ -31,6 +31,10 @@ jobs:
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884
         with:
           enable-cache: false
+      - name: System packages (ripgrep, poppler) from the README requirements
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ripgrep poppler-utils
       - name: Build the Presidio image (not pushed)
         run: docker build -t piigate-presidio:ci docker/
       - name: Start the container on loopback
