@@ -203,12 +203,19 @@ def strip_db_services(text: str) -> str:
         return "_" if SERVICE_COMMANDS.search(segment) else m.group()
 
     return DB_CLIENT.sub(substitute, text)
-RECURSIVE_FLAGS = re.compile(r"^-(?:[a-zA-Z]*[rR][a-zA-Z]*|-recursive|-dereference-recursive)$")
+CHAIN_SAFE = {
+    "ls", "tree", "du", "cat", "head", "tail", "wc", "stat", "file", "echo", "printf", "true",
+    "grep", "egrep", "fgrep", "rg", "fd", "find",
+}
+LS_LONG_PLAIN = {"--color", "--all", "--almost-all", "--directory", "--classify", "--human-readable", "--size", "--inode"}
+# GNU getopt accepts any unambiguous prefix of a long option: `--rec`, `--recur`… are --recursive (`--re` is ambiguous)
+_RECURSIVE_LONG = r"-rec(?:u(?:r(?:s(?:i(?:v(?:e)?)?)?)?)?)?"
+RECURSIVE_FLAGS = re.compile(rf"^-(?:\w*[rR]\w*|{_RECURSIVE_LONG}|-dereference-recursive)$")
 # -r/-R is not recursion here (jq -r raw output, gh -R repository, sort -r reverse, sed -r ERE, curl -r range…) —
 # otherwise a jq filter with `[]` counts as a pattern searched from cwd. Other commands keep the flag (deny by default).
 NOT_RECURSIVE_R = {"jq", "gojq", "yq", "gh", "sort", "sed", "date", "curl", "ssh", "less", "bat", "head", "tail", "tac"}
 # only -R is recursion (ls -r reverse order, chmod -r removes the read permission)
-RECURSIVE_UPPER_ONLY = re.compile(r"^(?:-[a-zA-Z]*R[a-zA-Z]*|--recursive)$")
+RECURSIVE_UPPER_ONLY = re.compile(rf"^(?:-\w*R\w*|-{_RECURSIVE_LONG})$")
 UPPER_ONLY_COMMANDS = {"ls", "chmod", "chown", "chgrp"}
 
 
@@ -362,6 +369,12 @@ def unfiltered_tools(cfg: dict) -> list[dict]:
 def unfiltered_entry(entries: list[dict], tool: str) -> dict | None:
     """The `unfiltered_tools` entry whose `mcp_tools` regex matches the MCP tool name."""
     return next((e for e in entries if e.get("mcp_tools") and re.search(e["mcp_tools"], tool)), None)
+
+
+class QuotedToken(str):
+    """A word that came whole from one quoted fragment: no glob, no brace expansion (issue #19)."""
+
+    quoted = True
 
 
 class Gate:
@@ -1130,13 +1143,14 @@ class Gate:
     @staticmethod
     def _tokens(command: str) -> list[str] | None:
         # an unquoted newline separates commands like `;` (issue #21): shlex would treat it as blank space, and
-        # `echo x<newline>cat <dir>/a.txt` would look like one `echo` stage. It becomes the token "\n"; a
-        # backslash-newline is a line continuation (blank space).
+        # `echo x<newline>cat <dir>/a.txt` would look like one `echo` stage. It becomes the token "\n". A
+        # backslash-newline is removed and joins the words around it, as in bash (`Sens\<nl>itive` is one word).
         marked, quote, i = [], "", 0
         while i < len(command):
             z = command[i]
             if z == "\\" and quote != "'" and i + 1 < len(command):
-                marked.append(" " if command[i + 1] == "\n" and not quote else command[i : i + 2])
+                if command[i + 1] != "\n":
+                    marked.append(command[i : i + 2])
                 i += 2
                 continue
             if quote:
@@ -1147,13 +1161,59 @@ class Gate:
                 z = " \x00 "
             marked.append(z)
             i += 1
-        lex = shlex.shlex("".join(marked), posix=True, punctuation_chars=";&|()<>")
+        text = "".join(marked)
+        lex = shlex.shlex(text, posix=True, punctuation_chars=";&|()<>")
         lex.whitespace_split = True
         lex.commenters = ""
         try:
-            return ["\n" if t == "\x00" else t for t in lex]
+            words = list(lex)
         except ValueError:
             return None
+        flags = Gate._quoted_words(text)
+        if flags is None or len(flags) != len(words):
+            flags = [False] * len(words)
+        return [QuotedToken(t) if q else ("\n" if t == "\x00" else t) for t, q in zip(words, flags)]
+
+    @staticmethod
+    def _quoted_words(text: str) -> list[bool] | None:
+        """For every token of `text` (as shlex splits it): the token is one whole quoted fragment ('…' or "…"), alone or
+        after `--option=` — the shell neither globs nor brace-expands it. A token with any unquoted character, escaped
+        or not (`''*`, `'a'b`, `\\*`), is not. None when the scan cannot be trusted."""
+        flags: list[bool] = []
+        i, n = 0, len(text)
+        while i < n:
+            z = text[i]
+            if z in " \t\r":
+                i += 1
+            elif z in ";&|()<>":
+                while i < n and text[i] in ";&|()<>":
+                    i += 1
+                flags.append(False)
+            else:
+                before, quotes, after = "", 0, False
+                while i < n and text[i] not in " \t\r;&|()<>":
+                    z = text[i]
+                    if z == "\\":
+                        after = after or quotes > 0
+                        before += "\\" if not quotes else ""
+                        i += 2
+                    elif z in "'\"":
+                        j = i + 1
+                        while j < n and text[j] != z:
+                            j += 2 if z == '"' and text[j] == "\\" else 1
+                        if j >= n:
+                            return None
+                        after = after or quotes > 0
+                        quotes += 1
+                        i = j + 1
+                    else:
+                        if quotes:
+                            after = True
+                        else:
+                            before += z
+                        i += 1
+                flags.append(quotes == 1 and not after and re.fullmatch(r"(?:--[\w-]+=)?", before) is not None)
+        return flags
 
     def _token_kind(
         self, t: str, recursion: bool, content: bool = True, literal: bool = False, verbatim: bool = False
@@ -1450,48 +1510,95 @@ class Gate:
                 return r, kinds[r]
         return None, ""
 
+    @staticmethod
+    def _chain_safe(stage: list[str]) -> bool:
+        """A stage that certainly keeps the working directory and runs no shell or other code: a plain (unwrapped,
+        no assignments) reader or lister from CHAIN_SAFE without an option that executes something."""
+        if not stage or stage[0] not in CHAIN_SAFE:
+            return False
+        cmd = stage[0]
+        for t in stage[1:]:
+            if cmd == "find" and t in FIND_ACTIONS:
+                return False
+            if cmd == "rg" and t.startswith(("--pre", "--hostname-bin")):
+                return False
+            if cmd == "fd" and (t in ("-x", "-X") or t.startswith(("--exec", "-x", "-X"))):
+                return False
+        return True
+
+    @staticmethod
+    def _cd_target(stage: list[str]) -> str | None:
+        """The literal directory of `cd X` / `cd -L|-P X` / `pushd X` (redirections ignored), None for anything else —
+        `cd -`, `cd ~-`, `cd $X`, a glob, `pushd -n X`, `pushd +1`, a second operand."""
+        if stage[0] not in ("cd", "pushd"):
+            return None
+        args, skip = [], 0
+        for j, a in enumerate(stage[1:], 1):  # without redirections (`cd x 2>/dev/null`, `cd x &>f`)
+            follows = stage[j + 1] if j + 1 < len(stage) else ""
+            if skip:
+                skip -= 1
+            elif a in REDIRECTS or re.fullmatch(r"\d?>&?|&>>?", a):
+                skip = 1  # the file after it
+            elif a.isdigit() and (follows in REDIRECTS or re.fullmatch(r"\d?>&?|&>>?", follows)):
+                skip = 2  # the descriptor, the operator and the file
+            else:
+                args.append(a)
+        while args and (args[0] == "--" or (stage[0] == "cd" and args[0] in ("-L", "-P"))):
+            args.pop(0)
+        if len(args) > 1:
+            return None
+        target = args[0] if args else "~"
+        if not target or target[0] in "-+" or re.search(r"[$`*?\[\]{}\\()!]", target):
+            return None
+        if "~" in target and target != "~" and not target.startswith("~/"):
+            return None
+        return target
+
     def _stage_dirs(self, command: str, tokens: list[str]) -> list[list[str]]:
-        """For every stage of _stages_loose: the directories it may run in. `cd X` / `pushd X` with a literal X moves
-        the stages joined to it by `&&` to X; after any other operator (`;`, `||`, `|`, `&`, parentheses — the cd may
-        have failed or run in a subshell) a stage may run in any directory seen so far. A non-literal target (`cd -`,
-        `cd "$D"`) and a multi-line command keep the session directory among the candidates."""
-        sure = [self.cwd]  # where the stage runs when every `&&` before it succeeded
+        """For every stage of _stages_loose: the directories it may run in (the session directory is always one).
+        The directory is narrowed only while the command is a chain of `&&` that consists of `cd X` / `pushd X` with a
+        literal X and plain readers or listers (CHAIN_SAFE): then each stage runs in the last literal target. Anything
+        else — another operator (`;`, `||`, `|`, `&`, a newline, a parenthesis), a wrapper (`builtin`, `command`, `env`,
+        `eval`), an assignment, a function or alias, `popd`, a non-literal `cd` (`cd -`, `cd "$D"`), a shell — ends the
+        narrowing for the rest of the command: from there every stage is checked in the session directory and in every
+        directory the literal `cd`s reached (relative to each of them). `cd` through CDPATH is not followed."""
         seen = [self.cwd]  # every directory a stage may run in
-        multiline = "\n" in command.strip()
+        sure = [self.cwd]  # where the stage runs while the narrowing holds
+        narrow = True
         result: list[list[str]] = []
         stage: list[str] = []
-        previous = ";"  # the operator before the stage
         for t in [*tokens, ";"]:
             if not (t in FORBIDDEN_OPERATORS or t in ("|", "|&") or re.fullmatch(r"[;&|()]+", t)):
                 stage.append(t)
                 continue
             if stage:
-                result.append(list(sure))
-                args, skip = [], 0
-                for j, a in enumerate(stage[1:], 1):  # without options and redirections (`cd x 2>/dev/null`, `cd x &>f`)
-                    follows = stage[j + 1] if j + 1 < len(stage) else ""
-                    if skip:
-                        skip -= 1
-                    elif a in REDIRECTS or re.fullmatch(r"\d?>&?|&>>?", a):
-                        skip = 1  # the file after it
-                    elif a.isdigit() and (follows in REDIRECTS or re.fullmatch(r"\d?>&?|&>>?", follows)):
-                        skip = 2  # the descriptor, the operator and the file are skipped
-                    elif a not in ("-L", "-P", "--"):
-                        args.append(a)
-                if Path(stage[0]).name in ("cd", "pushd") and len(args) <= 1 and not multiline:
-                    target = args[0] if args else "~"
-                    if re.fullmatch(r"~?[^$`~*?\[\]{}\\]*", target) and target != "-":
-                        moved = [_path(target, d) for d in sure]
-                        # after `||`, `|`, `&` the cd may have been skipped (`true || cd x && ls` runs ls where it was)
-                        sure = moved if previous in (";", "&&", "\n", "(") else [*seen, *moved]
-                        seen += [d for d in moved if d not in seen]
-                elif Path(stage[0]).name in ("popd",):
-                    sure = list(seen)
+                target = self._cd_target(stage)
+                if narrow and target is None and not self._chain_safe(stage):
+                    narrow = False
+                result.append(list(sure if narrow else seen))
+                if target is not None:
+                    moved = [_path(target, d) for d in (sure if narrow else seen)]
+                    seen += [d for d in moved if d not in seen]
+                    if narrow:
+                        sure = moved
                 stage = []
             if t != "&&":
-                sure = list(seen)
-            previous = t
+                narrow = False
         return result
+
+    @staticmethod
+    def _ls_plain(stage: list[str]) -> bool:
+        """An `ls` that certainly does not recurse: only short option clusters, `--` and a few known long options (GNU
+        ls accepts abbreviated long options, so any other long one — `--recur` — is not trusted)."""
+        for t in stage[1:]:
+            if t == "--":
+                break
+            if t.startswith("--"):
+                if t.split("=", 1)[0] not in LS_LONG_PLAIN:
+                    return False
+            elif t.startswith("-") and not re.fullmatch(r"-[A-QS-Za-z0-9]*", t):
+                return False
+        return True
 
     def _stage_kinds(
         self, stage: list[str], c: set[int], text: str, literal, verbatim, body: str, read_paths: set[str]
@@ -1533,13 +1640,9 @@ class Gate:
                 r = self._token_kind(t, False, content=i not in c)  # sensitive directories under t are skipped (.ignore)
                 if not r and _ancestor(_path(t, self.cwd), self.protected):
                     r = ("protected", t)
-            elif i in program and re.search(
-                rf"(['\"]){re.escape(t)}\1" if not t.startswith("--") or "=" not in t
-                else rf"{re.escape(t.split('=', 1)[0])}=(['\"]){re.escape(t.split('=', 1)[1])}\1",
-                text,
-            ):
-                # quoted in the command (`--jq='…'`: the value): one word, no glob (an unquoted `sed ~/D*` expands
-                # into the file operands)
+            elif i in program and getattr(t, "quoted", False):
+                # this very word is one quoted fragment (`'…'`, `--jq='…'`): no glob, no braces (an unquoted
+                # `sed ~/D*` expands into the file operands; a same-looking quoted word elsewhere changes nothing)
                 r = self._token_kind(t, False, content=i not in c, verbatim=True)
             elif t in literal:
                 r = self._literal_kind(t, t in verbatim, body, recursion, content=i not in c)
@@ -1547,7 +1650,7 @@ class Gate:
                 r = self._token_kind(t, recursion, content=i not in c)
             if r and r[0] == "extension" and i in c and _path(r[1], self.cwd) not in read_paths:
                 continue  # write only — no content comes back to the model
-            if r and r[0] == "extension" and stage[0] == "ls" and not recursion:
+            if r and r[0] == "extension" and stage[0] == "ls" and not recursion and self._ls_plain(stage):
                 continue  # `ls .markdownlint*`: names only, a pattern here reads no data file (issue #20)
             if r:
                 found.append(r)

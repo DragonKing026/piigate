@@ -2710,9 +2710,10 @@ class TestFalseAlarms(unittest.TestCase):
         self.assertIsNotNone(self.gate(self.phi).bash("jq '.[] // 1' people.csv"))
 
     def test_relative_paths_after_cd(self):
-        """Issue #18: after `cd X &&` relative paths, globs and the implicit `.` are resolved against X. When the cd
-        may have failed or run in a subshell (`;`, `||`, `|`, parentheses, a non-literal target, several lines), the
-        stage is checked against every directory it may run in — the session directory included."""
+        """Issue #18: after `cd X &&` relative paths, globs and the implicit `.` are resolved against X — only in a chain
+        of `&&` made of literal `cd`/`pushd` and plain readers/listers. Any other operator or stage (a wrapper, an
+        assignment, a function, a non-literal target, a shell, several lines) ends the narrowing: the rest of the command
+        is checked in every directory it may run in — the session directory included."""
         (self.public / "Sensitive-data").mkdir()
         (self.public / "raporty" / "nocne").mkdir(parents=True)
         (self.public / "raporty" / "nocne" / "2026-11-01").mkdir()
@@ -2720,7 +2721,6 @@ class TestFalseAlarms(unittest.TestCase):
         for command in (
             "cd raporty/nocne && ls -d */ | head -2",
             f"cd {self.public}/raporty/nocne && ls -R",
-            "cd raporty/nocne && for d in */; do echo $d; done",
             "cd raporty && cd nocne && grep -r foo",
             "pushd raporty/nocne && tree",
             "cd -P raporty/nocne && find . -name '*.md'",
@@ -2747,9 +2747,102 @@ class TestFalseAlarms(unittest.TestCase):
             "cd raporty && ls -R ..",
             "true || cd raporty/nocne && ls -R",
             "cd raporty/nocne 2>&1 && cd ../.. && ls -R",
+            # the narrowing ends at anything but a literal cd / plain reader joined by `&&` (security review of #18)
+            "cd raporty/nocne && cd - && ls -d */",
+            "cd raporty/nocne && cd $OLDPWD && ls -d */",
+            "cd raporty/nocne && cd ~- && ls -d */",
+            "cd raporty/nocne && cd \"$PWD/..\" && ls -d */",
+            "cd raporty/nocne && cd $(pwd)/../.. && ls -d */",
+            "X=../.. && cd raporty/nocne && cd $X && ls -d */",
+            "cd raporty/nocne && cd - >/dev/null && ls -d */",
+            "cd raporty/nocne && cd -- - && ls -d */",
+            "cd raporty/nocne && builtin cd ../.. && ls -d */",
+            "cd raporty/nocne && command cd ../.. && ls -d */",
+            "cd raporty/nocne && chdir ../.. && ls -d */",
+            "cd raporty/nocne && eval cd ../.. && ls -d */",
+            "cd raporty/nocne && eval 'cd ../..' && ls -d */",
+            "cd raporty/nocne && alias c=cd && c ../.. && ls -d */",
+            "pushd -n raporty/nocne && ls -d */",
+            "pushd raporty/nocne && pushd -0 && ls -d */",
+            "pushd raporty/nocne && pushd +1 && ls -d */",
+            "pushd raporty/nocne && pushd && ls -d */",
+            "f() { cd ../..; }; cd raporty/nocne && f && ls -d */",
+            "cd raporty && bash -c 'cd ..; ls -d */'",
+            "cd raporty && sh -c 'cd ..; ls -d */'",
+            "env -C ../.. ls -d */",
+            "cd raporty/nocne && env -C ../.. ls -d */",
+            "cd raporty/nocne && { cd ../..; } && ls -d */",
+            "cd raporty/nocne && (cd ../..) && ls -d */",
+            "cd raporty/nocne && find . -exec sh -c 'cd ../..; ls -d */' ';' && ls -d */",
+            "cd raporty/nocne && cd ../.. && cat Sens*/a.txt",
         ):
             with self.subTest(command):
                 self.assertIsNotNone(b.bash(command))
+
+    def test_quoting_is_judged_per_word(self):
+        """Issue #19 (review): a word is verbatim only when it is itself one quoted fragment — the same text quoted in
+        another command (`echo '…'`) does not make an unquoted glob in a jq/yq/gh/sed/awk word a plain path."""
+        (self.public / "Sensitive-data").mkdir()
+        b = self.gate(self.public)
+        for command in (
+            "jq {.,Sens*/a.json}; echo '{.,Sens*/a.json}'",
+            "jq Sens*/*.json; echo 'Sens*/*.json'",
+            "jq Sens*/*.json; echo \"Sens*/*.json\"",
+            "jq -n Sens*/*.json && echo 'Sens*/*.json'",
+            "jq Sens*/*.json | cat; echo 'Sens*/*.json'",
+            "yq Sens*/* ; echo 'Sens*/*'",
+            "gh api x -q Sens*/* ; echo 'Sens*/*'",
+            "gh api x --jq=Sens*/* ; echo '--jq=Sens*/*'",
+            "sed Sens*/*.json; echo 'Sens*/*.json'",
+            "sed -n p Sens*/*.json; echo 'Sens*/*.json'",
+            "awk 1 Sens*/*.json; echo 'Sens*/*.json'",
+            "jq -n \\Sens*/*.json",
+            "jq -n ''Sens*/*.json",
+            "jq -n \"\"Sens*/*.json",
+            "jq -n '.'Sens*/*.json",
+            "jq -n 'a'Sens*/*.json 'b'",
+            "echo x >/dev/null; jq Sens*/a.json; echo 'Sens*/a.json'",
+        ):
+            with self.subTest(command):
+                self.assertIsNotNone(b.bash(command))
+        tokens = b._tokens
+        quoted = lambda c: [bool(getattr(t, "quoted", False)) for t in tokens(c)]  # noqa: E731
+        self.assertEqual(quoted("jq 'a*' b* \"c*\" --jq='d*' x'y' ''z"), [False, True, False, True, True, False, False])
+        self.assertEqual(quoted("jq \\*a 'b'c"), [False, False, False])
+        for command in (  # quoted programs stay plain text
+            "jq '.a // .b' notes.md",
+            "gh api x -q '.[] | .name' ",
+        ):
+            with self.subTest(command):
+                self.assertIsNone(b.bash(command))
+
+    def test_backslash_newline_joins_words(self):
+        """Issue #21 (review): a backslash-newline outside quotes vanishes and glues the words, as in bash."""
+        (self.public / "Sensitive-data").mkdir()
+        b = self.gate(self.public)
+        for command in (
+            "cat Sens\\\nitive-data/a.txt",
+            "cat Sensitive\\\n-data/a.txt",
+            "cd Sens\\\nitive-data && cat a.txt",
+            "cd Sens\\\nitive-data\ncat a.txt",
+            "cat Sensitive-data/\\\na.txt",
+        ):
+            with self.subTest(command):
+                self.assertIsNotNone(b.bash(command))
+        self.assertEqual(b._tokens("cat Sens\\\nitive a\\\n b"), ["cat", "Sensitive", "a", "b"])
+
+    def test_ls_recursion_spelled_differently(self):
+        """Issue #20 (review): the `ls` exception never applies to recursion, however spelled."""
+        (self.phi / "Sensitive-data").mkdir()
+        b = self.gate(self.phi)
+        for flag in ("-R", "-1R", "-lR", "-laR", "-Rla", "-lRh", "-RF", "--recursive", "--recurs", "--recur", "--rec"):
+            command = f"ls {flag} *.csv; wc -l notes.md"
+            with self.subTest(command):
+                self.assertIsNotNone(b.bash(command))
+        for command in ("ls --recur *.csv", "ls -1R *.csv", "ls --unknown-option *.csv; wc -l notes.md"):
+            with self.subTest(command):
+                self.assertIsNotNone(b.bash(command))
+        self.assertIsNone(b.bash("ls -1 --color=never -d *.csv; wc -l notes.md"))
 
     def test_directory_name_in_text_still_denied_when_read(self):
         """Issue #7 (point 3): what must stay denied when the shell parser replaces the marker check — a sensitive
