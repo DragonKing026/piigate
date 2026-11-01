@@ -380,7 +380,8 @@ _CAMEL_CASE = re.compile(r"[A-Za-z][a-z0-9]*(?:[A-Z][a-z0-9]*)+")
 
 def technical_term(text: str, start: int, end: int, type_: str) -> bool:
     """Whether a NER hit (PERSON / ORG / ADDRESS) is a technology or package name, not data (issue #3): a known
-    name (`TECH_NAMES`), a lowercase identifier (`cypress-axe`, `ps_customersignin`, `vendor/package`, `webpackbar`)
+    name (`TECH_NAMES`), a lowercase identifier with a separator (`cypress-axe`, `ps_customersignin`, `vendor/package`,
+    `@scope`; never a bare word — it may be a surname)
     or — for ORG / ADDRESS — a CamelCase product name (CommonJS). A part that is a first name (`jan-kowalski`) or a
     surname by suffix keeps the hit: user names built of a person's name stay masked."""
     value = text[start:end].strip(" \t\r\n,;:()[]\"'.")
@@ -399,7 +400,9 @@ def technical_term(text: str, start: int, end: int, type_: str) -> bool:
         return False
     if value.casefold() in TECH_NAMES or token.casefold() in TECH_NAMES:
         return True
-    if _LOWER_IDENTIFIER.fullmatch(token):
+    # a bare lowercase word without a separator may be a surname ("nowak") — only kebab/snake/vendor/@scope qualify
+    scoped = text[s:k].lstrip(" \t\r\n,;:()[]\"'.-/").startswith("@")
+    if _LOWER_IDENTIFIER.fullmatch(token) and (scoped or re.search(r"[-_/]", token)):
         return True
     return type_ in ("ORG", "ADDRESS") and bool(_CAMEL_CASE.fullmatch(token))
 

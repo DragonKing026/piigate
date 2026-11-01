@@ -1883,6 +1883,20 @@ class TestDetectionEdgeCases(unittest.TestCase):
             found = [t[f.start : f.end] for f in engines.presidio(t, CONFIG)]
         self.assertEqual(found, [f"{p['first_name']} {p['surname']}", user], found)
 
+    def test_lone_lowercase_surname_from_ner_stays_masked(self):
+        """A bare lowercase word without a separator is not an identifier: NER's "nowak" is still masked."""
+        from unittest import mock
+
+        t = "klient nowak dzwonił wczoraj, a webpackbar bez zmian\n"
+        i, j = t.index("nowak"), t.index("webpackbar")
+        canned = [
+            {"entity_type": "PERSON", "start": i, "end": i + 5, "score": 0.8},
+            {"entity_type": "PERSON", "start": j, "end": j + 10, "score": 0.8},
+        ]
+        with mock.patch.object(engines, "_post", return_value=canned):
+            found = [t[f.start : f.end] for f in engines.presidio(t, CONFIG)]
+        self.assertEqual(found, ["nowak"])  # webpackbar is a known npm package (TECH_NAMES)
+
     def test_first_name_inside_a_product_name(self):
         """MariaDB is not "Maria" + DB (issue #6: a package list in a tools repository was denied as PERSON 2)."""
         row = "mysql,mariadb\tnarzedzia\tmariadb\tmariadb-client\tklient MySQL/MariaDB: mysql, mysqldump\n"
