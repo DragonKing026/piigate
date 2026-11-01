@@ -2745,6 +2745,11 @@ class TestFalseAlarms(unittest.TestCase):
             "cd raporty/nocne && cat ../../Sensitive-data/x.txt",
             "cd Sensitive-data && ls",
             "cd raporty && ls -R ..",
+            # a quoted substitution runs in the stage's directory, not the session's
+            "cd raporty/nocne && echo \"$(cat ../../Sens*/x.txt)\"",
+            "cd raporty/nocne && cat \"$(cat ../../Sens*/x.txt)\"",
+            "cd raporty/nocne && echo \"`cat ../../Sens*/x.txt`\"",
+            "cd raporty/nocne && printf '%s' \"x$(cat ../../Sens*/x.txt)\" | cat",
             "true || cd raporty/nocne && ls -R",
             "cd raporty/nocne 2>&1 && cd ../.. && ls -R",
             # the narrowing ends at anything but a literal cd / plain reader joined by `&&` (security review of #18)

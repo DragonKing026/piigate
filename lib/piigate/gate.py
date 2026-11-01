@@ -1498,12 +1498,19 @@ class Gate:
         for w in self.commands:
             if w.search(queries_text):
                 kinds.setdefault("command", "a database query on a server")
-        # substitutions inside quotes (`echo "$(cat x.csv)"`, backticks) stay one token above — checked as commands
+        # substitutions inside quotes (`echo "$(cat x.csv)"`, backticks) stay one token above — checked as commands, in
+        # every directory a stage may run in (`cd sub && echo "$(cat ../x.csv)"` reads from sub, not the session dir)
+        everywhere = list(dict.fromkeys(d for ds in dirs for d in ds)) or [own]
         for inner in self._substitutions(outside):
             if inner.strip() and inner.strip() != text.strip():
-                r, w = self._touches(inner, self._tokens(inner) or inner.split())
-                if r:
-                    kinds.setdefault(r, w)
+                try:
+                    for d in everywhere:
+                        self.cwd = d
+                        r, w = self._touches(inner, self._tokens(inner) or inner.split())
+                        if r:
+                            kinds.setdefault(r, _path(w, d) if d != own and os.path.lexists(_path(w, d)) else w)
+                finally:
+                    self.cwd = own
         self._text = text
         for r in ("protected", "sensitive", "command", "extension"):
             if r in kinds:
