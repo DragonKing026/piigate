@@ -893,6 +893,22 @@ class TestAnonymization(unittest.TestCase):
         self.assertIn("PERSON_", csv_)
         self.assertIn("Kwota: plain", anonymization.report(w))
 
+    def test_sheet_files_are_numbered_not_named(self):
+        """Issue #8: a sheet name (Klienci, Wizyty) is not a person — the file name carries the sheet number."""
+        p = dt.PATIENTS[0]
+        tables = [
+            table.Table("Klienci", ["Pacjent", "Kwota"], [[f"{p['first_name']} {p['surname']}", "120.5"]], "xlsx"),
+            table.Table("Wizyty", ["Data", "Kwota"], [["2026-10-01", "80"]], "xlsx"),
+        ]
+        directory = anonymization.prepare_dir(None, "arkusze", self.cfg)
+        w = anonymization.Result(directory)
+        anonymization.anonymize_tables(
+            tables, "klienci.xlsx", directory, self.cfg, PseudonymMap(), w, mask=set(), fragments=[]
+        )
+        self.assertEqual([n for n, _ in w.files], ["klienci-1.csv", "klienci-2.csv"])
+        self.assertTrue(w.files[1][1].startswith("table 2, rows 1;"), w.files)
+        self.assertEqual(leaks("".join(n + d for n, d in w.files)), [])
+
     def test_same_pseudonyms_and_reverse(self):
         w = anonymization.anonymize(FILES["csv"].name, FILES["csv"].read_bytes(), self.cfg)
         content = next(iter(self.result_files(w).values()))
