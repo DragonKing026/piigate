@@ -289,6 +289,8 @@ through the full text filter.
   (`ls`, `cat`, `grep`, `rg`, `find` without actions…) joined by `&&`; after any other operator or command a stage is
   checked in the session directory and in every directory reached. The output of a command substitution used as an operand (`cat $(echo …)`) is not
   followed yet (issue #22).
+  A project repository that TRACKS its sensitive directory is not protected against reading the history without naming
+  a path (`git log -U1`, `git cat-file --batch`, `git config --blob` in the root).
   The gate is a seat belt against mistakes and shortcuts, not a sandbox.
 - **The engine is trusted by address.** piigate protects the socket directory and refuses non-loopback engines, but a
   process of the same user that answers on the engine socket or port first can make NER report nothing (the rules

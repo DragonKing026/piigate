@@ -60,11 +60,17 @@ DIRECT_LAUNCHERS = {
     "stdbuf", "chrt", "taskset", "unbuffer",
 }
 SHELL_KEYWORDS = {"{", "}", "!", "if", "then", "elif", "else", "fi", "do", "done", "while", "until", "for", "case"}
-# commands that execute text they receive (stdin or a file): text printed to them is code, not only text (#23)
-EXECUTORS = SHELLS | {"eval", "source", ".", "xargs", "parallel"}
-INTERPRETERS = re.compile(r"(?:python|pypy|perl|ruby|node|nodejs|php|lua|tclsh|awk|gawk|mawk)[\d.]*")
+# commands that never run what they are given (a file written earlier in the same command may be their argument)
+NON_RUNNING = {"ls", "rm", "stat", "mv", "cp", "touch", "mkdir", "chmod", "diff", "echo", "printf", "true", "test", "["}
+# dotfiles and directories whose content later runs by itself (seeding): writing there while the command names a
+# sensitive path is refused
+SEEDING = re.compile(
+    r"(?:/\.git/hooks/|/\.(?:bashrc|bash_profile|bash_login|profile|zshrc|zshenv|zprofile|zlogin|bash_logout)$|/\.config/fish/"
+    r"|/\.config/autostart/|/\.config/systemd/user/|/\.xinitrc$|/\.xprofile$|/var/spool/cron/)"
+)
 # commands that do not read the content of the files they are given
 NO_READ_COMMANDS = {"stat", "touch", "rm", "rmdir", "mkdir", "test", "[", "ln", "chmod", "chown", "chgrp", "file"}
+COPY_INSIDE = {"cp", "mv", "install", "dd", "rsync", "ln"}
 GLOB_LIMIT = 200  # data files judged per glob / search root; more — denied as a precaution
 WALK_LIMIT = 100000  # directory entries visited when looking for data files under a search root
 REDIRECT_ALONE = re.compile(r"\d*(?:[<>]+&?|&>+)\d*-?")
@@ -394,7 +400,8 @@ def _allowed(args: list[str], spec: dict) -> tuple[list[int], list[str]] | None:
             known = name[1] in spec["s0"] or name[1] in spec["s1"]
         if not known:
             return None
-        if name in spec["files"] and value:
+        # every option that names a file (`--pathspec-from-file`, `--exclude-from`, `--file`, `--template`, `--blob`…)
+        if value and (name in spec["files"] or (name.startswith("--") and re.search(r"file|from|template|blob|reference|config", name))):
             files.append(value)
     return positional, files
 
@@ -407,9 +414,12 @@ _LOG0 = (
 ).split()
 _LOG1 = "max-count skip since until after before author committer grep format pretty date min-parents max-parents glob exclude".split()
 _LOGG = "color abbrev decorate pretty format stat date no-walk show-notes".split()
-_DIFFN = "name-only name-status stat numstat shortstat summary cached staged quiet exit-code no-renames check".split()
+# diff/stash show: only these format options (names, counts), plus the scope options; --check, --exit-code alone,
+# -U, -p… print or imply the patch. DIFF_NAMES_ONLY = the options that make the output names/counts.
+_DIFFN = "name-only name-status stat numstat shortstat summary cached staged quiet no-patch no-renames exit-code".split()
+DIFF_NAMES_ONLY = {"--name-only", "--name-status", "--stat", "--numstat", "--shortstat", "--summary", "--quiet", "--no-patch", "-s"}
 GIT_LOG = _spec("q0123456789", "n", _LOG0, _LOG1, _LOGG)
-GIT_DIFF_NAMES = _spec("zMq", "", _DIFFN, (), "stat dirstat find-renames color abbrev".split())
+GIT_DIFF_NAMES = _spec("zMqs", "", _DIFFN, (), "stat find-renames color abbrev".split())
 GIT_SPECS = {
     "status": _spec("sbzquonal", "", "short branch porcelain long ignored no-renames renames show-stash ahead-behind "
                     "no-ahead-behind no-column column".split(), (), "porcelain untracked-files ignored ignore-submodules column find-renames".split()),
@@ -437,12 +447,14 @@ GIT_SPECS = {
                   "no-commit commit no-edit edit stat no-stat dry-run update-head-ok".split(), "strategy strategy-option depth jobs".split(),
                   ("rebase", "recurse-submodules", "gpg-sign", "log")),
     "checkout": _spec("qfmt", "bB", "force quiet detach track no-track merge ours theirs ignore-other-worktrees guess no-guess progress "
-                      "no-progress overlay no-overlay".split(), "orphan conflict pathspec-from-file".split(), ("recurse-submodules",)),
+                      "no-progress overlay no-overlay".split(), "orphan conflict pathspec-from-file".split(), ("recurse-submodules",),
+                      ("--pathspec-from-file",)),
     "switch": _spec("qfdm", "cC", "detach force discard-changes guess no-guess track no-track merge quiet progress ignore-other-worktrees".split(),
                     "create force-create orphan conflict".split(), ("recurse-submodules",)),
     "restore": _spec("SWq", "s", "staged worktree quiet ours theirs merge overlay no-overlay progress ignore-unmerged ignore-skip-worktree-bits".split(),
-                     "source pathspec-from-file".split(), ("recurse-submodules",)),
-    "reset": _spec("q", "", "soft mixed hard merge keep quiet no-refresh refresh no-recurse-submodules".split(), (), ("recurse-submodules",)),
+                     "source pathspec-from-file".split(), ("recurse-submodules",), ("--pathspec-from-file",)),
+    "reset": _spec("q", "", "soft mixed hard merge keep quiet no-refresh refresh no-recurse-submodules".split(), ("pathspec-from-file",),
+                   ("recurse-submodules",), ("--pathspec-from-file",)),
     "rebase": _spec("qvfn", "sX", "continue abort skip quit autostash no-autostash keep-base root force-rebase no-ff ff quiet verbose stat "
                     "no-stat reapply-cherry-picks no-fork-point fork-point update-refs no-update-refs".split(), "onto strategy strategy-option whitespace".split(),
                     ("rebase-merges", "gpg-sign", "empty")),
@@ -469,7 +481,7 @@ GIT_SPECS = {
     "count-objects": _spec("vH", "", "verbose human-readable".split()),
     "ls-remote": _spec("q", "", "heads tags refs quiet get-url symref".split(), ("sort",)),
     "mv": _spec("fnkv", "", "force dry-run verbose".split()),
-    "rm": _spec("fnrq", "", "force dry-run cached quiet ignore-unmatch sparse".split(), ("pathspec-from-file",)),
+    "rm": _spec("fnrq", "", "force dry-run cached quiet ignore-unmatch sparse".split(), ("pathspec-from-file",), (), ("--pathspec-from-file",)),
     "clean": _spec("fdnxXq", "e", "force dry-run quiet".split()),
     "init": _spec("q", "b", "quiet bare".split(), "initial-branch separate-git-dir".split()),
     "clone": _spec("qvnsl", "bj", "bare mirror quiet verbose no-checkout shallow-submodules recursive single-branch no-tags local "
@@ -486,8 +498,10 @@ GIT_CONFIG_READ = _spec("lz", "", "list local global system worktree get get-all
                         "includes no-includes".split())
 # subcommands that copy content out of a repository: with a repository (or a source) in a sensitive directory they are readers
 GIT_EXPORT = {"clone", "worktree", "mv", "push", "fetch", "pull", "remote", "ls-remote"}  # a sensitive source/repository = a read
-# programs that run what they get (a shell script written earlier, a text piped in)
-RUNNERS = {"sudo", "doas", "busybox", "env", "command", "exec", "nohup", "setsid", "timeout", "nice", "su", "ssh", "xargs", "stdbuf"}
+# `file`: only options that do not read a magic/names file or look inside archives; on documents and images it prints
+# metadata (author, title, camera) — a read
+FILE_SPEC = _spec("bihL0", "", "mime mime-type mime-encoding brief dereference no-dereference null".split())
+FILE_METADATA = re.compile(r"\.(?:docx?|xlsx?|pptx?|odt|ods|odp|pdf|jpe?g|png|gif|webp|heic|tiff?|rtf|msg|eml)$", re.I)
 # filters that may follow a lister of a sensitive directory: only options that read stdin and print text
 FILTER_SPECS = {
     "grep": _spec("ivcnEFGwxoqHhsPzZ", "emABC", "ignore-case invert-match count line-number extended-regexp fixed-strings word-regexp "
@@ -503,7 +517,7 @@ FILTER_SPECS = {
     "column": _spec("tx", "sto", "table".split()),
     "nl": _spec(""), "tac": _spec(""), "rev": _spec(""), "basename": _spec("as"), "dirname": _spec(""), "cat": _spec("nAbeEstTuv"),
 }
-GH_FILE_LONG = {"field", "raw-field", "body-file", "input", "notes-file", "file", "template"}
+GH_FILE_LONG = {"field", "raw-field", "body-file", "input", "notes-file", "file", "template", "source"}
 # gh subcommands that run commands or change how gh runs them
 GH_EXEC = {"alias", "extension", "ext", "config", "codespace", "cs", "ssh-key", "browse", "completion"}
 
@@ -558,6 +572,7 @@ class Gate:
         self._public_dirs: dict[str, bool] = {}
         self._phi_under: dict[str, bool] = {}
         self._text = ""  # current Bash command (_touches)
+        self._raw = ""  # the Bash command as given (before heredoc bodies written to files are cut out)
         self._textual = True  # text arguments are only text (False: the command executes text it prints)
         self._written: set[str] = set()  # data files the current command writes (a read of one has no verdict yet)
         self._appears: dict[str, set[int]] = {}  # missing data file → stages that name it
@@ -842,46 +857,57 @@ class Gate:
             }
         return result
 
-    @staticmethod
-    def _runs_text(words: list[str]) -> bool:
-        """The program runs text it is given: a shell, interpreter, eval, `.`/source, xargs — also behind a wrapper
-        (`sudo bash`, `busybox sh`, `ssh host`)."""
-        if not words:
+    def _safe_receiver(self, core: list[str]) -> bool:
+        """A stage that receives piped text and certainly only filters/prints it: a text filter with allow-listed options
+        (FILTER_SPECS), piigate, or an allow-listed git/gh stage. Everything else — a shell, an interpreter, `at`,
+        `crontab -`, `sudo`, `ssh`, `flock`, `watch`, `xargs`, `sed` (its `e` command) — may run the text."""
+        if not core:
             return False
-        name = Path(words[0]).name
-        if words[0] == "." or name in EXECUTORS or INTERPRETERS.fullmatch(name) or name in ("ssh", "su"):
+        if self._is_piigate(core[0]):
             return True
-        if name in RUNNERS:
-            rest = [w for w in words[1:] if not w.startswith("-") and not re.fullmatch(r"\d+(?:\.\d+)?[smhd]?|\w+=.*", w)]
-            return Gate._runs_text(rest)
-        return False
+        if core[0] == "tee":  # prints its input and writes files (a file used again is checked in `_executes_text`)
+            return _allowed([t for t in core[1:] if t.startswith("-")], _spec("ai", "", ("append", "ignore-interrupts"))) is not None
+        if core[0] in FILTER_SPECS:
+            args = [t for t in strip_2to1(core[1:]) if not re.fullmatch(r"\d*[<>]+&?\d*|/dev/null", t)]
+            return _allowed(args, FILTER_SPECS[core[0]]) is not None
+        return self._stage_class(core) == "remote"
 
-    @staticmethod
-    def _executes_text(tokens: list[str]) -> bool:
-        """The command runs text it also prints or writes: a shell/interpreter/eval/xargs that receives a pipe
-        (`echo 'cat x' | bash`, `| sudo bash`, `| ssh host`), a script written and run in the same command
-        (`echo 'cat x' > s.sh; ./s.sh`, `bash s.sh`, `. ./s.sh`), or any such program together with a redirection to a
-        file. Text arguments are then code, not only text."""
-        written = {os.path.normpath(tokens[i + 1]) for i, t in enumerate(tokens[:-1]) if t in (">", ">>", ">|", "&>", "&>>")}
-        piped = executor = False
-        stage: list[str] = []
+    def _executes_text(self, tokens: list[str]) -> bool:
+        """Text arguments (a commit message, an issue body, echo/printf) are text only if nothing runs them: every stage
+        that receives piped text is a known filter (allow-list, `_safe_receiver`), there is no process substitution or
+        subshell fed by a pipe, and a file written by the command (`> s.sh`, `tee`) is not used again by a stage that
+        may run it (`bash s.sh`, `./s.sh`, `make -f s.sh`, `git -c core.pager=./s.sh`). Otherwise the text is code."""
         stages: list[list[str]] = []
+        writes: list[tuple[int, int, str]] = []
+        piped, previous, stage = False, "", []
         for t in [*tokens, ";"]:
+            if t == "(" and previous in ("<", ">", "|", "|&"):
+                return True  # `<(…)`, `>(…)`, `| (…)`
             if not (t in FORBIDDEN_OPERATORS or t in ("|", "|&") or re.fullmatch(r"[;&|()]+", t)):
                 stage.append(t)
+                previous = t
                 continue
-            words = Gate._strip_prefixes([stage])[-1] if stage else []
-            if Gate._runs_text(words):
-                executor = True
-                if piped:
-                    return True
-            stages.append(words)
+            parts = self._strip_prefixes([stage]) if stage else []
+            core = parts[-1] if parts else []
+            if stage and piped and not self._safe_receiver(core):
+                return True
+            if core:
+                stages.append(core)
+                writes += [(len(stages) - 1, i, os.path.normpath(core[i])) for i in self._write_targets(core) if i < len(core)]
             piped = t in ("|", "|&")
-            stage = []
-        return (executor and bool(written)) or any(
-            words and (os.path.normpath(words[0]) in written or (Gate._runs_text(words) and any(os.path.normpath(w) in written for w in words[1:])))
-            for words in stages
-        )
+            previous, stage = t, []
+        written = {w for _, _, w in writes if w != "." and not w.startswith("/dev/")}
+        for n, core in enumerate(stages):
+            if Path(core[0]).name in NON_RUNNING or self._stage_class(core) == "remote" or core[0] in FILTER_SPECS:
+                continue
+            # the stage's own write target is not a use of the file — but only where the target really is one
+            # (`> file`, tee, curl -o…); `ssh -o ProxyCommand=./s.sh` or a script name inside a code string is a use
+            plain = core[0] in ("tee", "curl", "wget", "cp", "mv", "install", "rsync", "dd", "sort", "pdftotext")
+            ignore = {i for k, i, _ in writes if k == n and (plain or (i and core[i - 1] in (">", ">>", ">|", "&>", "&>>")))}
+            for i, w in enumerate(core):
+                if i not in ignore and any(name in w for name in written):
+                    return True
+        return False
 
     def _stage_class(self, stage: list[str]) -> str:
         """'names' — a program that prints names or metadata, not content (#23): ls, tree, du, find and fd without a
@@ -897,12 +923,36 @@ class Gate:
             return "names"
         if cmd in ("ls", "tree", "du", "find", "fd", "fdfind", "stat", "file"):
             return "names" if self._lists_only(cmd, arguments) else ""
+        if cmd in COPY_INSIDE:
+            return "names" if self._copies_inside(cmd, arguments) else ""
         if cmd == "gh":
             sub = next((t for t in arguments if not t.startswith("-")), "")
+            if any(re.match(r"~[+-]", t) for t in arguments):  # a tilde the gate cannot expand: judged as a reader
+                return ""
             return "" if sub in GH_EXEC else "remote"
         if cmd == "git":
             return "remote" if self._git_call(arguments) is not None else ""
         return ""
+
+    def _copies_inside(self, cmd: str, arguments: list[str]) -> bool:
+        """cp/mv/install/dd/rsync/ln where EVERY operand (sources and targets) lies in a sensitive directory: the data
+        stays there and the command prints at most names (#23)."""
+        if cmd == "dd":
+            pairs = dict(t.split("=", 1) for t in arguments if "=" in t and not t.startswith("-"))
+            if "of" not in pairs:
+                return False  # without of= dd writes the data to stdout
+            operands = [pairs[k] for k in ("if", "of") if k in pairs]
+        else:
+            operands = [t.split("=", 1)[1] if t.startswith("--") else t for t in arguments if not t.startswith("-") or "=" in t]
+            if len(operands) < 2:
+                return False
+        for t in operands:
+            if re.search(r"[$`]|^~[+-]", t):
+                return False
+            prefix = re.split(r"[*?\[{]", t)[0] or "."
+            if self.path_kind(prefix) != "sensitive":
+                return False
+        return True
 
     @staticmethod
     def _fd_exec(arguments: list[str]) -> bool:
@@ -921,7 +971,10 @@ class Gate:
         if cmd.startswith("fd"):
             return not self._fd_exec(arguments)
         if cmd == "file":
-            return not any(re.match(r"^-[a-zA-Z]*f", t) for t in arguments if not t.startswith("--"))
+            parsed = _allowed(arguments, FILE_SPEC)
+            return parsed is not None and not any(
+                FILE_METADATA.search(arguments[k]) or re.search(r"[*?\[{]", arguments[k]) for k in parsed[0]
+            )
         return True
 
     def _repo_dir(self, repo_dirs: list[str]) -> str:
@@ -960,7 +1013,7 @@ class Gate:
             elif action == "show":
                 spec, names_option = GIT_DIFF_NAMES, True
             elif action in ("push", "save", "pop", "apply", "drop", "clear", "branch", "create", "store"):
-                spec = _spec("uaqk", "m", "include-untracked all keep-index no-keep-index quiet staged index".split(), "message pathspec-from-file".split())
+                spec = _spec("uaqk", "m", "include-untracked all keep-index no-keep-index quiet staged index".split(), "message pathspec-from-file".split(), (), ("--pathspec-from-file",))
             else:
                 return None
         elif sub == "diff":
@@ -974,8 +1027,7 @@ class Gate:
         positional, files = parsed
         words = [rest[k] for k in positional]
         if names_option and not any(
-            t.split("=", 1)[0][2:] in {"name-only", "name-status", "stat", "numstat", "shortstat", "summary", "quiet", "exit-code", "check"}
-            for t in rest if t.startswith("--")
+            name in DIFF_NAMES_ONLY for name, *_ in _scan(rest, spec["s1"], spec["l1"])[0]
         ):
             return None  # `git diff` / `stash show` without a names option print the changes themselves
         if sub == "config" and len(words) > 1:
@@ -1020,6 +1072,8 @@ class Gate:
                 elif "=" not in value:  # api: key=value; secret set -f FILE, issue create -F FILE
                     found.append(value)
             elif name in ("--body-file", "--input", "--notes-file", "--file") and value != "-":
+                found.append(value)
+            elif name == "--source":  # `gh repo create --source=DIR --push` uploads the whole directory
                 found.append(value)
         skip = c | text | self._program_text(stage)
         candidates = [stage[k + 1] for k in positional if k + 1 not in skip]
@@ -1927,6 +1981,17 @@ class Gate:
                         kinds.setdefault(*r)
         finally:
             self.cwd = own
+        # seeding: writing a file that runs later (.git/hooks, shell rc files, autostart, cron) in a command that names a
+        # sensitive path — the text written may be a command that reads it
+        mentions = (self._raw or text).casefold()
+        if any(m.casefold() in mentions for m in self.markers) or "sensitive" in kinds:
+            for stage, c, ds in zip(stages, dests, dirs):
+                for d in ds:
+                    targets = [_path(stage[i], d) for i in c if i < len(stage)]
+                    if stage[0] == "crontab":
+                        targets.append("/var/spool/cron/")
+                    if hit := next((t for t in targets if SEEDING.search(t)), None):
+                        kinds.setdefault("sensitive", f"{hit} (a file that runs later, in a command naming a sensitive path)")
         paths_text = self._marker_text(tokens, text)
         for z in self.markers:
             if z in paths_text:
@@ -2519,6 +2584,7 @@ class Gate:
         again — a file the command created is checked through its output instead."""
         if "\x00" in command:
             return "piigate: command denied — a NUL byte in the command"
+        self._raw = command
         command = self._strip_file_heredocs(command)
         tokens = self._tokens(command)
         if reason := self._human_only(command, tokens):
