@@ -1460,23 +1460,37 @@ class Gate:
         multiline = "\n" in command.strip()
         result: list[list[str]] = []
         stage: list[str] = []
+        previous = ";"  # the operator before the stage
         for t in [*tokens, ";"]:
             if not (t in FORBIDDEN_OPERATORS or t in ("|", "|&") or re.fullmatch(r"[;&|()]+", t)):
                 stage.append(t)
                 continue
             if stage:
                 result.append(list(sure))
-                args = [a for a in stage[1:] if a not in ("-L", "-P", "--")]
+                args, skip = [], 0
+                for j, a in enumerate(stage[1:], 1):  # without options and redirections (`cd x 2>/dev/null`, `cd x &>f`)
+                    follows = stage[j + 1] if j + 1 < len(stage) else ""
+                    if skip:
+                        skip -= 1
+                    elif a in REDIRECTS or re.fullmatch(r"\d?>&?|&>>?", a):
+                        skip = 1  # the file after it
+                    elif a.isdigit() and (follows in REDIRECTS or re.fullmatch(r"\d?>&?|&>>?", follows)):
+                        skip = 2  # the descriptor, the operator and the file are skipped
+                    elif a not in ("-L", "-P", "--"):
+                        args.append(a)
                 if Path(stage[0]).name in ("cd", "pushd") and len(args) <= 1 and not multiline:
                     target = args[0] if args else "~"
                     if re.fullmatch(r"~?[^$`~*?\[\]{}\\]*", target) and target != "-":
-                        sure = [_path(target, d) for d in sure]
-                        seen += [d for d in sure if d not in seen]
+                        moved = [_path(target, d) for d in sure]
+                        # after `||`, `|`, `&` the cd may have been skipped (`true || cd x && ls` runs ls where it was)
+                        sure = moved if previous in (";", "&&", "\n", "(") else [*seen, *moved]
+                        seen += [d for d in moved if d not in seen]
                 elif Path(stage[0]).name in ("popd",):
                     sure = list(seen)
                 stage = []
             if t != "&&":
                 sure = list(seen)
+            previous = t
         return result
 
     def _stage_kinds(

@@ -2724,6 +2724,9 @@ class TestFalseAlarms(unittest.TestCase):
             "cd raporty && cd nocne && grep -r foo",
             "pushd raporty/nocne && tree",
             "cd -P raporty/nocne && find . -name '*.md'",
+            "cd raporty/nocne 2>/dev/null && ls -R",
+            "cd raporty/nocne 2>&1 && ls -R",
+            "cd raporty/nocne &>/dev/null && ls -R",
         ):
             with self.subTest(command):
                 self.assertIsNone(b.bash(command))
@@ -2742,6 +2745,8 @@ class TestFalseAlarms(unittest.TestCase):
             "cd raporty/nocne && cat ../../Sensitive-data/x.txt",
             "cd Sensitive-data && ls",
             "cd raporty && ls -R ..",
+            "true || cd raporty/nocne && ls -R",
+            "cd raporty/nocne 2>&1 && cd ../.. && ls -R",
         ):
             with self.subTest(command):
                 self.assertIsNotNone(b.bash(command))
