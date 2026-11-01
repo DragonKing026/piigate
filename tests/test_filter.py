@@ -651,6 +651,44 @@ class TestSensors(unittest.TestCase):
         self.assertNotIn(p["pesel"], out["stdout"])
         self.assertEqual(set(out), {"stdout", "stderr", "interrupted", "isImage", "noOutputExpected"})
 
+    def test_pesel_needs_a_birth_date(self):
+        """Issue #17: 11 digits with a valid check digit but no real date are not a PESEL (GitHub run IDs were hidden);
+        a PESEL with a date in any of the five encoded centuries still is."""
+        from piigate import rules
+
+        for number in (
+            "12345678903",  # month 34
+            "00130100003",  # month 13
+            "00200100003",  # month 20
+            "00023000009",  # 30 February 1900
+            "00022900003",  # 29 February 1900 (not a leap year)
+            "00822900007",  # 29 February 1800
+        ):
+            with self.subTest(number):
+                self.assertFalse(rules.pesel_valid(number))
+        for number in (
+            "44051401359",  # 1944-05-14
+            "99123100003",  # 1999-12-31
+            "00222900009",  # 2000-02-29
+            "24922900006",  # 1824-12-29
+            "04622900009",  # 2204-02-29
+            *(p["pesel"] for p in dt.PATIENTS),
+        ):
+            with self.subTest(number):
+                self.assertTrue(rules.pesel_valid(number))
+        result = hook(
+            "filter",
+            {
+                "hook_event_name": "PostToolUse",
+                "cwd": str(TMP),
+                "tool_name": "Bash",
+                "tool_input": {"command": "gh api repos/o/r/actions/runs"},
+                "tool_response": {"stdout": "run 12345678903 queued", "stderr": "", "interrupted": False,
+                                  "isImage": False, "noOutputExpected": False},
+            },
+        )
+        self.assertIsNone(result)
+
     def test_unchanged_without_replacement(self):
         self.assertIsNone(
             hook(
