@@ -275,7 +275,12 @@ through the full text filter.
   `echo '$(cat x)' | bash`) and a quoted sed/awk program as a glob (it is still checked as a plain path and for directory
   names). File names are not content: a lister (`ls`, `find`, `tree`, `du`, `fd`, `git ls-files`) of a sensitive
   directory is allowed, but its names may only be filtered (`grep`, `head`, `sort`…) — piping them to `xargs`, a
-  `while read` loop, a substitution or a file is denied. A data file the command creates and reads back is denied.
+  `while read` loop, a substitution or a file is denied. A data file the command creates and reads back is denied. git and gh are judged by their
+  **options**, not by the subcommand name: a git subcommand is treated as metadata only when every option is on its
+  allow-list (`log -U1`, `-p`, `--unified`, `rebase -x`, `--upload-pack`, `config -f`, `commit -F FILE` are not), and
+  `gh` only for subcommands that do not run commands (`gh alias`, `extension`, `config` do). Copying out of a sensitive
+  repository (`clone`, `worktree add`, `mv`, `push`) is a read. Writing into a sensitive directory (`> dir/new`, `cp x
+  dir/`, `tee dir/f`, the Write tool) is allowed — nothing comes back.
   `-r`/`-R` is recursion except for commands where it means something else (`jq -r`, `gh -R`, `sort -r`, `sed -r`…;
   for `ls`/`chmod` only `-R`), so a jq filter with `[]` is not a pattern searched from the working directory.
   An unquoted newline separates commands like `;` (a backslash-newline joins words). Quoting is judged per word: only

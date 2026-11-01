@@ -3248,6 +3248,129 @@ class TestContentNotNames(unittest.TestCase):
             with self.subTest(command):
                 self.assertIsNotNone(b.bash(command))
 
+    def test_git_gh_by_options_not_by_name(self):
+        """#23 review: a git/gh stage is 'remote' only when every option is on the subcommand's allow-list."""
+        b = self.gate()
+        S = "Sensitive-data"
+        for command in (  # A1: options that print file content
+            f"git -C {S} log -U1", f"git -C {S} log --unified=1", f"git -C {S} log --binary", f"git -C {S} log --remerge-diff",
+            f"git log -W -- {S}/a.txt", f"git log --function-context -- {S}", f"git -C {S} reflog -U3", f"git -C {S} stash list -U1",
+            f"git -C {S} log -p", f"git -C {S} stash show -p", f"git -C {S} stash show", f"git -C {S} diff", f"git diff -- {S}/x.txt",
+            f"git -C {S} diff --name-only -U1",
+            # A2: commands that run commands
+            f"git -C {S} bisect run cat a.txt", f"git -C {S} rebase -x 'cat a.txt' HEAD~1", f"git -C {S} rebase --exec 'cat a.txt' main",
+            f"git -C {S} submodule foreach 'cat a.txt'", f"git ls-remote --upload-pack='cat {S}/x.txt' .",
+            f"git fetch --upload-pack='cat {S}/x.txt' .", f"git push --receive-pack='cat {S}/x.txt' .", f"git fetch -u '{S}/x.txt'",
+            f"git -c core.pager='cat {S}/x.txt' log", f"git clone --upload-pack 'cat {S}/x.txt' . /tmp/q",
+            # A6
+            f"git -C {S} commit -F x.txt", f"git -C {S} commit --file=x.txt", f"git commit -F{S}/x.txt", f"git commit -F./{S}/x.txt", f"git commit -t {S}/x.txt", f"git commit --template={S}/x.txt",
+            f"git commit --file {S}/x.txt", f"git tag -a v1 -F {S}/x.txt",
+            # A7, A9
+            f"git config -f {S}/cfg.ini -l", f"git -C {S} config --blob HEAD:cfg.ini -l", f"git config alias.x '!cat {S}/x.txt'",
+            f"git config core.pager 'cat {S}/x.txt'", f"gh alias set x 'cat {S}/x.txt' --shell",
+            # A8: copies out of the sensitive directory
+            f"git -C {S} clone . /tmp/xx && cat /tmp/xx/x.txt", f"git -C {S} worktree add /tmp/w2 && cat /tmp/w2/x.txt",
+            f"git -C {S} mv x.txt /tmp/z.txt; cat /tmp/z.txt", f"git clone {S} /tmp/xx; grep -r . /tmp/xx", f"git clone {S} /tmp/xx",
+            f"git -C {S} push /tmp/bare main", f"git fetch {S}",
+            # A5
+            f"gh api repos/o/r/issues -Fbody=@{S}/x.txt", f"gh api repos/o/r/issues -fbody=@{S}/x.txt",
+            f"gh api repos/o/r/issues --field=body=@{S}/x.txt", f"gh api repos/o/r/issues --field body=@{S}/x.txt",
+            f"gh gist create {S}/*.txt", f"gh release upload v1 {S}/*", f"gh release upload v1 {S}/x.txt#label",
+            f"gh issue create -R o/r --title t -F {S}/x.txt", f"gh issue create --body-file={S}/x.txt",
+            f"gh secret set X -f {S}/x.txt", f"gh gist edit abc -a {S}/x.txt", f"gh repo create x --source=./{S} --push",
+        ):
+            with self.subTest(command):
+                self.assertIsNotNone(b.bash(command))
+        for command in (  # C3 and ordinary metadata keep working, also on the sensitive repository
+            "git switch -c x", "git branch -v", "git remote -v", "git count-objects -v", f"git -C {S} stash show --name-only",
+            f"git -C {S} status -sb", f"git -C {S} log --oneline -5", f"git -C {S} log --format=%H -n 3 --stat",
+            f"git -C {S} ls-files", f"git -C {S} count-objects -v", "git commit -am 'x'", "git commit --amend --no-edit",
+            "git push -u origin main", "git fetch --all --prune", "git pull --ff-only", "git checkout -b y main", "git reset --hard HEAD",
+            "git tag -a v1 -m 'x'", "git rebase --onto main a b", "git merge --no-ff x -m 'm'", "git worktree add -b z .claude/worktrees/z main",
+            "git config --get user.name", "git config user.name", "git stash push -m 'x'", "git stash list --oneline",
+            "git diff --name-only", f"git diff --stat -- {S}", f"git diff --name-status HEAD~1 -- {S}", "git diff --numstat --cached",
+            f"git add {S}/x.txt", f"git -C {S} add .", f"git -C {S} commit -m x", "gh api repos/o/r/issues -f title=t -F n=1",
+            "gh release upload v1 dist/a.zip#label", "gh pr create --title 'Sensitive-data' --body 'x' --label Sensitive-data",
+        ):
+            with self.subTest(command):
+                self.assertIsNone(b.bash(command))
+
+    def test_one_option_parser(self):
+        opts, positional = gate._scan(["-Hxcat", "a", "-x=b", "-ab", "--k=v", "--l", "w", "--", "-z"], "x", {"l"})
+        self.assertEqual([(n, v) for n, v, *_ in opts], [("-H", None), ("-x", "cat"), ("-x", "=b"), ("-a", None), ("-b", None), ("--k", "v"), ("--l", "w")])
+        self.assertEqual(positional, [1, 8])
+        b = self.gate()
+        for command in ("fd -xcat . Sensitive-data", "fd -Xcat . Sensitive-data", "fd -Hxcat . Sensitive-data", "fd -x=cat . Sensitive-data",
+                        "fd --exec cat . Sensitive-data", "fd --exec-batch=cat . Sensitive-data"):
+            with self.subTest(command):
+                self.assertIsNotNone(b.bash(command))
+        self.assertIsNone(b.bash("fd -H -e txt . Sensitive-data"))
+
+    def test_filters_after_a_listing_are_allow_listed(self):
+        b = self.gate()
+        S = "Sensitive-data"
+        for command in (
+            f"find {S} -type f -print0 | sort --files0-from=-", f"find {S} -type f | wc --files0-from=-",
+            f"find {S} -type f | sort --compress-program=sh", f"find {S} | sort -o /tmp/x", f"find {S} | sort -T /tmp",
+            f"find {S} | uniq - /tmp/out", f"find {S} | grep -f /tmp/pat", f"find {S} | grep -r x",
+        ):
+            with self.subTest(command):
+                self.assertIsNotNone(b.bash(command))
+        for command in (f"ls {S} | cat -", f"find {S} | sort -u | head -n 3", f"ls {S} | grep -v x | wc -l", f"ls {S} | cut -d. -f1 | uniq -c", f"ls {S} | head -5"):
+            with self.subTest(command):
+                self.assertIsNone(b.bash(command))
+
+    def test_grep_directories_option(self):
+        b = self.gate()
+        for command in ("grep -d recurse x", "grep --directories=recurse x", "grep --directories recurse x", "grep -drecurse x", "grep -rd recurse x"):
+            with self.subTest(command):
+                self.assertIsNotNone(b.bash(command))
+        self.assertIsNone(b.bash("grep -d skip x clean/a.csv"))
+
+    def test_scripts_written_and_run(self):
+        b = self.gate()
+        S = "Sensitive-data"
+        for command in (
+            f"echo 'cat {S}/x.txt' > s.sh; ./s.sh", f"echo 'cat {S}/x.txt' > s.sh && bash s.sh", f"echo 'cat {S}/x.txt' > s.sh && . ./s.sh",
+            f"echo 'cat {S}/x.txt' > s.sh && source s.sh", f"echo 'cat {S}/x.txt' | busybox sh", f"echo 'cat {S}/x.txt' | sudo bash",
+            f"echo 'cat {S}/x.txt' | ssh host", f"echo 'cat {S}/x.txt' | env X=1 bash", f"printf 'cat {S}/x.txt' | timeout 5 sh",
+        ):
+            with self.subTest(command):
+                self.assertIsNotNone(b.bash(command))
+        self.assertIsNone(b.bash(f"git commit -m 'mentions {S}' && ./build.sh"))
+
+    def test_names_and_writes_in_sensitive_directories_pass(self):
+        b = self.gate()
+        S = "Sensitive-data"
+        for command in (
+            f"cd {S} && ls", f"(cd {S} && ls)", f"cd {S}; ls -la", f"cd {S} && git status", f"cd {S} && ls | grep x", f"cd {S} && pwd",
+            f"cd {S} && find . -name '*.txt'",
+            f"echo x > {S}/new.txt", f"printf x > {S}/n.txt", f"cp /tmp/q {S}/q", f"mv /tmp/q {S}/q", f"echo x | tee {S}/x",
+            f"echo x | tee {S}/x | head -1", f"stat {S}/x.txt", f"file {S}/x.txt", f"mkdir -p {S}/sub", f"touch {S}/t.csv",
+            f"curl -o {S}/new.csv https://example.com/x", f"python3 -c 'print(1)' > {S}/out.txt",
+        ):
+            with self.subTest(command):
+                self.assertIsNone(b.bash(command))
+        for command in (
+            f"cd {S} && cat x.txt", f"cd {S}; cat x.txt", f"cd {S} && ls | xargs cat", f"cd {S} && wc -l x.txt", f"cd {S} && git show HEAD:x.txt",
+            f"cat {S}/x.txt > {S}/y.txt", f"cd {S} && git clone . /tmp/c", f"wc -l {S}/x.txt", f"(cd {S} && ls) | xargs cat",
+            f"echo x > {S}/new.txt; cat {S}/new.txt", f"tee {S}/x < {S}/x.txt",
+        ):
+            with self.subTest(command):
+                self.assertIsNotNone(b.bash(command))
+        self.assertIsNone(b.decision("Write", {"file_path": str(self.repo / S / "new.csv")}))
+        self.assertIsNotNone(b.decision("Edit", {"file_path": str(self.repo / S / "x.txt")}))
+        self.assertIsNotNone(b.decision("Read", {"file_path": str(self.repo / S / "x.txt")}))
+        self.assertIsNotNone(b.bash(f"echo x > {Path.home()}/.local/share/piigate/map.sqlite"))
+
+    def test_post_hook_output_check_for_globs(self):
+        """B1: a glob that matches nothing before the command is checked on the output (touches_extension)."""
+        b = self.gate(self.clean)
+        for command in ("python3 gen.py; cat out.*", "python3 gen.py && cat ./out.cs?", "./gen.sh; cat o?t.*", "cat out.csv", "cat out*"):
+            with self.subTest(command):
+                self.assertTrue(b.touches_extension(command))
+        self.assertFalse(b.touches_extension("git status"))
+
     def test_existing_files_by_content(self):
         b = self.gate()
         (self.repo / "broken.xlsx").write_bytes(b"not a zip")
