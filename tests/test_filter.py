@@ -2751,6 +2751,29 @@ class TestFalseAlarms(unittest.TestCase):
             with self.subTest(command):
                 self.assertIsNotNone(b.bash(command))
 
+    def test_ls_operand_pattern_is_not_a_data_file(self):
+        """Issue #20: `ls` prints names only — a pattern operand is no read of a data file, whatever the other stages."""
+        (self.phi / "Sensitive-data").mkdir()
+        b = self.gate(self.phi)
+        for command in (
+            "ls .markdownlint* 2>/dev/null; wc -l notes.md",
+            "ls *.csv; wc -l notes.md",
+            "ls -l *.csv *.xlsx | wc -l; wc -l notes.md",
+            "ls *.csv && wc -l notes.md",
+        ):
+            with self.subTest(command):
+                self.assertIsNone(b.bash(command))
+        for command in (  # still denied: recursion, a content reader, a sensitive directory, a write target read back
+            "ls -R *.csv; wc -l notes.md",
+            "cat *.csv; wc -l notes.md",
+            "ls .; cat *.csv",
+            "ls Sensitive-data/*.csv; wc -l notes.md",
+            "ls Sensitive-data/*.csv",
+            "ls *.csv; wc -l *.csv",
+        ):
+            with self.subTest(command):
+                self.assertIsNotNone(b.bash(command))
+
     def test_newline_separates_commands(self):
         """Issue #21: an unquoted newline is an operator like `;` — `echo x⏎cat <sensitive>/f` is not one echo stage."""
         (self.public / "Sensitive-data").mkdir()

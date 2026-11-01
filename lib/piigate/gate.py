@@ -1547,6 +1547,8 @@ class Gate:
                 r = self._token_kind(t, recursion, content=i not in c)
             if r and r[0] == "extension" and i in c and _path(r[1], self.cwd) not in read_paths:
                 continue  # write only — no content comes back to the model
+            if r and r[0] == "extension" and stage[0] == "ls" and not recursion:
+                continue  # `ls .markdownlint*`: names only, a pattern here reads no data file (issue #20)
             if r:
                 found.append(r)
         return found
