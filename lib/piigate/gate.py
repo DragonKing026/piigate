@@ -993,12 +993,12 @@ class Gate:
         symbolic = cmd == "ln" and any(re.fullmatch(r"-[a-zA-Z]*s[a-zA-Z]*|--symbolic", t) for t in arguments)
         resolved = []
         for k, t in enumerate(operands):
-            if re.search(r"[$`]|^~", t):  # a variable or a tilde: where it points is not known here
-                return False
             if symbolic and k < len(operands) - 1:
                 continue  # a symlink's target is text, relative to the link's directory (below)
-            prefix = re.split(r"[*?\[{]", t)[0] or "."
-            resolved.append(_path(prefix, self.cwd))  # realpath: `..` and symlinks are followed, a missing leaf keeps its parent's
+            real = self._operand_locations(t)
+            if real is None:
+                return False
+            resolved += real
         if symbolic and len(operands) >= 2:
             # the link's TARGET (relative to the link's directory) must stay in the sensitive directory too: a symlink
             # that leads out is a way to carry the data away
@@ -1007,6 +1007,27 @@ class Gate:
                 target = t if os.path.isabs(t) else os.path.join(link_dir, t)
                 resolved.append(os.path.realpath(target))
         return all(self._resolved_sensitive(p) for p in resolved)
+
+    def _operand_locations(self, t: str) -> list[str] | None:
+        """The real locations a copy operand may name: realpath (`..` and symlinks followed, a missing leaf keeps its
+        parent's), a leading tilde and braces expanded like the shell, every match of a pattern by its own real location
+        (a match may be a symlink leading out); None when the location cannot be known here — a variable, a
+        substitution, or a pattern that climbs out after its prefix (`S/*/../../`, review of #23)."""
+        if re.search(r"[$`]", t):
+            return None
+        result: list[str] = []
+        for w in expand_braces(t):
+            if re.search(r"\{[^{}]*(?:,|\.\.)[^{}]*\}", w):
+                return None  # braces beyond the expansion limit
+            prefix = re.split(r"[*?\[]", w)[0] or "."
+            if prefix == w:
+                result.append(_path(w, self.cwd))
+                continue
+            if ".." in w[len(prefix) :].split("/"):
+                return None
+            pattern = os.path.join(self.cwd, config.expand_tilde(w))  # an absolute pattern replaces cwd
+            result += [_path(prefix, self.cwd)] + [os.path.realpath(m) for m in glob.glob(pattern)]
+        return result
 
     def _resolved_sensitive(self, p: str) -> bool:
         """An ALREADY RESOLVED path lies in a sensitive directory (by the real location, never by a name in the text)."""
@@ -2548,7 +2569,8 @@ class Gate:
             for a in arguments:
                 if re.match(r"^[\w.@-]+:", a) and cmd in ("scp", "rsync"):
                     continue
-                if not all(_inside(_path(w, self.cwd), self.sensitive) for w in expand_braces(a)):
+                real = self._operand_locations(a)  # the same resolution as _copies_inside (globs, symlinks, `..`)
+                if real is None or not all(_inside(p, self.sensitive) for p in real):
                     return False
             return True
         return True

@@ -3461,6 +3461,8 @@ class TestContentNotNames(unittest.TestCase):
             f"cd {S} && mv x.txt ..", f"cd {S} && install -D x.txt ../x", f"cd {S} && dd if=x.txt of=../x", f"cd {S} && rsync -a . ../x",
             f"cd {S} && dd if=x.txt of=~/x", f"cp {S}/x.txt {S}/lnk_dir/x", f"rsync -a {S}/ {S}/lnk_dir/", f"dd if={S}/x.txt of={S}/lnk_dir/o",
             f"cp {S}/x.txt $HOME/x", f"ln -s /tmp/out {S}/l", f"ln -s ../outside {S}/l2", f"ln -s {out} {S}/l3", f"ln {S}/x.txt /tmp/hard",
+            f"cp {S}/x.txt {S}/*/../../", f"cp {S}/x.txt {S}/s*/../../", f"cp {S}/x.txt {S}/*/..//..",  # a pattern climbing out
+            f"cp {S}/x.txt {S}/lnk*/", f"cp {S}/x.txt {S}/{{sub,lnk_dir}}/", f"cp {S}/x.txt {self.repo}/{S}/l*_dir",  # a symlink out
         ):
             with self.subTest(command):
                 self.assertIsNotNone(b.bash(command))
