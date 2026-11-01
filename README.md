@@ -269,6 +269,13 @@ through the full text filter.
   `-r`/`-R` is recursion except for commands where it means something else (`jq -r`, `gh -R`, `sort -r`, `sed -r`…;
   for `ls`/`chmod` only `-R`), so a jq filter with `[]` is not a pattern searched from the working directory; `ls -R`,
   `tree`, `find` and `du` without a path list the working directory and are checked like `ls -R .`.
+  An unquoted newline separates commands like `;` (a backslash-newline joins words). Quoting is judged per word: only
+  a word that is wholly one quoted string is a program (sed/awk/jq/yq, `gh -q/--jq/--template`) checked as a plain
+  path. After `cd DIR &&` relative paths are resolved against DIR only along a chain of literal `cd`s and plain readers
+  (`ls`, `cat`, `grep`, `rg`, `find` without actions…) joined by `&&`; after any other operator or command a stage is
+  checked in the session directory and in every directory reached. A glob operand of a non-recursive `ls` is a name
+  listing, not a data-file read. The output of a command substitution used as an operand (`cat $(echo …)`) is not
+  followed yet (issue #22).
   The gate is a seat belt against mistakes and shortcuts, not a sandbox.
 - **The engine is trusted by address.** piigate protects the socket directory and refuses non-loopback engines, but a
   process of the same user that answers on the engine socket or port first can make NER report nothing (the rules
