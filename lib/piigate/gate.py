@@ -66,7 +66,9 @@ NON_RUNNING = {"ls", "rm", "stat", "mv", "cp", "touch", "mkdir", "chmod", "diff"
 # sensitive path is refused
 SEEDING = re.compile(
     r"(?:/\.git/hooks/|/\.(?:bashrc|bash_profile|bash_login|profile|zshrc|zshenv|zprofile|zlogin|bash_logout)$|/\.config/fish/"
-    r"|/\.config/autostart/|/\.config/systemd/user/|/\.xinitrc$|/\.xprofile$|/var/spool/cron/)"
+    r"|/\.config/autostart/|/\.config/systemd/user/|/\.xinitrc$|/\.xprofile$|/var/spool/cron/"
+    r"|/\.ssh/(?:rc|config)$|/\.gitconfig$|/\.git/config$|/\.config/environment\.d/|/\.envrc$|/\.local/bin/"
+    r"|/\.claude/(?:settings[^/]*\.json|hooks/)|/BASH_ENV/ENV)"
 )
 # commands that do not read the content of the files they are given
 NO_READ_COMMANDS = {"stat", "touch", "rm", "rmdir", "mkdir", "test", "[", "ln", "chmod", "chown", "chgrp", "file"}
@@ -872,17 +874,26 @@ class Gate:
             return _allowed(args, FILTER_SPECS[core[0]]) is not None
         return self._stage_class(core) == "remote"
 
-    def _executes_text(self, tokens: list[str]) -> bool:
-        """Text arguments (a commit message, an issue body, echo/printf) are text only if nothing runs them: every stage
-        that receives piped text is a known filter (allow-list, `_safe_receiver`), there is no process substitution or
-        subshell fed by a pipe, and a file written by the command (`> s.sh`, `tee`) is not used again by a stage that
-        may run it (`bash s.sh`, `./s.sh`, `make -f s.sh`, `git -c core.pager=./s.sh`). Otherwise the text is code."""
+    def _safe_stage(self, core: list[str]) -> bool:
+        """A stage that certainly does not run a file or text it is given."""
+        return (
+            Path(core[0]).name in NON_RUNNING
+            or core[0] in FILTER_SPECS
+            or core[0] == "tee"
+            or self._is_piigate(core[0])
+            or self._stage_class(core) in ("remote", "names")
+        )
+
+    def _script_stages(self, tokens: list[str]) -> tuple[list[list[str]], list[tuple[int, int, str]], bool]:
+        """The command's stages (prefixes cut), the write targets (stage, token index, path) and whether text reaches a
+        stage that is not a known filter (a pipe into anything else, `<(…)`, `>(…)`, `| (…)`)."""
         stages: list[list[str]] = []
         writes: list[tuple[int, int, str]] = []
+        unsafe_pipe = False
         piped, previous, stage = False, "", []
         for t in [*tokens, ";"]:
             if t == "(" and previous in ("<", ">", "|", "|&"):
-                return True  # `<(…)`, `>(…)`, `| (…)`
+                unsafe_pipe = True
             if not (t in FORBIDDEN_OPERATORS or t in ("|", "|&") or re.fullmatch(r"[;&|()]+", t)):
                 stage.append(t)
                 previous = t
@@ -890,15 +901,30 @@ class Gate:
             parts = self._strip_prefixes([stage]) if stage else []
             core = parts[-1] if parts else []
             if stage and piped and not self._safe_receiver(core):
-                return True
+                unsafe_pipe = True
             if core:
                 stages.append(core)
                 writes += [(len(stages) - 1, i, os.path.normpath(core[i])) for i in self._write_targets(core) if i < len(core)]
             piped = t in ("|", "|&")
             previous, stage = t, []
+        return stages, writes, unsafe_pipe
+
+    def _executes_text(self, tokens: list[str]) -> bool:
+        """Text arguments (a commit message, an issue body, echo/printf) are text only if nothing runs them: every stage
+        that receives piped text is a known filter (allow-list, `_safe_receiver`), there is no process substitution or
+        subshell fed by a pipe, and when the command writes a file (`> s.sh`, `tee`, `-o`) no LATER stage can run it —
+        any stage that is not a known non-running one (a glob or variable as the command word, `./x`, a shell, an
+        interpreter, `eval`, `.`, `for … do`) counts, whatever name the file is given. Otherwise the text is code."""
+        stages, writes, unsafe_pipe = self._script_stages(tokens)
+        if unsafe_pipe:
+            return True
+        if writes:
+            first = min(k for k, _, _ in writes)
+            if any(not self._safe_stage(core) for core in stages[first + 1 :]):
+                return True
         written = {w for _, _, w in writes if w != "." and not w.startswith("/dev/")}
         for n, core in enumerate(stages):
-            if Path(core[0]).name in NON_RUNNING or self._stage_class(core) == "remote" or core[0] in FILTER_SPECS:
+            if self._safe_stage(core):
                 continue
             # the stage's own write target is not a use of the file — but only where the target really is one
             # (`> file`, tee, curl -o…); `ssh -o ProxyCommand=./s.sh` or a script name inside a code string is a use
@@ -907,6 +933,24 @@ class Gate:
             for i, w in enumerate(core):
                 if i not in ignore and any(name in w for name in written):
                     return True
+        return False
+
+    def _unvettable_script(self, tokens: list[str]) -> bool:
+        """A file is written from text that the gate cannot read as a literal (`printf '…%s…' x > s.sh`, `echo "$x" >
+        s.sh`) and a later stage may run it: the written code can name a sensitive path built at run time."""
+        stages, writes, _ = self._script_stages(tokens)
+        if not writes:
+            return False
+        first = min(k for k, _, _ in writes)
+        if all(self._safe_stage(core) for core in stages[first + 1 :]):
+            return False
+        for k, _, target in writes:
+            core = stages[k]
+            scripty = re.search(r"\.(?:sh|bash|zsh|ksh|fish|py|pl|rb|js|php|mk)$", target) or "." not in os.path.basename(target)
+            if scripty and core[0] in ("echo", "printf", "cat", "tee") and any(
+                ("%" in t and core[0] == "printf") or (re.search(r"\$", t) and not getattr(t, "single", False)) for t in core[1:]
+            ):
+                return True
         return False
 
     def _stage_class(self, stage: list[str]) -> str:
@@ -946,13 +990,27 @@ class Gate:
             operands = [t.split("=", 1)[1] if t.startswith("--") else t for t in arguments if not t.startswith("-") or "=" in t]
             if len(operands) < 2:
                 return False
-        for t in operands:
-            if re.search(r"[$`]|^~[+-]", t):
+        symbolic = cmd == "ln" and any(re.fullmatch(r"-[a-zA-Z]*s[a-zA-Z]*|--symbolic", t) for t in arguments)
+        resolved = []
+        for k, t in enumerate(operands):
+            if re.search(r"[$`]|^~", t):  # a variable or a tilde: where it points is not known here
                 return False
+            if symbolic and k < len(operands) - 1:
+                continue  # a symlink's target is text, relative to the link's directory (below)
             prefix = re.split(r"[*?\[{]", t)[0] or "."
-            if self.path_kind(prefix) != "sensitive":
-                return False
-        return True
+            resolved.append(_path(prefix, self.cwd))  # realpath: `..` and symlinks are followed, a missing leaf keeps its parent's
+        if symbolic and len(operands) >= 2:
+            # the link's TARGET (relative to the link's directory) must stay in the sensitive directory too: a symlink
+            # that leads out is a way to carry the data away
+            link_dir = os.path.dirname(os.path.join(self.cwd, operands[-1]))
+            for t in operands[:-1]:
+                target = t if os.path.isabs(t) else os.path.join(link_dir, t)
+                resolved.append(os.path.realpath(target))
+        return all(self._resolved_sensitive(p) for p in resolved)
+
+    def _resolved_sensitive(self, p: str) -> bool:
+        """An ALREADY RESOLVED path lies in a sensitive directory (by the real location, never by a name in the text)."""
+        return _inside(p, self.sensitive) or bool(self.sensitive_name and self.sensitive_name in Path(p).parts)
 
     @staticmethod
     def _fd_exec(arguments: list[str]) -> bool:
@@ -1990,8 +2048,12 @@ class Gate:
                     targets = [_path(stage[i], d) for i in c if i < len(stage)]
                     if stage[0] == "crontab":
                         targets.append("/var/spool/cron/")
+                    if any(re.match(r"(?:BASH_ENV|ENV)=", t) for t in stage):
+                        targets.append("/BASH_ENV/ENV variable (a file that every shell starts with)")
                     if hit := next((t for t in targets if SEEDING.search(t)), None):
                         kinds.setdefault("sensitive", f"{hit} (a file that runs later, in a command naming a sensitive path)")
+        if self._unvettable_script(tokens):
+            kinds.setdefault("sensitive", "a script written from text built at run time and then run in the same command")
         paths_text = self._marker_text(tokens, text)
         for z in self.markers:
             if z in paths_text:

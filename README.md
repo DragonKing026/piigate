@@ -291,6 +291,10 @@ through the full text filter.
   followed yet (issue #22).
   A project repository that TRACKS its sensitive directory is not protected against reading the history without naming
   a path (`git log -U1`, `git cat-file --batch`, `git config --blob` in the root).
+  Code written earlier and run later is not followed between commands (`Makefile`, `package.json`, `conftest.py`,
+  `sitecustomize.py`, `.vscode/tasks.json`, `.pre-commit-config.yaml`, a script run by a later call); inside one command,
+  writing a script and running it is refused when the command names a sensitive path or builds the script from text
+  assembled at run time (`printf '…%s…'`, `"$x"`).
   The gate is a seat belt against mistakes and shortcuts, not a sandbox.
 - **The engine is trusted by address.** piigate protects the socket directory and refuses non-loopback engines, but a
   process of the same user that answers on the engine socket or port first can make NER report nothing (the rules

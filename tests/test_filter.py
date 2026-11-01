@@ -3449,6 +3449,54 @@ class TestContentNotNames(unittest.TestCase):
             with self.subTest(command):
                 self.assertIsNotNone(b.bash(command))
 
+    def test_round4_copy_inside_is_resolved(self):
+        b = self.gate()
+        S = "Sensitive-data"
+        (self.repo / S / "sub").mkdir(exist_ok=True)
+        out = self.base / "outside"
+        out.mkdir(exist_ok=True)
+        subprocess.run(["ln", "-s", str(out), str(self.repo / S / "lnk_dir")], check=True)
+        for command in (
+            f"cp {S}/x.txt {S}/../x", f"cp {S}/x.txt {S}/sub/../../x", f"mv {S}/x.txt {S}/../x", f"cd {S} && cp x.txt ../x",
+            f"cd {S} && mv x.txt ..", f"cd {S} && install -D x.txt ../x", f"cd {S} && dd if=x.txt of=../x", f"cd {S} && rsync -a . ../x",
+            f"cd {S} && dd if=x.txt of=~/x", f"cp {S}/x.txt {S}/lnk_dir/x", f"rsync -a {S}/ {S}/lnk_dir/", f"dd if={S}/x.txt of={S}/lnk_dir/o",
+            f"cp {S}/x.txt $HOME/x", f"ln -s /tmp/out {S}/l", f"ln -s ../outside {S}/l2", f"ln -s {out} {S}/l3", f"ln {S}/x.txt /tmp/hard",
+        ):
+            with self.subTest(command):
+                self.assertIsNotNone(b.bash(command))
+        for command in (f"ln -s x.txt {S}/ok", f"ln -s sub {S}/ok2", f"cp {S}/x.txt {S}/sub/../y"):
+            with self.subTest(command):
+                self.assertIsNone(b.bash(command))
+
+    def test_round4_script_written_and_run(self):
+        b = self.gate()
+        S = "Sensitive-data"
+        for command in (
+            f"echo 'cat {S}/x.txt' > s.sh; ./s*", f"echo 'cat {S}/x.txt' > s.sh; bash s.*", f"echo 'cat {S}/x.txt' > s.sh; bash ./*.sh",
+            f"echo 'cat {S}/x.txt' > s.sh; . s.s?", f"echo 'cat {S}/x.txt' > s.sh; bash s.s[h]", f"echo 'cat {S}/x.txt' > s.sh; bash $(ls s.*)",
+            f"echo 'cat {S}/x.txt' > s.sh; $(ls s.*)", f"echo 'cat {S}/x.txt' > s.sh; sh $(echo s.sh)", f"echo 'cat {S}/x.txt' > s.sh; x=s; sh $x.sh",
+            f"echo 'cat {S}/x.txt' > s.sh; x=$(cat s.sh); eval \"$x\"", f"echo 'cat {S}/x.txt' > s.sh; for f in s.*; do sh $f; done",
+            f"mkdir -p d; echo 'cat {S}/x.txt' > d/s.sh; cd d; bash s.sh", "printf 'cat Sensitive-d%s/x.txt' ata > s.sh; sh s.sh",
+            f"echo 'cat {S}/x.txt' | tee -a s.sh; ./s*", f"x={S}; echo \"cat $x/x.txt\" > s.sh; sh s.sh",
+        ):
+            with self.subTest(command):
+                self.assertIsNotNone(b.bash(command))
+        for command in (f"echo 'about {S}' > notes.md && git add notes.md", "echo \"$HOME\" > notes.md; python3 gen.py", "printf '%s' x > notes.txt; ls"):
+            with self.subTest(command):
+                self.assertIsNone(b.bash(command))
+
+    def test_round4_more_seeding(self):
+        b = self.gate()
+        S = "Sensitive-data"
+        for command in (
+            f"echo 'cat {S}/x.txt' >> ~/.ssh/rc", f"echo 'cat {S}/x.txt' >> ~/.ssh/config", f"echo 'cat {S}/x.txt' >> ~/.gitconfig",
+            f"echo 'cat {S}/x.txt' >> .git/config", f"echo 'cat {S}/x.txt' > ~/.config/environment.d/a.conf", f"echo 'cat {S}/x.txt' > .envrc",
+            f"echo 'cat {S}/x.txt' > ~/.local/bin/ls", f"echo '{{}}' > .claude/settings.json; ls {S}", f"echo x > .claude/hooks/h.sh; ls {S}",
+            f"BASH_ENV=s.sh ls {S}", f"ENV=s.sh sh -c 'ls {S}'",
+        ):
+            with self.subTest(command):
+                self.assertIsNotNone(b.bash(command))
+
     def test_existing_files_by_content(self):
         b = self.gate()
         (self.repo / "broken.xlsx").write_bytes(b"not a zip")
