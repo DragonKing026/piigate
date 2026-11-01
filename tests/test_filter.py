@@ -377,11 +377,13 @@ class TestGate(unittest.TestCase):
         self.assertTrue(self.denial("Grep", {"pattern": "x", "path": f"{self.home}/Downloads/thunderbird.tmp"}))
         self.assertTrue(self.denial("Grep", {"pattern": "x", "glob": "*.csv", "path": str(FILES["csv"].parent)}))
         self.assertFalse(self.denial("Grep", {"pattern": "x", "glob": "*.csv"}))  # the plugin has no CSV files
-        self.assertTrue(self.denial("Glob", {"pattern": "*", "path": f"{self.home}/Documents/piigate/Sensitive-data"}))
+        # #23: Glob returns file names, never content — allowed also in sensitive directories (only the filter's files are off-limits)
+        self.assertFalse(self.denial("Glob", {"pattern": "*", "path": f"{self.home}/Documents/piigate/Sensitive-data"}))
+        self.assertTrue(self.denial("Glob", {"pattern": "*", "path": f"{self.home}/.local/share/piigate"}))
         self.assertFalse(self.denial("Glob", {"pattern": "**/*.py"}))
         self.assertTrue(self.denial("Grep", {"pattern": "Kowalski", "path": self.home}))
-        self.assertTrue(self.denial("Glob", {"pattern": "**/*", "path": self.home}))
-        self.assertTrue(self.denial("Glob", {"pattern": "Downloads/thunderbird.tmp/*", "path": self.home}))
+        self.assertFalse(self.denial("Glob", {"pattern": "**/*", "path": self.home}))  # #23: names (an ancestor of the filter's directory)
+        self.assertFalse(self.denial("Glob", {"pattern": "Downloads/thunderbird.tmp/*", "path": self.home}))  # #23: names
         self.assertTrue(self.denial("Edit", {"file_path": f"{self.home}/.config/piigate/config.json"}))
         self.assertTrue(self.denial("Edit", {"file_path": str(FILES["csv"])}))
         self.assertFalse(self.denial("Write", {"file_path": str(TMP / "new.csv")}))
@@ -405,8 +407,8 @@ class TestGate(unittest.TestCase):
             "cat <<'EOF'\n~/Documents/piigate/Sensitive-data/a.csv\nEOF": True,
             "cat ~/Downloads/thunderbird.tmp/mail.eml": True,
             "cd ~/Downloads && head thunderbird.tmp/a.csv": True,
-            "ls ~/Downloads/thunderbird.tmp/": True,
-            "pdftotext faktura.pdf -": True,
+            "ls ~/Downloads/thunderbird.tmp/": False,  # #23: file names are not content
+            "pdftotext faktura.pdf -": False,  # #23: a file that does not exist has no content
             "python3 -c \"print(open('/home/x/Sensitive-data/a.txt').read())\"": True,
             "ssh prod 'cd /var/www && bin/console dbal:run-sql \"SELECT * FROM pacjent\"'": True,
             "ssh prod 'bin/console doctrine:query:sql \"SELECT 1\"' | piigate table": True,  # no 2>&1
@@ -425,11 +427,11 @@ class TestGate(unittest.TestCase):
             "PIIGATE_CONFIG_DIR=/tmp/x piigate show a.pdf": True,
             "cp ~/Downloads/thunderbird.tmp/a.pdf ~/Documents/piigate/Sensitive-data/pharmacy/": False,
             "scp prod:/var/www/export.csv ~/Documents/piigate/Sensitive-data/pharmacy/": False,
-            "git add tests/data.csv": True,  # a data file would end up in the repository
+            "git add tests/data.csv": False,  # #23: git metadata operation (and the file does not exist)
             # bypasses found in a security review
             "grep -r Kowalski ~": True,
             "rg -i pacjent ~/Downloads": True,
-            "find ~ -name '*.eml'": True,
+            "find ~ -name '*.eml'": False,  # #23: names only
             "cat ~/Dow*/thunder*/mail.eml": True,
             "cat ~/Documents/piigate/Sensitive-{da,x}ta/a.txt": True,
             "./piigate table < ~/Documents/piigate/Sensitive-data/x.csv": True,
@@ -1386,10 +1388,11 @@ class TestContentVerdict(unittest.TestCase):
 
     def test_bash_cautious(self):
         cases = {
-            "cat missing.sql": True,  # no such file — the content cannot be checked
-            "cat *.sql": True,  # glob
+            "cat missing.sql": False,  # #23: no such file — no content (creating files is never denied)
+            "cat *.sql": False,  # #23: glob expanded, every match judged — here all schemas are clean
+            "cat *.csv": True,  # #23: ... and here one match has a PESEL
             "curl -s https://example.com/export > update.sql; cat update.sql": True,
-            "curl -s https://example.com/e.csv": True,  # a URL with an extension — data from the network, not a file
+            "curl -s https://example.com/e.csv": False,  # #23: a URL is not a local file
             "curl -s https://example.com/export | tee new.csv | head": False,  # tee writes; the sensors run on the output
             "cp -t /tmp pesele.csv": True,
             "head -3 update.sql 0001_schemat.sql": False,
@@ -1755,10 +1758,11 @@ class TestProjectFilters(unittest.TestCase):
             "git commit -q -m 'filter: approve the snapshot, reverse is human only'": False,
             "git log --reverse --oneline | piigate text": False,  # the --reverse option is not the subcommand
             'python3 - "$f" <<\'EOF\'\nimport sys\nprint(sys.argv[1])\nEOF': False,
-            "cat dane.c?v": True,
+            "cat dane.c?v": True,  # #23: patterns are expanded; this folder holds a csv with personal data
             "cat *.*": True,
-            "cat x.[cC]sv": True,
+            "cat x.[cC]sv": False,  # no match, no content
         }
+        (self.folder / "dane.csv").write_text("id;pesel\n1;44051401359\n", encoding="utf-8")
         for command, denial in cases.items():
             with self.subTest(command):
                 self.assertEqual(gate.Gate(CONFIG, str(self.folder)).decision("Bash", {"command": command}) is not None, denial)
@@ -1807,23 +1811,34 @@ class TestNameFilters(unittest.TestCase):
             "rg --glob=*.php -t php foo backend": False,
             "find backend -name '*.php' -not -path '*/vendor/*'": False,
             "fd -e php . backend": False,
-            # still denied: a data extension in the filter, recursion from the project root, the sensitive directory itself
-            "grep -r foo --include=*.csv backend/src": True,
-            "rg -g '*.xlsx' foo backend": True,
+            # #23: a data extension in the filter alone is not a denial (no such file), `find` without actions prints names
+            "grep -r foo --include=*.csv backend/src": False,
+            "rg -g '*.xlsx' foo backend": False,
+            "find . -name '*.php'": False,
+            # still denied: recursion from the project root, the sensitive directory itself
             "grep -r foo .": True,
             "grep -r foo --include=*.php .": True,
-            "find . -name '*.php'": True,
             "grep -r foo 'Patient data'": True,
+            "find . -name '*.php' -exec cat {} +": True,
         }
         for command, denial in cases.items():
             with self.subTest(command):
                 self.assertEqual(b.decision("Bash", {"command": command}) is not None, denial)
+        # #23: the same filter over a data file with personal data (judged by content) is denied
+        p = dt.PATIENTS[0]
+        (self.folder / "backend" / "src" / "ludzie.csv").write_text(
+            f"imie,pesel\n{p['first_name']},{p['pesel']}\n", encoding="utf-8"
+        )
+        for command in ("grep -r foo --include=*.csv backend/src", "rg -g '*.csv' foo backend", "rg -t csv foo backend"):
+            with self.subTest(command):
+                self.assertIsNotNone(b.decision("Bash", {"command": command}))
+        self.assertIsNone(b.decision("Bash", {"command": "grep -r foo --include=*.php backend/src"}))
 
     def test_no_path_means_cwd_and_ignore_excludes_dir(self):
         """rg/fd without a path search cwd (with the sensitive directory) — denied; an .ignore listing that directory →
         allowed (rg and fd honour it), unless the command disables ignore files. grep does not know .ignore."""
         b = lambda: gate.Gate(config.load(str(self.folder)), str(self.folder))  # noqa: E731
-        no_ignore = {"rg foo": True, "rg foo .": True, "fd php": True, "grep -r foo": True, "rg foo backend": False}
+        no_ignore = {"rg foo": True, "rg foo .": True, "fd php": False, "grep -r foo": True, "rg foo backend": False}  # fd: names (#23)
         for command, denial in no_ignore.items():
             with self.subTest(command):
                 self.assertEqual(b().decision("Bash", {"command": command}) is not None, denial)
@@ -1834,7 +1849,7 @@ class TestNameFilters(unittest.TestCase):
             "fd -e php": False,
             "rg --no-ignore foo": True,
             "rg -uu foo": True,
-            "rg -g '*.csv' foo": True,
+            "rg -g '*.csv' foo": False,  # #23: no data file in the tree
             "grep -r foo .": True,
             "rg foo 'Patient data'": True,
         }
@@ -2235,7 +2250,7 @@ class TestProjectDataDirs(unittest.TestCase):
 
     def test_project_search(self):
         """Grep over a project: without Sensitive-data or with it (its own .gitignore — rg skips it) passes; Glob (file
-        names) and grep -r (does not know .gitignore) with an existing directory — denied."""
+        names, #23) passes; grep -r (does not know .gitignore) with an existing directory — denied."""
         b = lambda: gate.Gate(self.cfg(), str(self.proj))  # noqa: E731
         self.assertIsNone(b().decision("Grep", {"pattern": "x"}))
         self.assertIsNone(b().decision("Glob", {"pattern": "**/*.py"}))
@@ -2245,7 +2260,7 @@ class TestProjectDataDirs(unittest.TestCase):
         self.assertIsNone(bb.decision("Grep", {"pattern": "x"}))
         self.assertIsNone(bb.decision("Bash", {"command": "rg x ."}))
         self.assertIsNotNone(bb.decision("Bash", {"command": "rg --no-ignore x ."}))
-        self.assertIsNotNone(bb.decision("Glob", {"pattern": "**/*"}))
+        self.assertIsNone(bb.decision("Glob", {"pattern": "**/*"}))  # #23: file names
         self.assertIsNotNone(bb.decision("Bash", {"command": "grep -r x ."}))
         # a negation in .gitignore — rg could enter the directory
         (self.proj / "Sensitive-data" / ".gitignore").write_text("*\n!lista.txt\n", encoding="utf-8")
@@ -2330,18 +2345,21 @@ class TestPhiPlacesOnly(unittest.TestCase):
             "ls -la ~": False,
             "find ~ -maxdepth 3 -type d -iname '*narz*'": False,
             "find ~ -maxdepth 3 -type d ( -iname '*narz*' -o -iname 'Tools' ) -not -path '*/.cache/*' 2>/dev/null": False,
-            "find ~ -maxdepth 3 -iname '*narz*'": True,  # file names in ~/Documents/piigate/Sensitive-data may be personal
-            "ls -R ~": True,
+            # #23: file names (also inside sensitive directories) are not content — listings are never denied
+            "find ~ -maxdepth 3 -iname '*narz*'": False,
+            "ls -R ~": False,
             "tree -d -L 2 ~": False,
             "du -sh ~": False,
-            "du -a ~": True,
-            "find ~ -type d -o -name '*.pdf'": True,
-            "find ~ ! -type d": True,
-            "find ~ -type d -name ( -o -name x )": True,  # a parenthesis as the -name argument does not change the level
-            "find ~ -type d -name ')' -o -name x": True,
-            "find ~ -type d -print0": True,
-            "du -ah ~": True,
-            "du --al ~": True,
+            "du -a ~": False,
+            "find ~ -type d -o -name '*.pdf'": False,
+            "find ~ ! -type d": False,
+            "find ~ -type d -name ( -o -name x )": False,
+            "find ~ -type d -name ')' -o -name x": False,
+            "find ~ -type d -print0": False,
+            "du -ah ~": False,
+            "du --al ~": False,
+            "find ~ -type d -exec cat {} +": True,  # an action that reads
+            "find ~ -name '*.pdf' -exec cat {} +": True,
             "du -sh -d 1 ~": False,
             f"ls {TMP}; cat {data}/map.sqlite": True,
         }.items():
@@ -2353,7 +2371,8 @@ class TestPhiPlacesOnly(unittest.TestCase):
         self.assertIsNone(b.decision("Bash", {"command": 'git commit -q -m "copies in the project, Sensitive-data with .gitignore"'}))
         self.assertIsNone(b.decision("Bash", {"command": "git commit -am 'thunderbird.tmp — description'"}))
         self.assertIsNotNone(b.decision("Bash", {"command": "cat ~/Documents/piigate/Sensitive-data/x.txt"}))
-        self.assertIsNotNone(b.decision("Bash", {"command": 'git commit -m "x" ~/Documents/piigate/Sensitive-data/a.txt'}))
+        # #23: committing a path is a git metadata operation
+        self.assertIsNone(b.decision("Bash", {"command": 'git commit -m "x" ~/Documents/piigate/Sensitive-data/a.txt'}))
         for command in (
             'git commit -m "$(cat ~/Documents/piigate/Sensitive-data/a.txt)"',
             "git commit -m \"`cat ~/Documents/piigate/Sensitive-data/a.txt`\"",
@@ -2384,12 +2403,15 @@ class TestPhiPlacesOnly(unittest.TestCase):
         self.assertFalse(self.gate(second).is_public_tree(str(second)))
 
     def test_listing_without_globs_and_named_files(self):
-        """The "names only" exemption does not cover globs/braces in the path or options reading names from a file."""
+        """#23: names are never content — also with globs and braces; options that read names from a file or run
+        something make the stage an ordinary reader."""
         b = self.gate()
-        self.assertIsNotNone(b.decision("Bash", {"command": "ls ~/D*"}))  # the glob hits ~/Documents/piigate/Sensitive-data
-        for command in ("ls ~/D*", "tree -d --fromfile ~", "du --files0-from=list ~", "ls ~/{a,b}", "ls -d ~"):
+        for command in ("ls ~/D*", "ls ~/{a,b}", "ls -d ~", "tree ~/Documents/piigate/Sensitive-data", "ls -R ~/Documents"):
             with self.subTest(command):
-                self.assertEqual(b._names_only(command, b._tokens(command)), command == "ls -d ~")
+                self.assertIsNone(b.decision("Bash", {"command": command}))
+        for command in ("tree -d --fromfile ~", "du --files0-from=list ~"):
+            with self.subTest(command):
+                self.assertEqual(b._stage_class(b._tokens(command)), "")
 
     def test_command_prefixes(self):
         """`X=1 grep -r … ~`, `env`/`nice`/`timeout` before a searcher — recursion must still be detected."""
@@ -2593,10 +2615,11 @@ class TestFalseAlarms(unittest.TestCase):
             "python3 - <<'EOF'\nimport json\njson.dump(1, open('x', 'w'))\nprint(open('people.csv').read())\nEOF",
             "cat <<'EOF' | bash\ncat people.csv\nEOF",
             "bash <<'EOF'\npeople.csv() { :; }\ncat people.csv\nEOF",
-            "cat x.dump",
+            "cat people.csv",  # #23: a name alone is not enough — this file exists and holds personal data
         ):
             with self.subTest(command):
                 self.assertIsNotNone(b.bash(command))
+        self.assertIsNone(b.bash("cat x.dump"))  # #23: no such file
 
     def test_plugin_root_in_quoted_heredoc(self):
         """Issue #5: `${CLAUDE_PLUGIN_ROOT}` inside a quoted heredoc is not expanded by the shell (it is another
@@ -2748,8 +2771,8 @@ class TestFalseAlarms(unittest.TestCase):
 
     def test_r_flag_of_non_searcher_is_not_recursion(self):
         """jq -r (raw output) and gh -R (repository) are not recursion: a jq filter with `[]` is not a pattern searched
-        from cwd — in a project with a sensitive directory it was denied as `.`. Searches and recursive listings of cwd
-        (also without a path: `ls -R`, `tree`, `find`, `du -a`) are still denied."""
+        from cwd — in a project with a sensitive directory it was denied as `.`. Searches of cwd (also without a path)
+        are still denied; recursive listings (`ls -R`, `tree`, `find`, `du -a`) print names only (#23)."""
         (self.public / "Sensitive-data").mkdir()
         b = self.gate(self.public)
         for command in (
@@ -2766,13 +2789,7 @@ class TestFalseAlarms(unittest.TestCase):
             "ls -ltr",
             "ls -R src 2>/dev/null",
             "find src -name '*.py'",
-        ):
-            with self.subTest(command):
-                self.assertIsNone(b.bash(command))
-        for command in (
-            "grep -r foo",
-            "grep -r foo .",
-            "rg --no-ignore foo",
+            # #23: listings print names only
             "ls -R",
             "ls -lR 2>/dev/null",
             "ls -R .",
@@ -2780,6 +2797,13 @@ class TestFalseAlarms(unittest.TestCase):
             "find",
             "find -name x 2> /dev/null",
             "du -a",
+        ):
+            with self.subTest(command):
+                self.assertIsNone(b.bash(command))
+        for command in (
+            "grep -r foo",
+            "grep -r foo .",
+            "rg --no-ignore foo",
             "xargs grep -r foo .",
             "jq -r . Sensitive-data/x.json",
         ):
@@ -2822,6 +2846,7 @@ class TestFalseAlarms(unittest.TestCase):
         assignment, a function, a non-literal target, a shell, several lines) ends the narrowing: the rest of the command
         is checked in every directory it may run in — the session directory included."""
         (self.public / "Sensitive-data").mkdir()
+        (self.public / "Sensitive-data" / "a.txt").write_text("x\n", encoding="utf-8")
         (self.public / "raporty" / "nocne").mkdir(parents=True)
         (self.public / "raporty" / "nocne" / "2026-11-01").mkdir()
         b = self.gate(self.public)
@@ -2837,55 +2862,56 @@ class TestFalseAlarms(unittest.TestCase):
         ):
             with self.subTest(command):
                 self.assertIsNone(b.bash(command))
+        # #23: the stage is a content reader (`ls` would print names only)
         for command in (  # still denied: the stage may run in the session directory (or the target holds data)
-            "cd raporty/nocne && cd ../.. && ls -R",
-            "cd raporty/nocne; ls -R",
-            "cd raporty/nocne || ls -R",
-            "cd raporty/nocne | ls -R",
-            "cd raporty/nocne & ls -R",
-            "(cd raporty/nocne && true) && ls -R",
-            "cd raporty/nocne && true; ls -R",
-            "cd \"$D\" && ls -R",
-            "cd - && ls -R",
-            "cd raporty/nocne && popd && ls -R",
-            "cd raporty/nocne && ls\nls -R",
+            "cd raporty/nocne && cd ../.. && grep -r foo",
+            "cd raporty/nocne; grep -r foo",
+            "cd raporty/nocne || grep -r foo",
+            "cd raporty/nocne | grep -r foo",
+            "cd raporty/nocne & grep -r foo",
+            "(cd raporty/nocne && true) && grep -r foo",
+            "cd raporty/nocne && true; grep -r foo",
+            "cd \"$D\" && grep -r foo",
+            "cd - && grep -r foo",
+            "cd raporty/nocne && popd && grep -r foo",
+            "cd raporty/nocne && ls\ngrep -r foo",
             "cd raporty/nocne && cat ../../Sensitive-data/x.txt",
-            "cd Sensitive-data && ls",
-            "cd raporty && ls -R ..",
+            "cd Sensitive-data && cat a.txt",
+            "cd raporty && grep -r foo ..",
             # a quoted substitution runs in the stage's directory, not the session's
             "cd raporty/nocne && echo \"$(cat ../../Sens*/x.txt)\"",
             "cd raporty/nocne && cat \"$(cat ../../Sens*/x.txt)\"",
             "cd raporty/nocne && echo \"`cat ../../Sens*/x.txt`\"",
             "cd raporty/nocne && printf '%s' \"x$(cat ../../Sens*/x.txt)\" | cat",
-            "true || cd raporty/nocne && ls -R",
-            "cd raporty/nocne 2>&1 && cd ../.. && ls -R",
+            "true || cd raporty/nocne && grep -r foo",
+            "cd raporty/nocne 2>&1 && cd ../.. && grep -r foo",
             # the narrowing ends at anything but a literal cd / plain reader joined by `&&` (security review of #18)
-            "cd raporty/nocne && cd - && ls -d */",
-            "cd raporty/nocne && cd $OLDPWD && ls -d */",
-            "cd raporty/nocne && cd ~- && ls -d */",
-            "cd raporty/nocne && cd \"$PWD/..\" && ls -d */",
-            "cd raporty/nocne && cd $(pwd)/../.. && ls -d */",
-            "X=../.. && cd raporty/nocne && cd $X && ls -d */",
-            "cd raporty/nocne && cd - >/dev/null && ls -d */",
-            "cd raporty/nocne && cd -- - && ls -d */",
-            "cd raporty/nocne && builtin cd ../.. && ls -d */",
-            "cd raporty/nocne && command cd ../.. && ls -d */",
-            "cd raporty/nocne && chdir ../.. && ls -d */",
-            "cd raporty/nocne && eval cd ../.. && ls -d */",
-            "cd raporty/nocne && eval 'cd ../..' && ls -d */",
-            "cd raporty/nocne && alias c=cd && c ../.. && ls -d */",
-            "pushd -n raporty/nocne && ls -d */",
-            "pushd raporty/nocne && pushd -0 && ls -d */",
-            "pushd raporty/nocne && pushd +1 && ls -d */",
-            "pushd raporty/nocne && pushd && ls -d */",
-            "f() { cd ../..; }; cd raporty/nocne && f && ls -d */",
-            "cd raporty && bash -c 'cd ..; ls -d */'",
-            "cd raporty && sh -c 'cd ..; ls -d */'",
-            "env -C ../.. ls -d */",
-            "cd raporty/nocne && env -C ../.. ls -d */",
-            "cd raporty/nocne && { cd ../..; } && ls -d */",
-            "cd raporty/nocne && (cd ../..) && ls -d */",
-            "cd raporty/nocne && find . -exec sh -c 'cd ../..; ls -d */' ';' && ls -d */",
+            "cd raporty/nocne && cd - && cat Sens*/a.txt",
+            "cd raporty/nocne && cd $OLDPWD && cat Sens*/a.txt",
+            "cd raporty/nocne && cd ~- && cat Sens*/a.txt",
+            "cd raporty/nocne && cd \"$PWD/..\" && cat Sens*/a.txt",
+            "cd raporty/nocne && cd $(pwd)/../.. && cat Sens*/a.txt",
+            "X=../.. && cd raporty/nocne && cd $X && cat Sens*/a.txt",
+            "cd raporty/nocne && cd - >/dev/null && cat Sens*/a.txt",
+            "cd raporty/nocne && cd -- - && cat Sens*/a.txt",
+            "cd raporty/nocne && builtin cd ../.. && cat Sens*/a.txt",
+            "cd raporty/nocne && command cd ../.. && cat Sens*/a.txt",
+            "cd raporty/nocne && chdir ../.. && cat Sens*/a.txt",
+            "cd raporty/nocne && eval cd ../.. && cat Sens*/a.txt",
+            "cd raporty/nocne && eval 'cd ../..' && cat Sens*/a.txt",
+            "cd raporty/nocne && alias c=cd && c ../.. && cat Sens*/a.txt",
+            "pushd -n raporty/nocne && cat Sens*/a.txt",
+            "pushd raporty/nocne && pushd -0 && cat Sens*/a.txt",
+            "pushd raporty/nocne && pushd +1 && cat Sens*/a.txt",
+            "pushd raporty/nocne && pushd && cat Sens*/a.txt",
+            "f() { cd ../..; }; cd raporty/nocne && f && cat Sens*/a.txt",
+            "cd raporty && bash -c 'cd ..; cat Sens*/a.txt'",
+            "cd raporty && sh -c 'cd ..; cat Sens*/a.txt'",
+            "env -C ../.. cat Sens*/a.txt",
+            "cd raporty/nocne && env -C ../.. cat Sens*/a.txt",
+            "cd raporty/nocne && { cd ../..; } && cat Sens*/a.txt",
+            "cd raporty/nocne && (cd ../..) && cat Sens*/a.txt",
+            "cd raporty/nocne && find . -exec sh -c 'cd ../..; cat Sens*/a.txt' ';' && cat Sens*/a.txt",
             "cd raporty/nocne && cd ../.. && cat Sens*/a.txt",
         ):
             with self.subTest(command):
@@ -2903,8 +2929,6 @@ class TestFalseAlarms(unittest.TestCase):
             "jq -n Sens*/*.json && echo 'Sens*/*.json'",
             "jq Sens*/*.json | cat; echo 'Sens*/*.json'",
             "yq Sens*/* ; echo 'Sens*/*'",
-            "gh api x -q Sens*/* ; echo 'Sens*/*'",
-            "gh api x --jq=Sens*/* ; echo '--jq=Sens*/*'",
             "sed Sens*/*.json; echo 'Sens*/*.json'",
             "sed -n p Sens*/*.json; echo 'Sens*/*.json'",
             "awk 1 Sens*/*.json; echo 'Sens*/*.json'",
@@ -2944,17 +2968,19 @@ class TestFalseAlarms(unittest.TestCase):
         self.assertEqual(b._tokens("cat Sens\\\nitive a\\\n b"), ["cat", "Sensitive", "a", "b"])
 
     def test_ls_recursion_spelled_differently(self):
-        """Issue #20 (review): the `ls` exception never applies to recursion, however spelled."""
+        """Issue #20 (review), reversed by #23: `ls` prints names, however spelled its recursion — never denied; the
+        content readers next to it are judged on their own."""
         (self.phi / "Sensitive-data").mkdir()
         b = self.gate(self.phi)
         for flag in ("-R", "-1R", "-lR", "-laR", "-Rla", "-lRh", "-RF", "--recursive", "--recurs", "--recur", "--rec"):
             command = f"ls {flag} *.csv; wc -l notes.md"
             with self.subTest(command):
-                self.assertIsNotNone(b.bash(command))
+                self.assertIsNone(b.bash(command))
         for command in ("ls --recur *.csv", "ls -1R *.csv", "ls --unknown-option *.csv; wc -l notes.md"):
             with self.subTest(command):
-                self.assertIsNotNone(b.bash(command))
+                self.assertIsNone(b.bash(command))
         self.assertIsNone(b.bash("ls -1 --color=never -d *.csv; wc -l notes.md"))
+        self.assertIsNotNone(b.bash("ls -R *.csv; cat *.csv"))
 
     def test_directory_name_in_text_still_denied_when_read(self):
         """Issue #7 (point 3): what must stay denied when the shell parser replaces the marker check — a sensitive
@@ -3002,15 +3028,16 @@ class TestFalseAlarms(unittest.TestCase):
             "ls *.csv; wc -l notes.md",
             "ls -l *.csv *.xlsx | wc -l; wc -l notes.md",
             "ls *.csv && wc -l notes.md",
+            # #23: names are never content — recursion and sensitive directories included
+            "ls -R *.csv; wc -l notes.md",
+            "ls Sensitive-data/*.csv; wc -l notes.md",
+            "ls Sensitive-data/*.csv",
         ):
             with self.subTest(command):
                 self.assertIsNone(b.bash(command))
-        for command in (  # still denied: recursion, a content reader, a sensitive directory, a write target read back
-            "ls -R *.csv; wc -l notes.md",
+        for command in (  # still denied: a content reader of an existing data file with personal data
             "cat *.csv; wc -l notes.md",
             "ls .; cat *.csv",
-            "ls Sensitive-data/*.csv; wc -l notes.md",
-            "ls Sensitive-data/*.csv",
             "ls *.csv; wc -l *.csv",
         ):
             with self.subTest(command):
@@ -3024,7 +3051,7 @@ class TestFalseAlarms(unittest.TestCase):
         for command in (
             "echo x\ncat Sensitive-data/a.txt",
             "echo x\ngrep -r foo",
-            "true\nls -R",
+            "true\ngrep -r foo",
             "echo x &&\ncat Sensitive-data/a.txt",
             "echo x \\\n&& cat Sensitive-data/a.txt",
             "echo x\n\ncat Sensitive-data/a.txt\n",
@@ -3047,6 +3074,276 @@ class TestFalseAlarms(unittest.TestCase):
         ):
             with self.subTest(command):
                 self.assertIsNone(b.bash(command))
+
+
+class TestContentNotNames(unittest.TestCase):
+    """#23: the Bash gate (and Read/Grep/Glob) denies only when the output can bring the CONTENT of sensitive data into
+    the context. Location and content decide — never a file type or a name alone."""
+
+    def setUp(self):
+        self.base = TMP / f"content-not-names-{self._testMethodName}"
+        shutil.rmtree(self.base, ignore_errors=True)
+        self.session = os.environ.pop("CLAUDE_PROJECT_DIR", None)
+        self.repo = self.base / "repo"
+        self.repo.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
+        (self.repo / ".claude").mkdir()
+        (self.repo / ".claude" / "piigate.json").write_text("{}", encoding="utf-8")  # a PHI project: content is judged
+        p = dt.PATIENTS[0]
+        (self.repo / "people.csv").write_text(f"imie,pesel\n{p['first_name']},{p['pesel']}\n", encoding="utf-8")
+        (self.repo / "Sensitive-data").mkdir()
+        (self.repo / "Sensitive-data" / "x.txt").write_text("secret\n", encoding="utf-8")
+        (self.repo / "Sensitive-data" / "x.json").write_text("{}\n", encoding="utf-8")
+        (self.repo / "raporty").mkdir()
+        self.clean = self.repo / "clean"
+        self.clean.mkdir()
+        for name in ("a.csv", "b.csv"):
+            (self.clean / name).write_text("id;status\n1;2\n", encoding="utf-8")
+        self.scripts = self.base / "s"
+        self.scripts.mkdir()
+
+    def tearDown(self):
+        if self.session is not None:
+            os.environ["CLAUDE_PROJECT_DIR"] = self.session
+
+    def gate(self, cwd: Path | None = None) -> gate.Gate:
+        k = config.load(str(cwd or self.repo))
+        k["sources"]["non_public"] = []
+        k["sources"]["public_repo_min_age_h"] = 0
+        return gate.Gate(k, str(cwd or self.repo))
+
+    def test_never_denied(self):
+        b = self.gate()
+        s = self.scripts
+        for command in (
+            f"python3 -I {s}/gen.py {s}/new.xlsx",  # creating a file: it does not exist, so it has no content
+            "curl -o new.csv https://example.com/x",
+            "curl -s https://example.com/e.csv",
+            "mkdir -p out && touch out/new.csv",
+            "cat missing.sql",
+            "gh issue create -R o/r --title \"t\" --body 'about Sensitive-data/x\n```\ncode\n```'",
+            "gh issue create -R o/r --title 'Sensitive-data' --body 'a `b` and $(c) and $HOME'",
+            "gh pr comment 1 --body 'mentions Sensitive-data/x.json and `code`'",
+            "gh search issues 'Sensitive-data' -R o/r",
+            "gh api repos/o/r/contents/Sensitive-data/x.csv",
+            "git commit -m 'opis Sensitive-data'",
+            "git commit -m 'opis `Sensitive-data` $(x)'",
+            "git tag -a v1 -m 'Sensitive-data'",
+            "echo 'mentions Sensitive-data and `x`'",
+            "printf '%s\\n' 'Sensitive-data/x.txt'",
+            "grep -r 'Sensitive-data' clean",
+            "ls Sensitive-data/",
+            "ls -R Sensitive-data",
+            "ls -la Sensitive-data/*.txt",
+            "find Sensitive-data -name '*.pdf'",
+            "find . -maxdepth 2 \\( -name '*.csv' -o -name '*.txt' \\)",
+            "tree Sensitive-data",
+            "du -sh Sensitive-data",
+            "fd -e txt . Sensitive-data",
+            "git status",
+            "git add plik.py",
+            "git add Sensitive-data/x.txt people.csv",
+            "git log --oneline -- Sensitive-data",
+            "git ls-files Sensitive-data",
+            "git worktree add -b x .claude/worktrees/x main",
+            "git merge --ff-only x",
+            "git push origin main",
+            "gh issue list -R o/r",
+        ):
+            with self.subTest(command):
+                self.assertIsNone(b.bash(command))
+        for path in ("x.xlsx", "new.csv", "sub/nowy.sql"):
+            with self.subTest(path):
+                self.assertIsNone(b.decision("Read", {"file_path": str(self.repo / path)}))
+        self.assertIsNone(b.decision("Write", {"file_path": str(self.repo / "w.csv")}))
+        self.assertIsNone(self.gate(self.clean).bash("cat *.csv"))
+        self.assertIsNone(self.gate(self.clean).bash("head -3 a.csv b.csv"))
+        self.assertIsNone(b.bash("head -3 clean/*.csv"))
+        self.assertIsNone(b.bash("cat nothing-*.csv"))  # no match, no content
+
+    def test_names_everywhere_but_the_filter_files(self):
+        b = self.gate()
+        home = str(Path.home())
+        for tool_input in (
+            {"pattern": "*", "path": f"{home}/Documents/piigate/Sensitive-data"},
+            {"pattern": "**/*.csv", "path": str(self.repo / "Sensitive-data")},
+            {"pattern": "Sensitive-data/*"},
+        ):
+            with self.subTest(tool_input):
+                self.assertIsNone(b.decision("Glob", tool_input))
+        self.assertIsNotNone(b.decision("Glob", {"pattern": "*", "path": f"{home}/.local/share/piigate"}))
+        self.assertIsNotNone(b.bash(f"ls {home}/.local/share/piigate"))  # the filter's own files stay off-limits
+        self.assertIsNotNone(b.bash(f"ls {home}/.config/piigate/*"))
+
+    def test_content_in_sensitive_directories_denied(self):
+        b = self.gate()
+        for command in (
+            "cat Sensitive-data/x.txt",
+            "echo x\ncat Sensitive-data/x.txt",
+            "cat Sens\\\nitive-data/x.txt",
+            "cd raporty && cd - && cat Sens*/x.txt",
+            "cd raporty && bash -c 'cd ..; cat Sens*/x.txt'",
+            "jq . Sens*/x.json",
+            "cd raporty && echo \"$(cat ../Sens*/x.txt)\"",
+            "grep -r foo Sensitive-data",
+            "grep -l foo Sensitive-data/*.txt",
+            "rg foo Sensitive-data",
+            "find Sensitive-data -exec cat {} +",
+            "find Sensitive-data -type f -execdir head -1 {} ;",
+            "fd -x cat {} . Sensitive-data",
+            "git show HEAD:Sensitive-data/x.txt",
+            "git diff -- Sensitive-data/x.txt",
+            "git log -p -- Sensitive-data/x.txt",
+            "gh issue create --title t --body \"$(cat Sensitive-data/x.txt)\"",
+            "gh issue create --title t --body-file Sensitive-data/x.txt",
+            "gh issue create --title t --body \"`cat Sensitive-data/x.txt`\"",
+            "echo '$(cat Sensitive-data/x.txt)' | bash",
+            "echo 'cat Sensitive-data/x.txt' | bash",
+            "echo 'cat Sensitive-data/x.txt' > run.sh && bash run.sh",
+            "git commit -m \"$(cat Sensitive-data/x.txt)\"",
+            "python3 -c \"print(open('Sensitive-data/x.txt').read())\"",
+            "cat < Sensitive-data/x.txt",
+            "head -1 clean/../Sensitive-data/x.txt",
+            "ls Sensitive-data/ && cat Sensitive-data/x.txt",
+        ):
+            with self.subTest(command):
+                self.assertIsNotNone(b.bash(command))
+        for tool, tool_input in (
+            ("Read", {"file_path": str(self.repo / "Sensitive-data" / "x.txt")}),
+            ("Read", {"file_path": str(self.repo / "Sensitive-data" / "missing.xlsx")}),  # a sensitive directory: always
+            ("Grep", {"pattern": "x", "path": str(self.repo / "Sensitive-data")}),
+        ):
+            with self.subTest(tool_input):
+                self.assertIsNotNone(b.decision(tool, tool_input))
+
+    def test_names_of_sensitive_files_do_not_become_a_read(self):
+        """Names are allowed — but not when they are passed on to something that reads them."""
+        b = self.gate()
+        for command in (
+            "ls Sensitive-data/ | grep x | head -3",
+            "find Sensitive-data -name '*.txt' | sort | uniq -c",
+            "ls Sensitive-data/ 2>/dev/null | head -2",
+            "env LC_ALL=C ls Sensitive-data | wc -l",
+            "ls Sensitive-data/ ; git status",
+            "ls Sensitive-data/ && echo ok",
+            "git ls-files Sensitive-data",
+        ):
+            with self.subTest(command):
+                self.assertIsNone(b.bash(command))
+        for command in (
+            "find Sensitive-data -print0 | xargs -0 cat",
+            "find Sensitive-data | xargs cat",
+            "git ls-files Sensitive-data | xargs cat",
+            "cat $(find Sensitive-data -name '*.txt')",
+            "cat \"$(find Sensitive-data -name '*.txt')\"",
+            "cat `ls -d Sensitive-data/*`",
+            "find Sensitive-data > /tmp/list.txt",
+            "tree -o /tmp/list.txt Sensitive-data",
+            "ls Sensitive-data/ | tee /tmp/list.txt",
+            "ls Sensitive-data/ | sed 's/^/cat /e'",
+            "find Sensitive-data | while read f; do cat \"$f\"; done",
+            "ls Sensitive-data/ &",
+            "echo 'Sensitive-data/x.txt' | xargs cat",
+        ):
+            with self.subTest(command):
+                self.assertIsNotNone(b.bash(command))
+
+    def test_existing_files_by_content(self):
+        b = self.gate()
+        (self.repo / "broken.xlsx").write_bytes(b"not a zip")
+        (self.repo / "mail.eml").write_text("From: a@b.pl\n\nhi\n", encoding="utf-8")
+        for command in (
+            "cat people.csv",
+            "cat *.csv",
+            "head -3 people.csv clean/a.csv",
+            "cat broken.xlsx",
+            "cat mail.eml",
+            "cat < people.csv",
+            "grep -r foo --include=*.csv .",
+            "git show HEAD:people.csv",
+            "cp people.csv /tmp/copy.csv",
+        ):
+            with self.subTest(command):
+                self.assertIsNotNone(b.bash(command))
+        for tool, tool_input in (
+            ("Read", {"file_path": str(self.repo / "people.csv")}),
+            ("Read", {"file_path": str(self.repo / "broken.xlsx")}),
+            ("Grep", {"pattern": "x", "path": str(self.repo / "people.csv")}),
+        ):
+            with self.subTest(tool_input):
+                self.assertIsNotNone(b.decision(tool, tool_input))
+        self.assertIsNone(b.decision("Read", {"file_path": str(self.clean / "a.csv")}))
+        reason = b.bash("cat people.csv")
+        self.assertIn("personal data", reason)
+        self.assertNotIn(dt.PATIENTS[0]["pesel"], reason)
+        # the PostToolUse safety net does not judge files again (a file the command created is checked via its output)
+        self.assertIsNone(b.bash("cat people.csv", files=False))
+        self.assertIsNotNone(b.bash("cat Sensitive-data/x.txt", files=False))
+
+    def test_file_written_and_read_in_one_command(self):
+        b = self.gate()
+        s = self.scripts
+        for command in (
+            "curl -s https://example.com/e > x.csv; cat x.csv",
+            "curl -s https://example.com/e -o x.csv && head x.csv",
+            f"python3 {s}/gen.py x.csv && cat x.csv",
+            f"python3 {s}/gen.py x.csv; python3 {s}/read.py x.csv",
+            "curl -s https://example.com/e > x.csv; cat *.csv",
+            "curl -s https://example.com/e > x.csv; cat x.c?v",
+            "echo hi | tee x.xlsx; wc -c x.xlsx",
+        ):
+            with self.subTest(command):
+                reason = b.bash(command)
+                self.assertIsNotNone(reason)
+                self.assertIn("written", reason)
+        for command in (  # one stage only, or a lister/toucher — nothing is read back
+            f"python3 {s}/gen.py x.csv",
+            "curl -s https://example.com/e > x.csv",
+            "curl -o x.csv https://example.com/e && ls x.csv",
+            "touch x.csv && stat x.csv",
+            "curl -o a.csv https://example.com/a && curl -o b.csv https://example.com/b",
+        ):
+            with self.subTest(command):
+                self.assertIsNone(b.bash(command))
+
+    def test_single_quotes_are_literal(self):
+        b = self.gate()
+        self.assertIsNone(b.bash("gh issue create -R o/r --body 'a `Sensitive-data` b'"))
+        self.assertIsNone(b.bash("git commit -m 'Sensitive-data `x` $(y) ${z}'"))
+        # double quotes substitute
+        self.assertIsNotNone(b.bash('gh issue create -R o/r --body "$(cat Sensitive-data/x.txt)"'))
+        self.assertIsNotNone(b.bash('git commit -m "`cat Sensitive-data/x.txt`"'))
+        t = b._tokens("echo 'a' \"b\" --body='c' d")
+        self.assertEqual([getattr(x, "quote", "") for x in t], ["", "'", '"', "'", ""])
+        self.assertTrue(t[1].single and not t[2].single)
+        self.assertEqual(b._substitutions("echo '`a`' \"`b`\" `c` $(d)"), ["b", "c", "d"])
+        self.assertEqual(b._substitutions("echo \"it's\" `x`"), ["x"])
+
+    def test_glob_limit(self):
+        many = self.repo / "many"
+        many.mkdir()
+        for i in range(gate.GLOB_LIMIT + 1):
+            (many / f"f{i}.csv").write_text("id;status\n1;2\n", encoding="utf-8")
+        b = self.gate()
+        reason = b.bash("cat many/*.csv")
+        self.assertIsNotNone(reason)
+        self.assertIn(str(gate.GLOB_LIMIT), reason)
+        self.assertIsNone(self.gate().bash("cat many/f1.csv"))
+
+    def test_protected_and_commands_unchanged(self):
+        b = self.gate()
+        home = str(Path.home())
+        for command in (
+            f"cat {home}/.local/share/piigate/map.sqlite",
+            "PIIGATE_DATA_DIR=/tmp/x piigate show a.pdf",
+            "piigate reverse report.md",
+            "piigate project approve",
+            "ssh prod 'bin/console dbal:run-sql \"SELECT 1\"'",
+            "piigate analyze x.pdf",
+        ):
+            with self.subTest(command):
+                self.assertIsNotNone(b.bash(command))
+        self.assertIsNone(b.bash("git commit -m 'about PIIGATE_DATA_DIR and piigate/map'"))
 
 
 class TestHumanApproval(unittest.TestCase):
