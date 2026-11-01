@@ -548,6 +548,12 @@ class Gate:
         quoting already kept it one word and unexpanded, so it is not a glob or braces — but it is still code (sed `r`,
         awk `getline`), so it stays checked as a plain path and for directory names. `-f` program files stay paths."""
         cmd = Path(stage[0]).name if stage else ""
+        if cmd == "gh":  # -q/--jq: a jq filter, -t/--template: a Go template (issue #19: `.m // "-"`)
+            text = {i + 1 for i, t in enumerate(stage[:-1]) if t in ("-q", "--jq", "-t", "--template")}
+            text |= {i for i, t in enumerate(stage) if t.split("=", 1)[0] in ("--jq", "--template") and "=" in t}
+            return {i for i in text if i < len(stage)}
+        if cmd in ("jq", "gojq", "yq"):
+            return Gate._jq_program(stage)
         if cmd not in ("sed", "gsed", "awk", "gawk", "mawk", "nawk"):
             return set()
         sed = cmd.endswith("sed")
@@ -595,6 +601,45 @@ class Gate:
                 positional.append(i)
             i += 1
         if not program_option and positional:
+            text.add(positional[0])
+        return {i for i in text if i < len(stage)}
+
+    @staticmethod
+    def _jq_program(stage: list[str]) -> set[int]:
+        """jq/gojq/yq: the filter — the first operand (after a yq `eval`/`ea` subcommand), unless -f/--from-file gives
+        a program file; `--arg/--argjson NAME VALUE` values are text too. Files (`--slurpfile/--rawfile NAME FILE`, the
+        operands after the filter) stay paths."""
+        # option → number of values that follow it; `text` values are not paths
+        values = {"--arg": 2, "--argjson": 2, "--slurpfile": 2, "--rawfile": 2, "--indent": 1, "-L": 1,
+                  "--library-path": 1, "--from-file": 1, "-f": 1, "--front-matter": 1, "-p": 1, "--input-format": 1,
+                  "-o": 1, "--output-format": 1}
+        text: set[int] = set()
+        positional: list[int] = []
+        from_file = False
+        i = 1
+        while i < len(stage):
+            t = stage[i]
+            if t in REDIRECTS or re.fullmatch(r"\d*[<>]+&?\d*", t):
+                i += 2
+                continue
+            if t == "--":
+                positional += range(i + 1, len(stage))
+                break
+            name = t.split("=", 1)[0]
+            if name in values and "=" not in t:
+                from_file |= name in ("-f", "--from-file")
+                if name in ("--arg", "--argjson"):
+                    text |= {i + 1, i + 2}
+                i += values[name] + 1
+                continue
+            if t.startswith("-") and len(t) > 1:
+                from_file |= name in ("-f", "--from-file")
+            else:
+                positional.append(i)
+            i += 1
+        if Path(stage[0]).name == "yq" and positional and stage[positional[0]] in ("eval", "e", "eval-all", "ea"):
+            positional.pop(0)
+        if not from_file and positional:
             text.add(positional[0])
         return {i for i in text if i < len(stage)}
 
@@ -1086,11 +1131,29 @@ class Gate:
 
     @staticmethod
     def _tokens(command: str) -> list[str] | None:
-        lex = shlex.shlex(command, posix=True, punctuation_chars=";&|()<>")
+        # an unquoted newline separates commands like `;` (issue #21): shlex would treat it as blank space, and
+        # `echo x<newline>cat <dir>/a.txt` would look like one `echo` stage. It becomes the token "\n"; a
+        # backslash-newline is a line continuation (blank space).
+        marked, quote, i = [], "", 0
+        while i < len(command):
+            z = command[i]
+            if z == "\\" and quote != "'" and i + 1 < len(command):
+                marked.append(" " if command[i + 1] == "\n" and not quote else command[i : i + 2])
+                i += 2
+                continue
+            if quote:
+                quote = "" if z == quote else quote
+            elif z in "'\"":
+                quote = z
+            elif z == "\n":
+                z = " \x00 "
+            marked.append(z)
+            i += 1
+        lex = shlex.shlex("".join(marked), posix=True, punctuation_chars=";&|()<>")
         lex.whitespace_split = True
         lex.commenters = ""
         try:
-            return list(lex)
+            return ["\n" if t == "\x00" else t for t in lex]
         except ValueError:
             return None
 
@@ -1339,67 +1402,36 @@ class Gate:
             return "protected", "a filter file"
         if re.search(r"PIIGATE_\w+|XDG_DOCUMENTS_DIR", text):
             return "protected", "PIIGATE_* / XDG_DOCUMENTS_DIR variables (they change where the filter looks)"
-        stages = self._strip_prefixes(self._stages_loose(tokens))
+        stages, dirs = [], []
+        for stage, ds in zip(self._stages_loose(tokens), self._stage_dirs(command, tokens)):
+            for s in self._strip_prefixes([stage]):
+                stages.append(s)
+                dirs.append(ds)
         outside, literal, verbatim, body = self._heredoc_text(text)
         kinds: dict[str, str] = {}
         dests = [self._write_targets(stage) for stage in stages]
         # paths the command reads (everything except write targets) — a write target read in the same command
         # (`curl … > x.csv; cat x.csv`) gets its content only after the gate's check
         read_paths = {
-            _path(k, self.cwd)
-            for stage, c in zip(stages, dests)
+            _path(k, d)
+            for stage, c, ds in zip(stages, dests, dirs)
+            for d in ds
             for i, t in enumerate(stage)
             if i not in c
             for k in (t, t.split("=", 1)[-1])
             if k and not re.fullmatch(r"[|<>&;()]+|\d?>&?\d?", k)
         }
-        for stage, c in zip(stages, dests):
-            cmd = Path(stage[0]).name if stage else ""
-            # grep without -r/-R/-d recurse reads only the given files (skips directories) — the pattern `../x*.yml`
-            # does not reach subdirectories; rg, fd, ag, find… search the tree by default
-            recursion = (
-                (cmd in SEARCHERS and FAMILIES.get(cmd) != "grep")
-                or _recursive_flag(cmd, stage)
-                or (FAMILIES.get(cmd) == "grep" and GREP_RECURSE.search(" ".join(stage)) is not None)
-            )
-            skip, filters, no_path = self._searcher_args(stage)
-            if cmd in LISTING_COMMANDS and stage[0] == cmd and not no_path:
-                # `ls -R`, `tree`, `find`, `du -a` without a path list cwd (a redirection — `2 > /dev/null` as the
-                # tokenizer splits it — is not an operand)
-                redirect = [t in REDIRECTS or re.fullmatch(r"\d?>&?|&>>?", t) is not None for t in stage]
-                redirected = {i + 1 for i, r in enumerate(redirect) if r}
-                redirected |= {i for i, t in enumerate(stage[:-1]) if t.isdigit() and redirect[i + 1]}
-                arguments = [
-                    t for i, t in enumerate(stage[1:], 1)
-                    if i not in redirected and t not in REDIRECTS and not re.fullmatch(r"[|<>&;()]+|\d?>&?\d?", t)
-                ]
-                no_path = not _listing_paths(cmd, arguments)
-            skip |= self._text_args(stage)
-            program = self._program_text(stage)
-            for v in filters:  # --include=*.csv, -t csv: the name filter reaches for data files
-                if self._data_filter(v) and not self._stage_public(stage, skip, no_path):
-                    kinds.setdefault("extension", v)
-            family = FAMILIES.get(cmd)
-            if no_path:  # rg foo, fd php, grep -r foo — they search cwd
-                stage = [*stage, "."]
-            for i, t in enumerate(stage):
-                if i in skip or not t or re.fullmatch(r"[|<>&;()]+|\d?>&?\d?", t):
-                    continue
-                if family in IGNORE_FILES and i and self._ignore_excludes(t, family, stage):
-                    r = self._token_kind(t, False, content=i not in c)  # sensitive directories under t are skipped (.ignore)
-                    if not r and _ancestor(_path(t, self.cwd), self.protected):
-                        r = ("protected", t)
-                elif i in program and re.search(rf"(['\"]){re.escape(t)}\1", text):
-                    # quoted in the command: one word, no glob (an unquoted `sed ~/D*` expands into the file operands)
-                    r = self._token_kind(t, False, content=i not in c, verbatim=True)
-                elif t in literal:
-                    r = self._literal_kind(t, t in verbatim, body, recursion, content=i not in c)
-                else:
-                    r = self._token_kind(t, recursion, content=i not in c)
-                if r and r[0] == "extension" and i in c and _path(r[1], self.cwd) not in read_paths:
-                    continue  # write only — no content comes back to the model
-                if r:
-                    kinds.setdefault(*r)
+        own = self.cwd
+        try:
+            for stage, c, ds in zip(stages, dests, dirs):
+                for d in ds:  # every directory the stage may run in (issue #18: `cd sub && ls -d */`)
+                    self.cwd = d
+                    for r in self._stage_kinds(stage, c, text, literal, verbatim, body, read_paths):
+                        if d != own and os.path.lexists(_path(r[1], d)):
+                            r = (r[0], _path(r[1], d))  # the message resolves `what` against the session directory
+                        kinds.setdefault(*r)
+        finally:
+            self.cwd = own
         paths_text = self._strip_commit_message(tokens, text)
         for z in self.markers:
             if z in paths_text:
@@ -1419,6 +1451,109 @@ class Gate:
             if r in kinds:
                 return r, kinds[r]
         return None, ""
+
+    def _stage_dirs(self, command: str, tokens: list[str]) -> list[list[str]]:
+        """For every stage of _stages_loose: the directories it may run in. `cd X` / `pushd X` with a literal X moves
+        the stages joined to it by `&&` to X; after any other operator (`;`, `||`, `|`, `&`, parentheses — the cd may
+        have failed or run in a subshell) a stage may run in any directory seen so far. A non-literal target (`cd -`,
+        `cd "$D"`) and a multi-line command keep the session directory among the candidates."""
+        sure = [self.cwd]  # where the stage runs when every `&&` before it succeeded
+        seen = [self.cwd]  # every directory a stage may run in
+        multiline = "\n" in command.strip()
+        result: list[list[str]] = []
+        stage: list[str] = []
+        previous = ";"  # the operator before the stage
+        for t in [*tokens, ";"]:
+            if not (t in FORBIDDEN_OPERATORS or t in ("|", "|&") or re.fullmatch(r"[;&|()]+", t)):
+                stage.append(t)
+                continue
+            if stage:
+                result.append(list(sure))
+                args, skip = [], 0
+                for j, a in enumerate(stage[1:], 1):  # without options and redirections (`cd x 2>/dev/null`, `cd x &>f`)
+                    follows = stage[j + 1] if j + 1 < len(stage) else ""
+                    if skip:
+                        skip -= 1
+                    elif a in REDIRECTS or re.fullmatch(r"\d?>&?|&>>?", a):
+                        skip = 1  # the file after it
+                    elif a.isdigit() and (follows in REDIRECTS or re.fullmatch(r"\d?>&?|&>>?", follows)):
+                        skip = 2  # the descriptor, the operator and the file are skipped
+                    elif a not in ("-L", "-P", "--"):
+                        args.append(a)
+                if Path(stage[0]).name in ("cd", "pushd") and len(args) <= 1 and not multiline:
+                    target = args[0] if args else "~"
+                    if re.fullmatch(r"~?[^$`~*?\[\]{}\\]*", target) and target != "-":
+                        moved = [_path(target, d) for d in sure]
+                        # after `||`, `|`, `&` the cd may have been skipped (`true || cd x && ls` runs ls where it was)
+                        sure = moved if previous in (";", "&&", "\n", "(") else [*seen, *moved]
+                        seen += [d for d in moved if d not in seen]
+                elif Path(stage[0]).name in ("popd",):
+                    sure = list(seen)
+                stage = []
+            if t != "&&":
+                sure = list(seen)
+            previous = t
+        return result
+
+    def _stage_kinds(
+        self, stage: list[str], c: set[int], text: str, literal, verbatim, body: str, read_paths: set[str]
+    ) -> list[tuple[str, str]]:
+        """Reasons the stage touches data, resolved against self.cwd."""
+        found: list[tuple[str, str]] = []
+        cmd = Path(stage[0]).name if stage else ""
+        # grep without -r/-R/-d recurse reads only the given files (skips directories) — the pattern `../x*.yml`
+        # does not reach subdirectories; rg, fd, ag, find… search the tree by default
+        recursion = (
+            (cmd in SEARCHERS and FAMILIES.get(cmd) != "grep")
+            or _recursive_flag(cmd, stage)
+            or (FAMILIES.get(cmd) == "grep" and GREP_RECURSE.search(" ".join(stage)) is not None)
+        )
+        skip, filters, no_path = self._searcher_args(stage)
+        if cmd in LISTING_COMMANDS and stage[0] == cmd and not no_path:
+            # `ls -R`, `tree`, `find`, `du -a` without a path list cwd (a redirection — `2 > /dev/null` as the
+            # tokenizer splits it — is not an operand)
+            redirect = [t in REDIRECTS or re.fullmatch(r"\d?>&?|&>>?", t) is not None for t in stage]
+            redirected = {i + 1 for i, r in enumerate(redirect) if r}
+            redirected |= {i for i, t in enumerate(stage[:-1]) if t.isdigit() and redirect[i + 1]}
+            arguments = [
+                t for i, t in enumerate(stage[1:], 1)
+                if i not in redirected and t not in REDIRECTS and not re.fullmatch(r"[|<>&;()]+|\d?>&?\d?", t)
+            ]
+            no_path = not _listing_paths(cmd, arguments)
+        skip |= self._text_args(stage)
+        program = self._program_text(stage)
+        for v in filters:  # --include=*.csv, -t csv: the name filter reaches for data files
+            if self._data_filter(v) and not self._stage_public(stage, skip, no_path):
+                found.append(("extension", v))
+        family = FAMILIES.get(cmd)
+        if no_path:  # rg foo, fd php, grep -r foo — they search cwd
+            stage = [*stage, "."]
+        for i, t in enumerate(stage):
+            if i in skip or not t or re.fullmatch(r"[|<>&;()]+|\d?>&?\d?", t):
+                continue
+            if family in IGNORE_FILES and i and self._ignore_excludes(t, family, stage):
+                r = self._token_kind(t, False, content=i not in c)  # sensitive directories under t are skipped (.ignore)
+                if not r and _ancestor(_path(t, self.cwd), self.protected):
+                    r = ("protected", t)
+            elif i in program and re.search(
+                rf"(['\"]){re.escape(t)}\1" if not t.startswith("--") or "=" not in t
+                else rf"{re.escape(t.split('=', 1)[0])}=(['\"]){re.escape(t.split('=', 1)[1])}\1",
+                text,
+            ):
+                # quoted in the command (`--jq='…'`: the value): one word, no glob (an unquoted `sed ~/D*` expands
+                # into the file operands)
+                r = self._token_kind(t, False, content=i not in c, verbatim=True)
+            elif t in literal:
+                r = self._literal_kind(t, t in verbatim, body, recursion, content=i not in c)
+            else:
+                r = self._token_kind(t, recursion, content=i not in c)
+            if r and r[0] == "extension" and i in c and _path(r[1], self.cwd) not in read_paths:
+                continue  # write only — no content comes back to the model
+            if r and r[0] == "extension" and stage[0] == "ls" and not recursion:
+                continue  # `ls .markdownlint*`: names only, a pattern here reads no data file (issue #20)
+            if r:
+                found.append(r)
+        return found
 
     @staticmethod
     def _strip_prefixes(stages: list[list[str]]) -> list[list[str]]:

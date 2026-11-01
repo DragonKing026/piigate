@@ -26,11 +26,25 @@ class Fragment:
     weight: int = 2
 
 
+PESEL_CENTURIES = {0: 1900, 20: 2000, 40: 2100, 60: 2200, 80: 1800}  # month offset → century
+
+
 def pesel_valid(digits: str) -> bool:
+    """The check digit and a real birth date (YYMMDD, the century in the month: +80 1800s, +0 1900s, +20 2000s,
+    +40 2100s, +60 2200s) — by the check digit alone 1 in 10 arbitrary 11-digit numbers (run IDs) would pass."""
     if len(digits) != 11 or not digits.isdigit():
         return False
     weights = (1, 3, 7, 9, 1, 3, 7, 9, 1, 3)
-    return (10 - sum(int(c) * w for c, w in zip(digits, weights)) % 10) % 10 == int(digits[10])
+    if (10 - sum(int(c) * w for c, w in zip(digits, weights)) % 10) % 10 != int(digits[10]):
+        return False
+    coded = int(digits[2:4])
+    month = coded % 20
+    if not 1 <= month <= 12:
+        return False
+    year, day = PESEL_CENTURIES[coded - month] + int(digits[:2]), int(digits[4:6])
+    leap = year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+    days = (31, 29 if leap else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)[month - 1]
+    return 1 <= day <= days
 
 
 def nip_valid(digits: str) -> bool:

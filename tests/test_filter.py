@@ -651,6 +651,44 @@ class TestSensors(unittest.TestCase):
         self.assertNotIn(p["pesel"], out["stdout"])
         self.assertEqual(set(out), {"stdout", "stderr", "interrupted", "isImage", "noOutputExpected"})
 
+    def test_pesel_needs_a_birth_date(self):
+        """Issue #17: 11 digits with a valid check digit but no real date are not a PESEL (GitHub run IDs were hidden);
+        a PESEL with a date in any of the five encoded centuries still is."""
+        from piigate import rules
+
+        for number in (
+            "12345678903",  # month 34
+            "00130100003",  # month 13
+            "00200100003",  # month 20
+            "00023000009",  # 30 February 1900
+            "00022900003",  # 29 February 1900 (not a leap year)
+            "00822900007",  # 29 February 1800
+        ):
+            with self.subTest(number):
+                self.assertFalse(rules.pesel_valid(number))
+        for number in (
+            "44051401359",  # 1944-05-14
+            "99123100003",  # 1999-12-31
+            "00222900009",  # 2000-02-29
+            "24922900006",  # 1824-12-29
+            "04622900009",  # 2204-02-29
+            *(p["pesel"] for p in dt.PATIENTS),
+        ):
+            with self.subTest(number):
+                self.assertTrue(rules.pesel_valid(number))
+        result = hook(
+            "filter",
+            {
+                "hook_event_name": "PostToolUse",
+                "cwd": str(TMP),
+                "tool_name": "Bash",
+                "tool_input": {"command": "gh api repos/o/r/actions/runs"},
+                "tool_response": {"stdout": "run 12345678903 queued", "stderr": "", "interrupted": False,
+                                  "isImage": False, "noOutputExpected": False},
+            },
+        )
+        self.assertIsNone(result)
+
     def test_unchanged_without_replacement(self):
         self.assertIsNone(
             hook(
@@ -2747,6 +2785,161 @@ class TestFalseAlarms(unittest.TestCase):
         ):
             with self.subTest(command):
                 self.assertIsNotNone(b.bash(command))
+
+    def test_jq_program_is_not_a_path(self):
+        """Issue #19: the jq alternative operator `//` in a `gh -q` / `jq` filter is program text, not a recursive
+        pattern from `.` (a project root with a sensitive directory). File operands stay checked."""
+        (self.public / "Sensitive-data").mkdir()
+        b = self.gate(self.public)
+        for command in (
+            "gh issue list -R o/r --state open --json number,title,milestone "
+            "-q '.[] | \"#\\(.number) \\(.title) [\\(.milestone.title // \"-\")]\"'",
+            "gh issue list --json n -q '.[] | .m // \"-\"'",
+            "gh issue list --json n --jq='.[] | \"\\(.m // \"-\")\"'",
+            "gh api repos/o/r/milestones --template '{{range .}}{{.title}}//{{end}}'",
+            "jq -r '.[] | \"[\\(.m // \"-\")]\"' compose.yml",
+            "jq --arg d '/x/*' -r '.a // $d' compose.yml",
+            "yq eval '.services[] // \"none\"' compose.yml",
+            "curl -s https://example.org/x | jq '.a // .b'",
+        ):
+            with self.subTest(command):
+                self.assertIsNone(b.bash(command))
+        for command in (  # still denied: the data files and directories given to jq
+            "jq -r '.a // .b' Sensitive-data/x.json",
+            "jq -f Sensitive-data/prog.jq compose.yml",
+            "jq -n --slurpfile p Sensitive-data/x.json '$p // 1'",
+            "jq '.a // 1' Sensitive-data/*",
+            "jq 'Sensitive-data/x.json'",  # a program that names the directory is still checked as a path
+            "gh issue list --json n -q '.[]' > /dev/null; cat Sensitive-data/x.json",
+        ):
+            with self.subTest(command):
+                self.assertIsNotNone(b.bash(command))
+        self.assertIsNotNone(self.gate(self.phi).bash("jq '.[] // 1' people.csv"))
+
+    def test_relative_paths_after_cd(self):
+        """Issue #18: after `cd X &&` relative paths, globs and the implicit `.` are resolved against X. When the cd
+        may have failed or run in a subshell (`;`, `||`, `|`, parentheses, a non-literal target, several lines), the
+        stage is checked against every directory it may run in — the session directory included."""
+        (self.public / "Sensitive-data").mkdir()
+        (self.public / "raporty" / "nocne").mkdir(parents=True)
+        (self.public / "raporty" / "nocne" / "2026-11-01").mkdir()
+        b = self.gate(self.public)
+        for command in (
+            "cd raporty/nocne && ls -d */ | head -2",
+            f"cd {self.public}/raporty/nocne && ls -R",
+            "cd raporty/nocne && for d in */; do echo $d; done",
+            "cd raporty && cd nocne && grep -r foo",
+            "pushd raporty/nocne && tree",
+            "cd -P raporty/nocne && find . -name '*.md'",
+            "cd raporty/nocne 2>/dev/null && ls -R",
+            "cd raporty/nocne 2>&1 && ls -R",
+            "cd raporty/nocne &>/dev/null && ls -R",
+        ):
+            with self.subTest(command):
+                self.assertIsNone(b.bash(command))
+        for command in (  # still denied: the stage may run in the session directory (or the target holds data)
+            "cd raporty/nocne && cd ../.. && ls -R",
+            "cd raporty/nocne; ls -R",
+            "cd raporty/nocne || ls -R",
+            "cd raporty/nocne | ls -R",
+            "cd raporty/nocne & ls -R",
+            "(cd raporty/nocne && true) && ls -R",
+            "cd raporty/nocne && true; ls -R",
+            "cd \"$D\" && ls -R",
+            "cd - && ls -R",
+            "cd raporty/nocne && popd && ls -R",
+            "cd raporty/nocne && ls\nls -R",
+            "cd raporty/nocne && cat ../../Sensitive-data/x.txt",
+            "cd Sensitive-data && ls",
+            "cd raporty && ls -R ..",
+            "true || cd raporty/nocne && ls -R",
+            "cd raporty/nocne 2>&1 && cd ../.. && ls -R",
+        ):
+            with self.subTest(command):
+                self.assertIsNotNone(b.bash(command))
+
+    def test_directory_name_in_text_still_denied_when_read(self):
+        """Issue #7 (point 3): what must stay denied when the shell parser replaces the marker check — a sensitive
+        directory really read by a command, by Python code or by a shell fed from a heredoc."""
+        (self.phi / "Sensitive-data").mkdir()
+        b = self.gate(self.phi)
+        for command in (
+            "cat Sensitive-data/x.json",
+            "python3 -c \"open('Sensitive-data/x.json')\"",
+            "python3 - <<'EOF'\nprint(open('Sensitive-data/x.json').read())\nEOF",
+            "python3 - <<EOF\nprint(open('Sensitive-data/x.json').read())\nEOF",
+            "python3 - <<'EOF'\nimport os\nos.system('cat Sensitive-data/x.json')\nEOF",
+            "bash <<'EOF'\ncat Sensitive-data/x.json\nEOF",
+            "cat <<'EOF' | bash\ncat Sensitive-data/x.json\nEOF",
+        ):
+            with self.subTest(command):
+                self.assertIsNotNone(b.bash(command))
+        for command in (  # already allowed: the name is a text argument
+            "gh issue create --title t --body 'the notes mention Sensitive-data/x.json'",
+            "echo Sensitive-data/x.json",
+            "cat > notes.md <<'EOF'\nsee Sensitive-data/x.json\nEOF",
+        ):
+            with self.subTest(command):
+                self.assertIsNone(b.bash(command))
+
+    @unittest.expectedFailure
+    def test_directory_name_in_quoted_heredoc_text(self):
+        """issue #7 — awaits the shell parser: the name of a sensitive directory in the text of a quoted heredoc fed to
+        a non-shell (a string a Python program writes to a .md file, a `gh … --body-file -` body) is no access."""
+        (self.phi / "Sensitive-data").mkdir()
+        b = self.gate(self.phi)
+        for command in (
+            "python3 - notes.md <<'EOF'\ntext = 'files in Sensitive-data/x.json are personal'\nEOF",
+            "gh issue create --title t --body-file - <<'EOF'\nsee Sensitive-data/x.json\nEOF",
+        ):
+            with self.subTest(command):
+                self.assertIsNone(b.bash(command))
+
+    def test_ls_operand_pattern_is_not_a_data_file(self):
+        """Issue #20: `ls` prints names only — a pattern operand is no read of a data file, whatever the other stages."""
+        (self.phi / "Sensitive-data").mkdir()
+        b = self.gate(self.phi)
+        for command in (
+            "ls .markdownlint* 2>/dev/null; wc -l notes.md",
+            "ls *.csv; wc -l notes.md",
+            "ls -l *.csv *.xlsx | wc -l; wc -l notes.md",
+            "ls *.csv && wc -l notes.md",
+        ):
+            with self.subTest(command):
+                self.assertIsNone(b.bash(command))
+        for command in (  # still denied: recursion, a content reader, a sensitive directory, a write target read back
+            "ls -R *.csv; wc -l notes.md",
+            "cat *.csv; wc -l notes.md",
+            "ls .; cat *.csv",
+            "ls Sensitive-data/*.csv; wc -l notes.md",
+            "ls Sensitive-data/*.csv",
+            "ls *.csv; wc -l *.csv",
+        ):
+            with self.subTest(command):
+                self.assertIsNotNone(b.bash(command))
+
+    def test_newline_separates_commands(self):
+        """Issue #21: an unquoted newline is an operator like `;` — `echo x⏎cat <sensitive>/f` is not one echo stage."""
+        (self.public / "Sensitive-data").mkdir()
+        (self.public / "Sensitive-data" / "a.txt").write_text("x\n", encoding="utf-8")
+        b = self.gate(self.public)
+        for command in (
+            "echo x\ncat Sensitive-data/a.txt",
+            "echo x\ngrep -r foo",
+            "true\nls -R",
+            "echo x &&\ncat Sensitive-data/a.txt",
+            "echo x \\\n&& cat Sensitive-data/a.txt",
+            "echo x\n\ncat Sensitive-data/a.txt\n",
+            "printf '%s' 'a\nb'\ncat Sensitive-data/a.txt",
+        ):
+            with self.subTest(command):
+                self.assertIsNotNone(b.bash(command))
+        tokens = b._tokens
+        self.assertEqual(tokens("a b\nc d"), ["a", "b", "\n", "c", "d"])
+        self.assertEqual(tokens("a &&\nb"), ["a", "&&", "\n", "b"])
+        self.assertEqual(tokens("a \\\nb"), ["a", "b"])  # a line continuation
+        self.assertEqual(tokens("echo 'a\nb' \"c\nd\""), ["echo", "a\nb", "c\nd"])  # quoted newlines stay text
+        self.assertIsNone(b.bash("echo x\necho y"))
 
     def test_searches_in_repo_without_phi(self):
         b = self.gate(self.public)

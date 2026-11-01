@@ -14,6 +14,7 @@ import re
 import sys
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -67,11 +68,21 @@ def with_iban_check(country: str, bban: str) -> str:
 
 
 class TestChecksums(unittest.TestCase):
-    @given(st.lists(st.integers(0, 9), min_size=10, max_size=10))
-    def test_pesel_accepts_built_numbers_and_rejects_a_wrong_check_digit(self, first10):
+    @given(st.dates(min_value=date(1800, 1, 1), max_value=date(2299, 12, 31)), st.integers(0, 9999))
+    def test_pesel_accepts_built_numbers_and_rejects_a_wrong_check_digit(self, born, serial):
+        offset = {18: 80, 19: 0, 20: 20, 21: 40, 22: 60}[born.year // 100]
+        first10 = [int(c) for c in f"{born.year % 100:02d}{born.month + offset:02d}{born.day:02d}{serial:04d}"]
         number = with_pesel_check(first10)
         self.assertTrue(rules.pesel_valid(number))
         self.assertFalse(rules.pesel_valid(number[:10] + str((int(number[10]) + 1) % 10)))
+
+    @given(st.lists(st.integers(0, 9), min_size=10, max_size=10))
+    def test_pesel_needs_a_real_birth_date(self, first10):
+        """Issue #17: a valid check digit alone is not a PESEL — the month and day must form a date."""
+        number = with_pesel_check(first10)
+        coded, day = int(number[2:4]), int(number[4:6])
+        if not 1 <= coded % 20 <= 12 or not 1 <= day <= 31:
+            self.assertFalse(rules.pesel_valid(number))
 
     @given(st.lists(st.integers(0, 9), min_size=9, max_size=9))
     def test_nip_accepts_built_numbers_and_rejects_a_wrong_check_digit(self, first9):
