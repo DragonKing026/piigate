@@ -262,6 +262,8 @@ KRS_RE = re.compile(r"(?i)\bKRS\s*[:.]?\s*(?:nr\.?\s*)?(\d{10})\b")
 IPV6_RE = re.compile(r"(?<![\w:.])(?=[0-9A-Fa-f:]*\d)(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?![\w:])")
 DIGITS_RE = re.compile(r"(?<![\d])\d[\d -]{9,22}\d(?![\d])")
 WORD_RE = re.compile(rf"{NAME}")
+# capital letters glued to a name and not starting another capitalized word (MariaDB, JanSQL — unlike JanKowalski)
+ACRONYM_TAIL = re.compile(rf"[{UPPER}]+(?![{LOWER}])")
 
 
 def _group(m: re.Match) -> tuple[int, int]:
@@ -319,6 +321,8 @@ def find_persons(text: str) -> list[Fragment]:
     words = list(WORD_RE.finditer(text))
     for i, m in enumerate(words):
         if m.group().casefold() not in known:
+            continue
+        if ACRONYM_TAIL.match(text, m.end()):  # MariaDB, MariaDB10 — a product name, not "Maria" + "DB"
             continue
         s, k = m.start(), m.end()
         # capitalized neighbour right next to it (Jan Kowalski, KOWALSKA JANINA) — both words are the person;

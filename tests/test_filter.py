@@ -1823,6 +1823,23 @@ class TestDetectionEdgeCases(unittest.TestCase):
                     self.assertIn("ORG_", result)
         self.assertEqual(verdict.check_text(t, CONFIG), {})
 
+    def test_first_name_inside_a_product_name(self):
+        """MariaDB is not "Maria" + DB (issue #6: a package list in a tools repository was denied as PERSON 2)."""
+        row = "mysql,mariadb\tnarzedzia\tmariadb\tmariadb-client\tklient MySQL/MariaDB: mysql, mysqldump\n"
+        self.assertEqual(verdict.check_text(PACKAGES_TSV + row, CONFIG), {})
+        result, _ = text.filter_text(row, CONFIG, rules_only=True)
+        self.assertEqual(result, row)
+        # a name glued to another capitalized word (a CamelCase user name) is still a name
+        p = dt.PATIENTS[0]
+        for t in (
+            f"{p['first_name']} {p['surname']}",
+            f"login: {p['first_name']}{p['surname']}",
+            f"{p['first_name']}, {p['surname']}",
+        ):
+            with self.subTest(t):
+                self.assertNotEqual(text.filter_text(t, CONFIG, rules_only=True)[0], t)
+                self.assertIn("PERSON", verdict.check_text(t, CONFIG))
+
     def test_field_label_and_lowercase_outside_person(self):
         t = "Imię: Bożydar Nazwisko: Testowy. Pacjentka zgłosiła się rano, dr hab. przyjął ją o 9.\n"
         for description, only in self.filters():
@@ -2295,6 +2312,7 @@ PACKAGES_TSV = (
     "shellcheck\tlint\tShellCheck\tshellcheck\tShell script analysis tool\n"
     "pandoc\tdocs\tpandoc\tpandoc\tUniversal document converter\n"
     "tesseract\tocr\ttesseract-langpack-pol\ttesseract-ocr-pol\tTesseract OCR Polish language data\n"
+    "mysql,mariadb\tdb\tmariadb\tmariadb-client\tklient MySQL/MariaDB: mysql, mysqldump\n"  # "Maria" + "DB" (issue #6)
 )
 
 
@@ -2587,6 +2605,21 @@ class TestFalseAlarms(unittest.TestCase):
         self.assertEqual(verdict.check_text(PACKAGES_TSV, cfg), {})  # no PERSON for "Liberation Sans", "Noto Sans"…
         self.assertIsNone(self.gate(self.phi).decision("Read", {"file_path": str(self.phi / "packages.tsv")}))
         self.assertIsNotNone(self.gate(self.phi).decision("Read", {"file_path": str(self.phi / "people.csv")}))
+
+    def test_denial_names_the_exemption(self):
+        """A denial for the content of a file says how a human can exempt that one file (issue #6)."""
+        (self.phi / "mariadb.tsv").write_text("x\tMariaDB\n", encoding="utf-8")
+        path = str(self.phi / "people.csv")
+        reason = self.gate(self.phi).decision("Read", {"file_path": path})
+        self.assertIn("exempt_directories", reason)
+        self.assertIn(path, reason)
+        self.assertIsNone(self.gate(self.phi).decision("Read", {"file_path": str(self.phi / "mariadb.tsv")}))
+        # the exemption named in the message really works for a single file
+        k = config.load(str(self.phi))
+        k["sources"]["non_public"] = []
+        k["sources"]["public_repo_min_age_h"] = 0
+        k["sources"]["exempt_directories"] = [path]
+        self.assertIsNone(gate.Gate(k, str(self.phi)).decision("Read", {"file_path": path}))
 
     def test_system_directories(self):
         for where in (self.public, self.phi):

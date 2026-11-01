@@ -799,6 +799,8 @@ class Gate:
             if kind == "sensitive"
             else self.describe_verdict(s)
         )
+        if kind == "extension":  # a false positive: only a human exempts a single file (the model cannot edit the config)
+            what += f"; if it is a false positive, a human can add the path {_path(s, self.cwd)} to `sources.exempt_directories`"
         if tool in ("Edit", "Write", "NotebookEdit"):
             return f"piigate: {tool} on {s} denied — {what} (the edit result shows the file content). {HINT}"
         return f"piigate: direct read of {s} denied — {what}. {HINT}"
