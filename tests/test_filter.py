@@ -2751,6 +2751,43 @@ class TestFalseAlarms(unittest.TestCase):
             with self.subTest(command):
                 self.assertIsNotNone(b.bash(command))
 
+    def test_directory_name_in_text_still_denied_when_read(self):
+        """Issue #7 (point 3): what must stay denied when the shell parser replaces the marker check — a sensitive
+        directory really read by a command, by Python code or by a shell fed from a heredoc."""
+        (self.phi / "Sensitive-data").mkdir()
+        b = self.gate(self.phi)
+        for command in (
+            "cat Sensitive-data/x.json",
+            "python3 -c \"open('Sensitive-data/x.json')\"",
+            "python3 - <<'EOF'\nprint(open('Sensitive-data/x.json').read())\nEOF",
+            "python3 - <<EOF\nprint(open('Sensitive-data/x.json').read())\nEOF",
+            "python3 - <<'EOF'\nimport os\nos.system('cat Sensitive-data/x.json')\nEOF",
+            "bash <<'EOF'\ncat Sensitive-data/x.json\nEOF",
+            "cat <<'EOF' | bash\ncat Sensitive-data/x.json\nEOF",
+        ):
+            with self.subTest(command):
+                self.assertIsNotNone(b.bash(command))
+        for command in (  # already allowed: the name is a text argument
+            "gh issue create --title t --body 'the notes mention Sensitive-data/x.json'",
+            "echo Sensitive-data/x.json",
+            "cat > notes.md <<'EOF'\nsee Sensitive-data/x.json\nEOF",
+        ):
+            with self.subTest(command):
+                self.assertIsNone(b.bash(command))
+
+    @unittest.expectedFailure
+    def test_directory_name_in_quoted_heredoc_text(self):
+        """issue #7 — awaits the shell parser: the name of a sensitive directory in the text of a quoted heredoc fed to
+        a non-shell (a string a Python program writes to a .md file, a `gh … --body-file -` body) is no access."""
+        (self.phi / "Sensitive-data").mkdir()
+        b = self.gate(self.phi)
+        for command in (
+            "python3 - notes.md <<'EOF'\ntext = 'files in Sensitive-data/x.json are personal'\nEOF",
+            "gh issue create --title t --body-file - <<'EOF'\nsee Sensitive-data/x.json\nEOF",
+        ):
+            with self.subTest(command):
+                self.assertIsNone(b.bash(command))
+
     def test_ls_operand_pattern_is_not_a_data_file(self):
         """Issue #20: `ls` prints names only — a pattern operand is no read of a data file, whatever the other stages."""
         (self.phi / "Sensitive-data").mkdir()
