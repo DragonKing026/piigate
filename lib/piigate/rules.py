@@ -361,6 +361,49 @@ def _after_institution(text: str, start: int) -> bool:
     return any(_institution(s) for s in before)
 
 
+# Well-known technology names that NER takes for people, places or companies (issue #3). Only names that are not
+# plausible Polish first names or surnames; a user adds more in `text.plain_words`.
+TECH_NAMES = frozenset(
+    s.casefold()
+    for s in (
+        "Nuxt Vite Vitest Cypress Webpack Rollup Esbuild Babel ESLint Prettier Tailwind Bootstrap Symfony Doctrine "
+        "Twig Composer Packagist Docker Traefik Sablier Playwright Puppeteer Mocha Jest Vue Vuex Pinia Svelte Astro "
+        "Gulp Grunt Nginx Apache Redis Memcached Kubernetes Terraform Ansible Grafana Prometheus Webpackbar "
+        "Axios Lodash Express Laravel Django Flask Selenium Storybook Sass Less Stylelint Husky Lerna Turborepo "
+        "Fedora Debian Ubuntu Alpine Pandoc Hunspell Shellcheck Ripgrep Lighthouse Wireshark"
+    ).split()
+)
+_TOKEN_CHAR = re.compile(r"[\w@./-]")
+_LOWER_IDENTIFIER = re.compile(r"[a-z0-9]+(?:[-_./][a-z0-9]+)*")
+_CAMEL_CASE = re.compile(r"[A-Za-z][a-z0-9]*(?:[A-Z][a-z0-9]*)+")
+
+
+def technical_term(text: str, start: int, end: int, type_: str) -> bool:
+    """Whether a NER hit (PERSON / ORG / ADDRESS) is a technology or package name, not data (issue #3): a known
+    name (`TECH_NAMES`), a lowercase identifier (`cypress-axe`, `ps_customersignin`, `vendor/package`, `webpackbar`)
+    or — for ORG / ADDRESS — a CamelCase product name (CommonJS). A part that is a first name (`jan-kowalski`) or a
+    surname by suffix keeps the hit: user names built of a person's name stay masked."""
+    value = text[start:end].strip(" \t\r\n,;:()[]\"'.")
+    if not value or re.search(r"\s", value):  # several words — a name or a sentence, not an identifier
+        return False
+    s, k = start, end
+    while s > 0 and _TOKEN_CHAR.match(text[s - 1]):
+        s -= 1
+    while k < len(text) and _TOKEN_CHAR.match(text[k]):
+        k += 1
+    token = text[s:k].strip(".-/@ \t\r\n,;:()[]\"'")
+    if not token:
+        return False
+    parts = [p for p in re.split(r"[-_./@]+", token.casefold()) if p]
+    if any(p in first_names() or SURNAME_SUFFIXES.fullmatch(p.capitalize()) for p in parts):
+        return False
+    if value.casefold() in TECH_NAMES or token.casefold() in TECH_NAMES:
+        return True
+    if _LOWER_IDENTIFIER.fullmatch(token):
+        return True
+    return type_ in ("ORG", "ADDRESS") and bool(_CAMEL_CASE.fullmatch(token))
+
+
 def stems(fragment: str) -> list[str]:
     """Stems of a person name's words, to find inflected forms in the rest of the text (Kowalska → Kowalsk…)."""
     result = []

@@ -1823,6 +1823,50 @@ class TestDetectionEdgeCases(unittest.TestCase):
                     self.assertIn("ORG_", result)
         self.assertEqual(verdict.check_text(t, CONFIG), {})
 
+    CATALOG = (
+        "Moduł Nuxt z narzędziami SEO dla Nuxt SEO.\n"
+        "Wtyczka Vite przekształcająca moduły CommonJS.\n"
+        "cypress-axe: testy dostępności w Cypress.\n"
+        "quill-mention, webpackbar, ps_customersignin\n"
+    )
+
+    def test_technology_names_are_not_personal_data(self):
+        """Issue #3: names of technologies and packages are not PERSON / ADDRESS / ORG (real Presidio)."""
+        if not PRESIDIO:
+            self.skipTest(PRESIDIO_SKIP)
+        result, counter = text.filter_text(self.CATALOG, CONFIG, pseudonym_map=PseudonymMap())
+        self.assertEqual(result, self.CATALOG)
+        self.assertEqual(counter, {})
+
+    def test_ner_hits_on_identifiers_are_dropped(self):
+        """The same, with canned NER answers (runs without the engine): kebab-case / snake_case / vendor/package
+        identifiers, CamelCase product names and lowercase one-word package names are not pseudonymized;
+        names of people (also lowercase first names in an identifier) still are."""
+        from unittest import mock
+
+        p = dt.PATIENTS[1]
+        user = f"{p['first_name'].lower()}-{p['surname'].lower()}"  # a user name built of a first name and a surname
+        t = (
+            f"{self.CATALOG}vendor/some-package, @scope/quill-mention\n"
+            f"Autor: {p['first_name']} {p['surname']}, konto {user}.\n"
+        )
+
+        def spans(*words, type_):
+            return [
+                {"entity_type": type_, "start": t.index(w), "end": t.index(w) + len(w), "score": 0.85} for w in words
+            ]
+
+        canned = (
+            spans("Cypress", "Vite", type_="LOCATION")
+            + spans("webpackbar", "quill-mention", type_="PERSON")
+            + spans("ps_customersignin", "vendor/some-package", type_="LOCATION")
+            + spans("CommonJS", type_="ORGANIZATION")
+            + spans(f"{p['first_name']} {p['surname']}", user, type_="PERSON")
+        )
+        with mock.patch.object(engines, "_post", return_value=canned):
+            found = [t[f.start : f.end] for f in engines.presidio(t, CONFIG)]
+        self.assertEqual(found, [f"{p['first_name']} {p['surname']}", user], found)
+
     def test_first_name_inside_a_product_name(self):
         """MariaDB is not "Maria" + DB (issue #6: a package list in a tools repository was denied as PERSON 2)."""
         row = "mysql,mariadb\tnarzedzia\tmariadb\tmariadb-client\tklient MySQL/MariaDB: mysql, mysqldump\n"

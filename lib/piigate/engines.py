@@ -194,6 +194,8 @@ def presidio(text: str, cfg: dict) -> list[Fragment]:
                     continue
                 if type_ == "PERSON" and rules.is_common_noun(value):
                     continue  # "przyszła z Babcią" — a capitalized common noun, not a person
+                if type_ in ("PERSON", "ORG", "ADDRESS") and rules.technical_term(text, start, end, type_):
+                    continue  # Vite, cypress-axe, ps_customersignin, vendor/package — technology, not data
                 if type_ == "PHONE" and re.search(r"[/A-Za-z]", value):
                     type_ = "NUMBER"  # FV/2026/10/123 is a document number, not a phone — still masked
                 result.append(Fragment(start, end, type_, weight))
