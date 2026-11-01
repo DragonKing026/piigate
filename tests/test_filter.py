@@ -2709,6 +2709,66 @@ class TestFalseAlarms(unittest.TestCase):
                 self.assertIsNotNone(b.bash(command))
         self.assertIsNotNone(self.gate(self.phi).bash("jq '.[] // 1' people.csv"))
 
+    def test_relative_paths_after_cd(self):
+        """Issue #18: after `cd X &&` relative paths, globs and the implicit `.` are resolved against X. When the cd
+        may have failed or run in a subshell (`;`, `||`, `|`, parentheses, a non-literal target, several lines), the
+        stage is checked against every directory it may run in — the session directory included."""
+        (self.public / "Sensitive-data").mkdir()
+        (self.public / "raporty" / "nocne").mkdir(parents=True)
+        (self.public / "raporty" / "nocne" / "2026-11-01").mkdir()
+        b = self.gate(self.public)
+        for command in (
+            "cd raporty/nocne && ls -d */ | head -2",
+            f"cd {self.public}/raporty/nocne && ls -R",
+            "cd raporty/nocne && for d in */; do echo $d; done",
+            "cd raporty && cd nocne && grep -r foo",
+            "pushd raporty/nocne && tree",
+            "cd -P raporty/nocne && find . -name '*.md'",
+        ):
+            with self.subTest(command):
+                self.assertIsNone(b.bash(command))
+        for command in (  # still denied: the stage may run in the session directory (or the target holds data)
+            "cd raporty/nocne && cd ../.. && ls -R",
+            "cd raporty/nocne; ls -R",
+            "cd raporty/nocne || ls -R",
+            "cd raporty/nocne | ls -R",
+            "cd raporty/nocne & ls -R",
+            "(cd raporty/nocne && true) && ls -R",
+            "cd raporty/nocne && true; ls -R",
+            "cd \"$D\" && ls -R",
+            "cd - && ls -R",
+            "cd raporty/nocne && popd && ls -R",
+            "cd raporty/nocne && ls\nls -R",
+            "cd raporty/nocne && cat ../../Sensitive-data/x.txt",
+            "cd Sensitive-data && ls",
+            "cd raporty && ls -R ..",
+        ):
+            with self.subTest(command):
+                self.assertIsNotNone(b.bash(command))
+
+    def test_newline_separates_commands(self):
+        """Issue #21: an unquoted newline is an operator like `;` — `echo x⏎cat <sensitive>/f` is not one echo stage."""
+        (self.public / "Sensitive-data").mkdir()
+        (self.public / "Sensitive-data" / "a.txt").write_text("x\n", encoding="utf-8")
+        b = self.gate(self.public)
+        for command in (
+            "echo x\ncat Sensitive-data/a.txt",
+            "echo x\ngrep -r foo",
+            "true\nls -R",
+            "echo x &&\ncat Sensitive-data/a.txt",
+            "echo x \\\n&& cat Sensitive-data/a.txt",
+            "echo x\n\ncat Sensitive-data/a.txt\n",
+            "printf '%s' 'a\nb'\ncat Sensitive-data/a.txt",
+        ):
+            with self.subTest(command):
+                self.assertIsNotNone(b.bash(command))
+        tokens = b._tokens
+        self.assertEqual(tokens("a b\nc d"), ["a", "b", "\n", "c", "d"])
+        self.assertEqual(tokens("a &&\nb"), ["a", "&&", "\n", "b"])
+        self.assertEqual(tokens("a \\\nb"), ["a", "b"])  # a line continuation
+        self.assertEqual(tokens("echo 'a\nb' \"c\nd\""), ["echo", "a\nb", "c\nd"])  # quoted newlines stay text
+        self.assertIsNone(b.bash("echo x\necho y"))
+
     def test_searches_in_repo_without_phi(self):
         b = self.gate(self.public)
         for command in (
