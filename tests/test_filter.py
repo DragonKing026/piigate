@@ -2679,6 +2679,36 @@ class TestFalseAlarms(unittest.TestCase):
             with self.subTest(command):
                 self.assertIsNotNone(b.bash(command))
 
+    def test_jq_program_is_not_a_path(self):
+        """Issue #19: the jq alternative operator `//` in a `gh -q` / `jq` filter is program text, not a recursive
+        pattern from `.` (a project root with a sensitive directory). File operands stay checked."""
+        (self.public / "Sensitive-data").mkdir()
+        b = self.gate(self.public)
+        for command in (
+            "gh issue list -R o/r --state open --json number,title,milestone "
+            "-q '.[] | \"#\\(.number) \\(.title) [\\(.milestone.title // \"-\")]\"'",
+            "gh issue list --json n -q '.[] | .m // \"-\"'",
+            "gh issue list --json n --jq='.[] | \"\\(.m // \"-\")\"'",
+            "gh api repos/o/r/milestones --template '{{range .}}{{.title}}//{{end}}'",
+            "jq -r '.[] | \"[\\(.m // \"-\")]\"' compose.yml",
+            "jq --arg d '/x/*' -r '.a // $d' compose.yml",
+            "yq eval '.services[] // \"none\"' compose.yml",
+            "curl -s https://example.org/x | jq '.a // .b'",
+        ):
+            with self.subTest(command):
+                self.assertIsNone(b.bash(command))
+        for command in (  # still denied: the data files and directories given to jq
+            "jq -r '.a // .b' Sensitive-data/x.json",
+            "jq -f Sensitive-data/prog.jq compose.yml",
+            "jq -n --slurpfile p Sensitive-data/x.json '$p // 1'",
+            "jq '.a // 1' Sensitive-data/*",
+            "jq 'Sensitive-data/x.json'",  # a program that names the directory is still checked as a path
+            "gh issue list --json n -q '.[]' > /dev/null; cat Sensitive-data/x.json",
+        ):
+            with self.subTest(command):
+                self.assertIsNotNone(b.bash(command))
+        self.assertIsNotNone(self.gate(self.phi).bash("jq '.[] // 1' people.csv"))
+
     def test_searches_in_repo_without_phi(self):
         b = self.gate(self.public)
         for command in (

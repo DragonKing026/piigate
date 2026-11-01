@@ -548,6 +548,12 @@ class Gate:
         quoting already kept it one word and unexpanded, so it is not a glob or braces — but it is still code (sed `r`,
         awk `getline`), so it stays checked as a plain path and for directory names. `-f` program files stay paths."""
         cmd = Path(stage[0]).name if stage else ""
+        if cmd == "gh":  # -q/--jq: a jq filter, -t/--template: a Go template (issue #19: `.m // "-"`)
+            text = {i + 1 for i, t in enumerate(stage[:-1]) if t in ("-q", "--jq", "-t", "--template")}
+            text |= {i for i, t in enumerate(stage) if t.split("=", 1)[0] in ("--jq", "--template") and "=" in t}
+            return {i for i in text if i < len(stage)}
+        if cmd in ("jq", "gojq", "yq"):
+            return Gate._jq_program(stage)
         if cmd not in ("sed", "gsed", "awk", "gawk", "mawk", "nawk"):
             return set()
         sed = cmd.endswith("sed")
@@ -595,6 +601,45 @@ class Gate:
                 positional.append(i)
             i += 1
         if not program_option and positional:
+            text.add(positional[0])
+        return {i for i in text if i < len(stage)}
+
+    @staticmethod
+    def _jq_program(stage: list[str]) -> set[int]:
+        """jq/gojq/yq: the filter — the first operand (after a yq `eval`/`ea` subcommand), unless -f/--from-file gives
+        a program file; `--arg/--argjson NAME VALUE` values are text too. Files (`--slurpfile/--rawfile NAME FILE`, the
+        operands after the filter) stay paths."""
+        # option → number of values that follow it; `text` values are not paths
+        values = {"--arg": 2, "--argjson": 2, "--slurpfile": 2, "--rawfile": 2, "--indent": 1, "-L": 1,
+                  "--library-path": 1, "--from-file": 1, "-f": 1, "--front-matter": 1, "-p": 1, "--input-format": 1,
+                  "-o": 1, "--output-format": 1}
+        text: set[int] = set()
+        positional: list[int] = []
+        from_file = False
+        i = 1
+        while i < len(stage):
+            t = stage[i]
+            if t in REDIRECTS or re.fullmatch(r"\d*[<>]+&?\d*", t):
+                i += 2
+                continue
+            if t == "--":
+                positional += range(i + 1, len(stage))
+                break
+            name = t.split("=", 1)[0]
+            if name in values and "=" not in t:
+                from_file |= name in ("-f", "--from-file")
+                if name in ("--arg", "--argjson"):
+                    text |= {i + 1, i + 2}
+                i += values[name] + 1
+                continue
+            if t.startswith("-") and len(t) > 1:
+                from_file |= name in ("-f", "--from-file")
+            else:
+                positional.append(i)
+            i += 1
+        if Path(stage[0]).name == "yq" and positional and stage[positional[0]] in ("eval", "e", "eval-all", "ea"):
+            positional.pop(0)
+        if not from_file and positional:
             text.add(positional[0])
         return {i for i in text if i < len(stage)}
 
@@ -1387,8 +1432,13 @@ class Gate:
                     r = self._token_kind(t, False, content=i not in c)  # sensitive directories under t are skipped (.ignore)
                     if not r and _ancestor(_path(t, self.cwd), self.protected):
                         r = ("protected", t)
-                elif i in program and re.search(rf"(['\"]){re.escape(t)}\1", text):
-                    # quoted in the command: one word, no glob (an unquoted `sed ~/D*` expands into the file operands)
+                elif i in program and re.search(
+                    rf"(['\"]){re.escape(t)}\1" if not t.startswith("--") or "=" not in t
+                    else rf"{re.escape(t.split('=', 1)[0])}=(['\"]){re.escape(t.split('=', 1)[1])}\1",
+                    text,
+                ):
+                    # quoted in the command (`--jq='…'`: the value): one word, no glob (an unquoted `sed ~/D*` expands
+                    # into the file operands)
                     r = self._token_kind(t, False, content=i not in c, verbatim=True)
                 elif t in literal:
                     r = self._literal_kind(t, t in verbatim, body, recursion, content=i not in c)
