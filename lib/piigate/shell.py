@@ -638,7 +638,7 @@ class VarModel:
     dialect: str = DEFAULT_DIALECT
     depth: int = 0
 
-    def elements(self, words, use: int, origin: str, positional, pwd) -> list[str] | None:
+    def elements(self, words, use: int, origin: str, positional, pwd, partial: bool = False) -> list[str] | None:
         """The values of a list of words (an array literal, the items of a `for`): each word's variants, flattened. A glob
         outside quotes stays the text of the pattern (it is judged as the search it is). None when a word is not certain."""
         if self.depth > 6:
@@ -651,6 +651,8 @@ class VarModel:
                     w, lambda n: self.value(n, use, origin, positional, pwd), self.dialect
                 )
                 if unresolved:
+                    if partial:
+                        continue  # a SUPERSET: what is known stays, what is not is left out (the written text stays too)
                     return None
                 quoted_glob = any(g[0] == "lit" and g[2] and _GLOB_CHARS.search(g[1]) for g in w.segs) and not any(
                     g[0] == "lit" and not g[2] and _GLOB_CHARS.search(g[1]) for g in w.segs
@@ -673,9 +675,18 @@ class VarModel:
             return ("list", list(positional)) if positional is not None else ("unknown", None)
         if name == "#":
             return ("static", str(len(positional))) if positional is not None else ("unknown", None)
+        found = self.sites.get(name)
+        if found and any(payload and payload[1] for _, _, payload in found):
+            # an ARRAY (or a `for` variable): every element ever put into it is a possible value of ANY use of the name —
+            # whatever the order, whatever else is dynamic or unknown about it (`declare a; a+=(…)`, `unset a; …`, in a
+            # function or a loop). The written text stays a candidate too (see `subst_word`): never only one of them.
+            items: list[str] = []
+            for _, _, payload in found:
+                if payload:
+                    items += self.elements(payload[0], use, origin, positional, pwd, partial=True) or []
+            return "aset", list(dict.fromkeys(items))
         if name in self.unknown:
             return "unknown", None
-        found = self.sites.get(name)
         if found:
             mine = [x for x in found if x[0] < use or origin == "function"]
             if not mine or any(op == "dynamic" for _, op, _ in found) or len(mine) != len(found):
@@ -728,7 +739,9 @@ def build_model(calls: list, assigned_in_expansions=(), session: str = "/", dial
     for i, c in enumerate(calls):
         persistent = not c.argv or c.name in DECLARATIONS  # `x=1` alone / `declare x=1`; `x=1 cmd` is only for cmd
         for a in c.assigns:
-            if not persistent or (a.value is None and not a.is_array) or any(w.expands and not w.segs for w in a.elements):
+            if not persistent or (a.value is None and not a.is_array):
+                sites.setdefault(a.name, []).append((i, "dynamic", None))
+            elif any(w.expands and not w.segs for w in a.elements) and not a.is_array:
                 sites.setdefault(a.name, []).append((i, "dynamic", None))
             elif a.is_array:
                 op = "elem" if a.array and not a.elements or (a.array and a.value is not None) else ("append" if a.append else "set")
@@ -778,11 +791,22 @@ def subst_word(w: Word, lookup, dialect: str = DEFAULT_DIALECT) -> tuple[list[li
             options.append([seg[1]])
             continue
         if seg[0] == "opaque":
+            arrays = [lookup(n) for n in seg[2]]
+            if any(k == "aset" for k, _ in arrays):  # `${a[@]:1}`, `${a[@]/x/}`, `${a[@]:-d}`, `${#a[@]}`, `${!a[@]}`: any operator
+                options.append([e for k, v in arrays if k == "aset" for e in v] + [seg[1]])
+                pattern_value = pattern_value or any(_GLOB_CHARS.search(e) for k, v in arrays if k == "aset" for e in v)
+                continue
             options.append([seg[1]])
             unresolved.extend(seg[2] or ("(expansion)",))
             continue
         name, quoted, text = seg[1], seg[2], seg[3]
         kind, val = lookup(name)
+        if kind == "aset":  # an array: every element it ever got, AND the written text — both are judged
+            options.append(list(val) + [text])
+            for v in val:
+                if _GLOB_CHARS.search(v):
+                    pattern_value = True  # an element with a glob is a search on the disk
+            continue
         if seg[0] == "var" and kind == "list":
             if single and name == "@":
                 return [list(val)], [], False  # `"$@"`: one word per argument
@@ -816,8 +840,8 @@ def subst_word(w: Word, lookup, dialect: str = DEFAULT_DIALECT) -> tuple[list[li
     total = 1
     for o in options:
         total *= len(o)
-    if total > MAX_VARIANTS:
-        return [[w.text]], [g[1] for g in w.segs if g[0] in ("var", "op", "arr")] or ["(set)"], False
+    if total > MAX_VARIANTS:  # too many possible values to judge each: the adapter REFUSES (it must not fall back to the text)
+        return [[w.text]], [*[g[1] for g in w.segs if g[0] in ("var", "op", "arr")], "(too many)"], False
     variants: list[list[str]] = [[""]]
     for o in options:
         variants = [[v[0] + t] for v in variants for t in o]

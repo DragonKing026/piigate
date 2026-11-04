@@ -484,6 +484,46 @@ class TestRound6(Base):
         self.assertIsNone(self.ast().bash("echo hello | cat"))
 
 
+class TestRound7(Base):
+    def test_an_element_never_disappears(self):
+        for command in (
+            "declare a; a+=(../S*/p*); cat ${a[@]}", "declare -a a; a+=(../S*/p*); cat ${a[@]}", "unset a; a+=(../S*/p*); cat ${a[@]}",
+            "typeset a; a+=(../S*/p*); cat ${a[@]}", "local a; a+=(../S*/p*); cat ${a[@]}", "export a; a+=(../S*/p*); cat ${a[@]}",
+            "f() { a+=(../S*/p*); }; a=(); f; cat ${a[@]}", "declare -a files; files+=(../S*/*.csv); cat \"${files[@]}\"",
+            "a=(zzz ../S*/p*); cat ${a[@]:1}", 'a=(zzz ../S*/p*); cat "${a[@]:1}"', "a=(zzz ../S*/p*); cat ${a[@]:0}",
+            "a=(zzz ../S*/p*); cat ${a[@]/zzz/}", "a=(zzz ../S*/p*); cat ${a[@]#zzz}", "a=(zzz ../S*/p*); cat ${a[@]%zzz}",
+            "a=(zzz ../S*/p*); cat ${a[@]:-d}", "a=(zzz ../S*/p*); cat ${a[@]:+${a[@]}}", "a=(); a+=(../S*/p*); cat ${a[@]:1}",
+            "a=(zzz); a+=(../S*/p*); cat ${a[@]/x/}", "a=(); for i in 1; do a+=(../S*/p*); done; cat ${a[@]#x}",
+            "a=(); while :; do a+=(../S*/p*); break; done; cat ${a[@]%x}", "declare -A m; m+=([k]=../S*/p*); cat ${m[k]}",
+        ):
+            for dialect in shell.DIALECTS:
+                with self.subTest(command=command, dialect=dialect):
+                    self.assertIsNotNone(self.ast(dialect).bash(command))
+
+    def test_too_many_possible_values_is_a_refusal_not_the_text(self):
+        for command in (
+            "a=(1 2 3 4 5 6 7 8 9); cat ${a[@]}${a[@]}", "a=(1 2 3 4 5 6 7 8 9); echo x > ${a[@]}${a[@]}",
+            "a=(1 2 3 4 5 6 7 8 9); b=(1 2 3 4 5 6 7 8 9); cat ${a[@]}${b[@]}",
+        ):
+            with self.subTest(command):
+                g = self.ast()
+                self.assertIsNotNone(g.bash(command))
+                self.assertIn("too many", g.bash(command))
+        self.assertIsNone(self.ast().bash("a=(1 2 3); cat ${a[@]}"))  # a few values: judged one by one, all fine
+
+    def test_matrix_of_array_shapes_and_uses(self):
+        import shutil
+
+        import shell_matrix
+
+        if not shutil.which("zsh"):
+            self.skipTest("zsh not installed")
+        result = shell_matrix.run()
+        self.assertGreater(result["cases"], 700)
+        self.assertEqual(result["failures"], [])  # the old gate denies and a real shell reads: the AST gate denies too
+        self.assertGreater(result["real_reads"], 300)
+
+
 class TestWordValuesAgainstARealShell(Base):
     """B1: the value of a word is computed from the pieces of the tree. For a corpus of static variables and every way to
     glue them to quotes, the words `AstGate` makes of `cat WORD` are what a real zsh / bash makes of `printf [%s] WORD`."""

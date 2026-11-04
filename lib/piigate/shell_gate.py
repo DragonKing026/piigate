@@ -55,6 +55,10 @@ class _Parsed:
     rest: frozenset = frozenset()  # the words of the command itself (without the text bodies of its heredocs)
 
 
+class _TooMany(str):
+    """A word with more possible values than are judged one by one: the stage is refused, never judged as the text."""
+
+
 class _Set(QuotedToken):
     """A word that is one of several known values (the variable of a `for` over static words): `alts` are the others. It is
     a QuotedToken only in the sense of being a plain word (the gate globs it itself)."""
@@ -144,6 +148,8 @@ class AstGate(gate.Gate):
         out: list[str] = []
         for text in words:
             tok = QuotedToken(text, w.quote) if w.quote else (QuotedToken(text, '"') if noglob and len(words) == 1 else text)
+            if "(too many)" in unresolved:
+                tok = _TooMany(text)
             if len(variants) > 1 and len(words) == 1 and all(len(v) == 1 for v in variants):
                 tok = _Set(text, w.quote)
                 tok.alts = tuple(v[0] for v in variants[1:])  # a SET: the first is the token, every value is judged
@@ -525,6 +531,8 @@ class AstGate(gate.Gate):
 
     def _stage_kinds(self, stage, c, text, literal, verbatim, body):
         # a word that is one of several known values (a `for` over static words): the stage is judged for each value
+        if any(isinstance(t, _TooMany) for t in stage):
+            return [("sensitive", "a variable with too many possible values to judge each one")]
         positions = [i for i, t in enumerate(stage) if getattr(t, "alts", ())]
         variants = [list(stage)]
         for i in positions:
