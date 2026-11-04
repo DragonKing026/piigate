@@ -4824,6 +4824,19 @@ class TestChecksumNumbers(unittest.TestCase):
         self.assertTrue(phones("200 302 404 599 200"))
         self.assertTrue(phones("200 302 404 209 200"))
 
+    def test_a_long_column_of_number_lists_is_linear(self):
+        """A megabyte of lines with a list of codes (each one a phone-shaped group inside a list) is found in seconds."""
+        import time
+        from piigate import rules
+
+        sample = "200 200 200 200\n" * 65536
+        self.assertGreaterEqual(len(sample), 1_000_000)
+        started = time.monotonic()
+        found = rules.detect(sample)
+        elapsed = time.monotonic() - started
+        self.assertEqual([f for f in found if f.type_ == "PHONE"], [])
+        self.assertLess(elapsed, 15, f"detect took {elapsed:.1f} s on 1 MB")
+
     @unittest.skipUnless(PRESIDIO, PRESIDIO_SKIP)
     def test_text_filter(self):
         p = dt.PATIENTS[0]

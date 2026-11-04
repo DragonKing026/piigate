@@ -5,6 +5,7 @@ come from the configuration. The rules always run — also when Presidio is down
 headers and file names are still filtered by the rules alone).
 """
 
+import bisect
 import ipaddress
 import re
 from dataclasses import dataclass
@@ -415,9 +416,16 @@ BARE_PHONE_RE = re.compile(r"\d{3}[ \t-]\d{3}[ \t-]\d{3}")
 PHONE_LABEL_RE = re.compile(r"(?i)\b(?:tel|telefon\w*|kom|komórk\w*)\.?\s*[:.]?\s*$")
 
 
+def _inside(spans: list[tuple[int, int]], starts: list[int], s: int, k: int) -> bool:
+    """Whether [s, k) lies within one of the sorted, disjoint `spans` (`starts` are their beginnings)."""
+    i = bisect.bisect_right(starts, s) - 1
+    return i >= 0 and k <= spans[i][1]
+
+
 def detect(text: str, *, dates: str = "all", drugs: bool = True) -> list[Fragment]:
     result: list[Fragment] = []
     lists = [m.span() for m in NUMBER_LIST_RE.finditer(text) if not PHONE_LABEL_RE.search(text, max(0, m.start() - 24), m.start())]
+    list_starts = [a for a, _ in lists]  # the spans are sorted and do not overlap
     for type_, regex, weight in PATTERNS:
         if type_ == "DATE" and dates == "none":
             continue
@@ -429,7 +437,7 @@ def detect(text: str, *, dates: str = "all", drugs: bool = True) -> list[Fragmen
                     continue
             if type_ == "EMAIL" and not email_valid(m.group()):
                 continue
-            if type_ == "PHONE" and BARE_PHONE_RE.fullmatch(m.group()) and any(a <= s and k <= b for a, b in lists):
+            if type_ == "PHONE" and BARE_PHONE_RE.fullmatch(m.group()) and _inside(lists, list_starts, s, k):
                 continue
             result.append(Fragment(s, k, type_, weight))
 
