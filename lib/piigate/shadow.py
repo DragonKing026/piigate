@@ -18,6 +18,7 @@ import os
 import signal
 import sys
 import time
+from pathlib import Path
 
 from . import config
 
@@ -215,7 +216,7 @@ def observe(cfg: dict, cwd: str, command: str, old_reason: str | None, files: bo
 
 def read() -> dict:
     try:
-        data = json.loads(open(path(), encoding="utf-8").read())
+        data = json.loads(Path(path()).read_text(encoding="utf-8"))
         return data if isinstance(data, dict) and isinstance(data.get("days"), dict) else {"version": 1, "days": {}}
     except (OSError, ValueError):
         return {"version": 1, "days": {}}
