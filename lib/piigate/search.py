@@ -411,7 +411,7 @@ def search(
         if folder:
             before = os.path.relpath(folder, base)
             return f"{before}/{text.filter_name(os.path.relpath(p, folder), cfg, pseudonym_map, forbidden)}"
-        if _in(p, sensitive):  # search inside a sensitive directory
+        if config.in_sensitive(cfg, p):  # search inside a sensitive directory
             return text.filter_name(rel, cfg, pseudonym_map, forbidden)
         return rel
 
@@ -420,7 +420,7 @@ def search(
 
     def is_sensitive(p: str) -> bool:
         r = os.path.realpath(p)
-        return _in(r, sensitive) or r.casefold().endswith(extensions)
+        return config.in_sensitive(cfg, r) or r.casefold().endswith(extensions)
 
     # groups 1 and 2 — text files through rg
     matched, w.truncated = _search_text_files(

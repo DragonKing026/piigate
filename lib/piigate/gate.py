@@ -554,7 +554,7 @@ class Gate:
         # in-project data directories: `.gitignore` restored on every run (the directory may have been created by hand)
         config.ensure_project_gitignore(cfg)
         # `Sensitive-data` of any project (not only the session's and the cwd repo's) — by path component name
-        self.sensitive_name = (cfg.get("project_directories") or {}).get("sensitive") or None
+        self.sensitive_name = config.sensitive_name(cfg)
         self.project_sensitive = [config.expand(k) for k in cfg.get("in_project", {}).get("sensitive", [])]
         self.extensions = tuple(e.casefold() for e in cfg["sources"]["extensions"])
         # an extension outside the sensitive directories is only a reason to check the content
@@ -2663,6 +2663,37 @@ class Gate:
             return command  # an unterminated heredoc or the written file used later (`bash s.sh`) — unchanged
         return text
 
+    def _marker_only_rmdir(self, tokens: list[str] | None) -> str | None:
+        """The whole command is one `rmdir` of a piigate data directory that holds nothing but the `.gitignore` marker
+        (#7): it would fail with "Directory not empty", because the gate recreates the marker on every run. Denied with
+        the one-command recipe — the command could not succeed anyway. Anything else (more files, an edited marker, a
+        compound command) is left to rmdir itself."""
+        if not tokens or tokens[0] != "rmdir" or any(re.search(r"[;&|()<>\n$`*?\[{~]", t) for t in tokens):
+            return None
+        operands = [t for t in tokens[1:] if not t.startswith("-")]
+        if len(operands) != 1:
+            return None
+        given = os.path.join(self.cwd, operands[0])
+        real = os.path.realpath(given)
+        names = {n for n in ((self.cfg.get("project_directories") or {}).values()) if n}
+        data = {*self.project_sensitive, *(config.expand(k) for k in self.cfg.get("in_project", {}).get("anonymized", []))}
+        if os.path.islink(given.rstrip("/")) or not os.path.isdir(real) or not (real in data or os.path.basename(real) in names):
+            return None
+        marker = os.path.join(real, ".gitignore")
+        try:
+            if os.listdir(real) != [".gitignore"] or os.path.islink(marker):
+                return None
+            if Path(marker).read_text(encoding="utf-8") != config.GITIGNORE:
+                return None
+        except (OSError, UnicodeDecodeError):
+            return None
+        d = shlex.quote(operands[0].rstrip("/") or operands[0])
+        return (
+            f"piigate: `rmdir {d}` would fail with \"Directory not empty\" — the directory holds only the piigate marker "
+            "`.gitignore`, which the gate recreates on every command. Remove the directory with the marker in one command "
+            f"(nothing else is in it): `rm -r {d}`."
+        )
+
     def bash(self, command: str, files: bool = True) -> str | None:
         """None = allow, otherwise the denial reason. files=False (the PostToolUse safety net): data files are not judged
         again — a file the command created is checked through its output instead."""
@@ -2672,6 +2703,8 @@ class Gate:
         command = self._strip_file_heredocs(command)
         tokens = self._tokens(command)
         if reason := self._human_only(command, tokens):
+            return reason
+        if reason := self._marker_only_rmdir(tokens):
             return reason
         if re.search(r"\b(?:analyze|anonymize)\b", command) and any(
             c is None or c[1:2] in (["analyze"], ["anonymize"]) for c in self._invocations(command, {"piigate"})
@@ -2712,9 +2745,11 @@ class Gate:
         p = _path(what, self.cwd) if kind == "sensitive" else ""
         if p and not _inside(p, self.sensitive) and _ancestor(p, self.sensitive):
             sub = ", ".join(os.path.relpath(k, p) for k in self.sensitive if _inside(k, [p]))
+            entries = ", ".join(f"`/{x}/`" for x in sub.split(", "))
             what = (
                 f"{what} — contains a sensitive directory: {sub}; search the code subdirectory, use piigate_search (MCP) or "
-                f"exclude it with the entry `/{sub.split(', ')[0]}/` in an .ignore file (honoured by rg, fd, ag; not grep)"
+                f"exclude {'them' if ',' in sub else 'it'} with the {'entries' if ',' in sub else 'entry'} {entries} in an .ignore "
+                "file (honoured by rg, fd, ag; not grep)"
             )
         description = {
             "sensitive": f"a sensitive data directory ({what})",

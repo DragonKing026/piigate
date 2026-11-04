@@ -81,13 +81,71 @@ def project_roots(cwd: str | None) -> list[str]:
     return result
 
 
+GITDIR_FILE_LIMIT = 4096
+WORKTREE_LIMIT = 64
+
+
+def _read_small(path: Path) -> str | None:
+    """Text of a small pointer file (`.git`, `commondir`, `gitdir`); None when missing, too large or unreadable."""
+    try:
+        if path.stat().st_size > GITDIR_FILE_LIMIT:
+            return None
+        return path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _resolve(value: str, base: Path) -> Path:
+    p = Path(value)
+    return Path(os.path.realpath(p if p.is_absolute() else base / p))
+
+
+def worktree_roots(root: str) -> list[str]:
+    """Top directories of every git worktree of the repository `root` belongs to — the main one and the linked ones —
+    read from files only, without running git (the gate runs on every tool call). The given root comes first. Stale
+    entries, garbage, oversized files and read errors are skipped; a submodule or a plain directory is just itself.
+    The pointer files can be written by the agent, so the result only ever WIDENS what is protected."""
+    start = Path(os.path.realpath(root))
+    result = [start]
+    marker = start / ".git"
+    common: Path | None = None
+    if marker.is_dir() and not marker.is_symlink():
+        common = marker
+    elif marker.is_file():
+        text = _read_small(marker)
+        if text and text.startswith("gitdir:"):
+            git_dir = _resolve(text[len("gitdir:") :].strip(), start)
+            if (pointer := _read_small(git_dir / "commondir")) is not None:  # no commondir: a submodule, not a linked worktree
+                common = _resolve(pointer, git_dir)
+    if common is None:
+        return [str(start)] if _outside_home(start) else []
+    if common.name == ".git" and common.parent not in result:
+        result.append(common.parent)
+    try:
+        entries = sorted(e for e in (common / "worktrees").iterdir() if e.is_dir())[:WORKTREE_LIMIT]
+    except OSError:
+        entries = []
+    for entry in entries:
+        if (pointer := _read_small(entry / "gitdir")) is None:
+            continue
+        dot_git = _resolve(pointer, entry)
+        if dot_git.name == ".git" and dot_git.parent.is_dir() and dot_git.parent not in result:
+            result.append(dot_git.parent)
+    return [str(k) for k in result if _outside_home(k)]
+
+
 def _add_project_dirs(cfg: dict, roots: list[str]) -> dict:
     names = cfg.get("project_directories", {})
     anon_cfg = cfg.setdefault("anonymization", {})
     anon_cfg["directories"] = [anon_cfg.get("directory", DEFAULT_ANONYMIZED)]  # all copy directories — the gate allows reading them directly
     w = cfg["in_project"] = {"sensitive": [], "anonymized": []}
     if n := names.get("sensitive"):
-        w["sensitive"] = [os.path.join(k, n) for k in roots]
+        # the session and repo roots first (the first one holds the copies), then the other worktrees of those repos: the
+        # protected set may grow, the readable Anonymized-data set below must not (a `gitdir` file can be planted)
+        every = list(roots)
+        for k in roots:
+            every += [x for x in worktree_roots(k) if x not in every]
+        w["sensitive"] = [os.path.join(k, n) for k in every]
         z = cfg["sources"]
         z["directories"] = list(z["directories"]) + [k for k in w["sensitive"] if k not in z["directories"]]
     if n := names.get("anonymized"):
@@ -172,6 +230,22 @@ def expand(path: str) -> str:
 
 def sensitive_dirs(cfg: dict) -> list[str]:
     return [expand(k) for k in cfg["sources"]["directories"]]
+
+
+def sensitive_name(cfg: dict) -> str | None:
+    """Name of the in-project sensitive directory (`project_directories.sensitive`) — a directory of that name is
+    sensitive in ANY project, also one the session knows nothing about."""
+    return (cfg.get("project_directories") or {}).get("sensitive") or None
+
+
+def in_sensitive(cfg: dict, real_path: str) -> bool:
+    """A RESOLVED path counts as sensitive: inside a configured sensitive directory (the in-project ones of every
+    worktree included) or below a directory named like the in-project one. Call it on the realpath, so that a symlink
+    from a sensitive directory to the outside loses the permission."""
+    n = sensitive_name(cfg)
+    if n and n in Path(real_path).parts:
+        return True
+    return any(real_path == k or real_path.startswith(k.rstrip("/") + "/") for k in sensitive_dirs(cfg))
 
 
 def protected_dirs(cfg: dict) -> list[str]:
