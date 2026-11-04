@@ -123,19 +123,33 @@ class TestDecisions(Base):
         self.assertEqual(g.parse_error, "")
         self.assertIsNotNone(self.ast("zsh").bash("cat =(cat ../Sensitive-data/people.csv)"))
 
-    def test_zsh_syntax_without_a_node_is_denied(self):
+    def test_zsh_flag_that_runs_code_is_denied_in_every_nesting(self):
         for command in (
-            "echo *(e:'cat ../S*/p*.csv >&2':)",
-            "echo *.csv(e:'cat ../S*/p*.csv >&2':)",
-            "x='$(cat ../S*/p*.csv >&2)'; echo ${(e)x}",
-            "echo *(+f)",
+            "x='$(cat ../S*/p*.csv)'; echo ${(e)x}",
+            "x='$(cat ../S*/p*.csv)'; echo ${${(e)x}}",
+            "x='$(cat ../S*/p*.csv)'; echo ${(e)${x}}",
+            "x='$(cat ../S*/p*.csv)'; echo ${y:-${(e)x}}",
+        ):
+            g = self.ast("zsh")
+            self.assertIsNotNone(g.bash(command), command)
+            self.assertFalse(g.parse_error, command)
+
+    def test_zsh_qualifier_is_judged_by_the_options_not_by_its_text(self):
+        for command in (
+            "setopt bareglobqual; echo *(e:'cat ../S*/p*.csv >&2':)",
+            "setopt bareglobqual; echo *(e,'cat ../S*/p*.csv >&2',)",  # separators `, / ! + [ ] { }`: never matched by text
+            "options[bareglobqual]=on; echo *(e/'cat ../S*/p*.csv >&2'/)",
+            "set -o extendedglob; echo *(#qe:'cat ../S*/p*.csv >&2':)",
+            "unsetopt NO_BARE_GLOB_QUAL; echo *(+f)",
+            "emulate zsh; ls *(.)",
+            "zsh -o bareglobqual -c 'echo *(+f)'",
+            "eval 'echo *(.)'",
         ):
             for dialect in shell.DIALECTS:
-                with self.subTest(command, dialect=dialect):
-                    g = self.ast(dialect)
-                    self.assertIsNotNone(g.bash(command))
-                    if not g.parse_error:
-                        self.assertIn("zsh", g.bash(command))
+                g = self.ast(dialect)
+                self.assertIsNotNone(g.bash(command), (command, dialect))
+        for command in ("ls *(.)", "echo *.csv(N)", "echo +(a|b)", "echo *(e:'x':)"):  # no option change: an inert qualifier
+            self.assertIsNone(self.ast("zsh").bash(command), command)
 
     def test_text_heredoc_body_is_judged(self):
         self.assertIsNotNone(self.ast().bash("python3 - <<'EOF'\nprint(open('../Sensitive-data/people.csv').read())\nEOF"))
@@ -213,14 +227,37 @@ class TestRules(Base):
         g.bash("cat '>' x.csv > out.csv")
         self.assertEqual([str(t) for t in g._current.tokens], ["cat", "\\>", "x.csv", ">", "out.csv"])
 
-    def test_zsh_code_is_refused_other_qualifiers_only_with_setopt(self):
-        for command in ("echo *(e:'cat ../S*/p*.csv >&2':)", "echo *(+f)", "x='$(cat ../S*/p*.csv)'; echo ${(e)x}"):
-            for dialect in shell.DIALECTS:
-                g = self.ast(dialect)
-                self.assertIsNotNone(g.bash(command), (command, dialect))
-        self.assertIsNone(self.ast("zsh").bash("ls *(.)"))
-        self.assertIsNone(self.ast("zsh").bash("echo +(a|b)"))
-        self.assertIsNotNone(self.ast("zsh").bash("setopt BARE_GLOB_QUAL; ls *(.)"))
+    def test_variables_have_a_value_only_when_one_static_assignment_gives_it(self):
+        for command in (
+            "d=../Sensitive-data; cat $d/people.csv",
+            "a=..; b=Sensit; c=ive-data; cat $a/$b$c/people.csv",
+            "c=cat; $c ../Sensitive-data/people.csv",
+            "readonly r=../Sensitive-data/people.csv; cat $r",
+            "export e=../Sensitive-data/people.csv; cat $e",
+            "declare -a a=(../Sensitive-data/people.csv); cat \"${a[@]}\"",
+            "declare -A a=([k]=../Sensitive-data/people.csv); cat \"${a[k]}\"",
+            "for d in ../Sensitive-data/people.csv; do cat $d; done",
+        ):
+            with self.subTest(command):
+                self.deny(command)
+        for command in (  # no known value: a refusal for a reader
+            "read d <<< x; cat $d", "printf -v d %s x; cat $d", "echo ${d:=x}; cat $d", "set -- x; cat $1", "x=a; y=$x; cat $y",
+            "x=a; x=b; cat $x", "cat $x; x=a", "declare -n r=d; cat $r", "cat $SOME_PATH", "cat \"$1\"",
+        ):
+            with self.subTest(command):
+                self.deny(command)
+        for command in (  # known: the one static assignment, the environment named on purpose, a loop over static words
+            "d=notes; cat $d.md", "cat $HOME/notes.md", "cat $PWD/notes.md", "for f in *.md; do cat $f; done", "cat '$x'",
+        ):
+            with self.subTest(command):
+                self.assertIsNone(self.ast().bash(command))
+
+    def test_unknown_write_target_and_lister(self):
+        self.deny("tee $(echo ../S*/p*.csv) </dev/null")
+        self.deny('echo x > "$OUT"')
+        self.assertIsNone(self.ast().bash("echo x > out.txt"))
+        self.deny("ls $D | xargs cat")  # the names of a place nobody knows flow into a reader
+        self.assertIsNone(self.ast().bash("ls $D | head -3"))
 
     def test_zsh_foreach_word_list(self):
         self.deny("foreach f (../S*/p*.csv)\ncat $f\nend", "zsh")
@@ -244,6 +281,32 @@ class TestRules(Base):
             g = self.ast()
             self.assertIsNotNone(g.bash("cat ../Sensitive-data/people.csv"))
             self.assertTrue(g.parse_error)
+
+
+class TestSealedBinary(Base):
+    def test_no_fallback_to_the_file_when_the_seal_fails(self):
+        from unittest import mock
+
+        with mock.patch.object(shell, "_sealed_memfd", side_effect=OSError("no seals")):
+            with self.assertRaises(shell.ParseError):
+                shell.parse("cat x", cwd="/w")
+            g = self.ast()
+            self.assertIsNotNone(g.bash("ls"))
+            self.assertTrue(g.parse_error)
+
+    def test_the_memfd_is_sealed(self):
+        import fcntl
+        import os
+
+        fd = shell._sealed_memfd(b"abc")
+        try:
+            seals = fcntl.fcntl(fd, fcntl.F_GET_SEALS)
+            want = fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL
+            self.assertEqual(seals & want, want)
+            with self.assertRaises(OSError):
+                os.write(fd, b"x")
+        finally:
+            os.close(fd)
 
 
 class TestAdversarialCorpus(Base):
@@ -281,8 +344,7 @@ class TestDirectoryModel(Base):
         "cd a && cd ~- && cat x",
         "cd a && eval $x && cat x",
         "cd a && alias c=cd && c .. && cat x",
-        "f() { cd ..; }; cd a && f && cat x",
-        "f() { cat x; }; cd a && f",
+        "f() { cd ../S*; }; f && cat x",
         "cd a && source ./s.sh && cat x",
         "cd a && cd - && cat x",
         "cd ../S* && cat x",
@@ -307,6 +369,41 @@ class TestDirectoryModel(Base):
         for command in ("cd \"$D\" && ls", "f() { cd /tmp; }; f; ls", "cd \"$D\"; cd /tmp && cat hosts.txt", "cd \"$D\" && git status"):
             with self.subTest(command):
                 self.assertIsNone(self.ast().bash(command))  # names, an absolute directory, a git call: no relative read
+
+    def test_functions_are_analysed_where_they_are_called(self):
+        calls = shell.parse("f() { cd ..; }; cd a && f && cat x", cwd="/w")
+        self.assertEqual(calls[-1].cwds, {"/w"})  # the `cd ..` of the body carried on
+        self.assertTrue(calls[-1].cwd_known)
+        calls = shell.parse("f() { cat x; }; cd a && f && f", cwd="/w")
+        self.assertEqual([sorted(c.cwds) for c in calls if c.name == "cat"], [["/w"], ["/w/a"], ["/w/a"]])
+        calls = shell.parse("f() { find d; :; }; f | xargs cat", cwd="/w")
+        # (the body is also emitted where it is declared, outside the pipeline: the LAST find and `:` are the called ones)
+        last = {c.name: c for c in calls if c.name in ("find", ":", "xargs")}
+        self.assertEqual([(n, last[n].piped_in, last[n].pipes_out) for n in ("find", ":", "xargs")],
+                         [("find", False, True), (":", False, True), ("xargs", True, False)])
+
+    def test_recursion_and_depth_are_refused(self):
+        with self.assertRaises(shell.ParseError):
+            shell.parse("f() { f; }; f", cwd="/w")
+        with self.assertRaises(shell.ParseError):
+            shell.parse("a() { :; }; b() { a; }; c() { b; }; d() { c; }; e() { d; }; g() { e; }; g", cwd="/w")
+
+    def test_a_failed_cd_is_not_repaired_by_a_later_absolute_cd(self):
+        """`cd X` may fail: the commands after `;` may still run where they were. Only the `&&` chain after an absolute
+        `cd` is known again."""
+        for command in (
+            "cd ../S*; cd /nonexistent; cat x",
+            "f() { cd ../S*; }; f; cd /nonexistent; cat x",
+            "cd a || true; cd /nonexistent; cat x",
+        ):
+            last = shell.parse(command, cwd="/w")[-1]
+            self.assertIn("/w", last.cwds, command)
+        self.assertFalse(shell.parse("cd ../S*; cd /nonexistent; cat x", cwd="/w")[-1].cwd_known)
+        last = shell.parse("cd ../S* && cd /abs && cat x", cwd="/w")[-1]
+        self.assertTrue(last.cwd_known)
+        self.assertEqual(last.cwds, {"/abs"})
+        for command in ("cd ../Sens*; cd /nonexistent; cat people.csv", "f() { cd ../Sens*; }; f; cd /nonexistent; cat people.csv"):
+            self.assertIsNotNone(self.ast().bash(command), command)
 
     def test_a_static_eval_is_followed(self):
         for command in ("cd a && eval cd .. && cat x", "cd a && eval 'cd ..' && cat x", "cd a && chdir .. && cat x"):
