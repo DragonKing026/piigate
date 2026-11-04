@@ -291,6 +291,10 @@ def _word(node: dict) -> Word:
             raw = _text(p)
             quoting.add("none")
             texts.append(_unescape(raw))
+            if "(" in raw:
+                # zsh only: a glob qualifier `*(e:code:)` / `*(+func)` / `*(.)` is kept by shfmt as plain text — it has no
+                # node, and `e:` / `+` run code. Nothing in the tree says what it does: the word is marked
+                kinds.add("zsh")
             if _has_glob(raw):
                 kinds.add("glob")
             if _has_brace(raw):
@@ -330,6 +334,8 @@ def _expansion_text(p: dict, kinds: set[str]) -> str:
     t = _need(p, "Type")
     if t == "ParamExp":
         kinds.add("param")
+        if p.keys() & {"Flags", "GlobSubst", "Modifiers"}:  # zsh `${(e)x}` (evaluates $(…) in the value), `${~x}`, `${x:a}`
+            kinds.add("zsh")
         return _param_text(p, kinds)
     if t == "CmdSubst":
         kinds.add("cmd")

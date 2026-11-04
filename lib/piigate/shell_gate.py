@@ -214,6 +214,17 @@ class AstGate(gate.Gate):
                 return None
         return p
 
+    @staticmethod
+    def _zsh_syntax(calls: list[shell.Call]) -> bool:
+        """A word with zsh syntax the tree does not describe (glob qualifier, `${(flags)…}`): it may run code or reach files
+        the gate cannot see — fail closed."""
+        for c in calls:
+            words = [*c.argv, *(a.value for a in c.assigns if a.value), *(x for a in c.assigns for x in a.array)]
+            words += [r.target for r in c.redirects if r.target is not None]
+            if any({"zsh", "extglob"} & w.kinds for w in words):  # zsh reads `*(…)` as a qualifier, bash as an extglob
+                return True
+        return False
+
     # ------------------------------------------------------------------------------------------------ entry
 
     def bash(self, command: str, files: bool = True) -> str | None:
@@ -225,6 +236,11 @@ class AstGate(gate.Gate):
             except shell.ParseError as e:
                 self.parse_error = str(e)
                 return f"piigate: command denied — it cannot be parsed with certainty ({e}). {gate.HINT}"
+        if self._current is not None and self._zsh_syntax(self._current.calls):
+            return (
+                "piigate: command denied — zsh syntax the gate cannot judge (a glob qualifier `(e:…:)` / `(+func)` / "
+                f"`(.)`, a parameter flag `${{(e)x}}`): it may run code or reach files. {gate.HINT}"
+            )
         return super().bash(command, files)
 
     # ------------------------------------------------------------------------------------------------ front-end
