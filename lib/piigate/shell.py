@@ -56,6 +56,7 @@ class Word:
     quoting: str  # none | single | double | mixed
     expands: bool  # the value is not known statically: $var, ${}, $(), ``, $(( )), <( ), glob, ~, brace, extglob
     kinds: frozenset[str] = frozenset()  # param cmd arith proc glob tilde brace extglob
+    quote: str = ""  # `'` or `"` when the word is ONE quoted fragment (alone or after `--option=`): never globbed or brace-expanded
 
     @property
     def static(self) -> bool:
@@ -313,7 +314,15 @@ def _word(node: dict) -> Word:
         label = next(iter(quoting))
     else:
         label = "mixed"
-    return Word("".join(texts), label, bool(kinds), frozenset(kinds))
+    parts = node.get("Parts") or []
+    quote = ""
+    if parts and (len(parts) == 1 or (len(parts) == 2 and parts[0]["Type"] == "Lit" and re.fullmatch(r"--[\w-]+=", _text(parts[0])))):
+        last = parts[-1]
+        if last["Type"] == "DblQuoted":
+            quote = '"'
+        elif last["Type"] == "SglQuoted" and not last.get("Dollar"):
+            quote = "'"
+    return Word("".join(texts), label, bool(kinds), frozenset(kinds), quote)
 
 
 def _expansion_text(p: dict, kinds: set[str]) -> str:
