@@ -35,6 +35,8 @@ piigate — sensitive data (PHI/PII) through a filter before it reaches the mode
   piigate project                                project filters (.claude/piigate.json): in force and pending
   piigate project approve                        HUMAN ONLY: the current project file becomes the approved snapshot
                                                  (only then do removed entries stop applying)
+  piigate shadow                                 shadow mode of the Bash gate: counts only (no commands, no paths)
+  piigate shadow-on | shadow-off | shadow-reset  HUMAN ONLY: switch the shadow mode on / off, clear its counts
   piigate reverse [FILE|-] [-o OUTPUT]           HUMAN ONLY: pseudonyms → originals (in the terminal or into a
                                                  file in a sensitive directory); an agent is denied
 """
@@ -242,6 +244,42 @@ def project_cmd(arg, cfg: dict) -> int:
     return 0
 
 
+def shadow_cmd(arg, cfg: dict) -> int:
+    from piigate import shadow
+
+    if arg.command == "shadow":
+        print(shadow.report())
+        print(f"shadow mode: {'ON' if shadow.enabled(cfg) else 'off'} (`shell_shadow` in {config.config_dir() / 'config.json'})")
+        return 0
+    if _agent():
+        print(
+            f"piigate {arg.command}: denied — the command was run by an AI agent. Switching the shadow mode or clearing its counts "
+            "is for a human only, in their own terminal.",
+            file=sys.stderr,
+        )
+        return 4
+    what = {"shadow-on": "switch the shadow mode ON (the new gate will judge every Bash command next to the old one; counts only)",
+            "shadow-off": "switch the shadow mode off", "shadow-reset": "delete the shadow counts"}[arg.command]
+    if not _confirm(arg.command, what):
+        return 4
+    if arg.command == "shadow-reset":
+        shadow.reset()
+        print("shadow counts deleted")
+        return 0
+    target = config.config_dir() / "config.json"
+    data = {}
+    if target.is_file():
+        data = json.loads(target.read_text(encoding="utf-8"))
+    data["shell_shadow"] = arg.command == "shadow-on"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    print(f"shell_shadow = {data['shell_shadow']} in {target}")
+    return 0
+
+
 def status(cfg: dict) -> int:
     folder = config.data_dir()
     print(
@@ -289,7 +327,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     try:
         cfg = config.load(os.getcwd())
-        if arg.command not in ("status", "project"):
+        if arg.command not in ("status", "project", "shadow", "shadow-on", "shadow-off", "shadow-reset"):
             project.require_valid(cfg)
         if arg.command == "show":
             if not arg.file:
@@ -331,6 +369,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(analysis.analyze(path.name, path.read_bytes(), cfg, question=arg.question, dest=arg.o), end="")
         elif arg.command == "reverse":
             return reverse(arg, cfg)
+        elif arg.command in ("shadow", "shadow-on", "shadow-off", "shadow-reset"):
+            return shadow_cmd(arg, cfg)
         elif arg.command == "status":
             return status(cfg)
         elif arg.command == "project":

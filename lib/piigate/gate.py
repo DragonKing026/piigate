@@ -107,7 +107,7 @@ FIND_ACTIONS = {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fp
 NETWORK_COMMANDS = {"ssh", "scp", "rsync", "sftp", "curl", "wget", "http", "https", "mysql", "mariadb", "psql", "docker", "kubectl"}
 FORBIDDEN_OPERATORS = {";", "&&", "||", "&", ";;", "(", ")", "<<<", "\n", "&|", ";&", "|&&"}
 REDIRECTS = {">", ">>", ">&", "&>", "&>>", ">|", "<", "<<", "<>", "<&"}
-PIIGATE_SUBCOMMANDS = {"show", "list", "table", "text", "status", "help", "--help", "-h"}
+PIIGATE_SUBCOMMANDS = {"show", "list", "table", "text", "status", "shadow", "help", "--help", "-h"}  # `shadow`: counts only
 # earlier pipeline stages before piigate: reading commands only (allow-list), no writing to files
 # (no psql/mysql/mlr/docker — they can run code or write a file locally; database queries go through ssh,
 # where the command runs on the server)
@@ -2622,6 +2622,9 @@ class Gate:
         for word, description in (
             ("reverse", "`piigate reverse` (restoring the originals)"),
             ("approve", "`piigate project approve` (approving project filters, including removals)"),
+            ("shadow-reset", "`piigate shadow-reset` (clearing the shadow counters)"),
+            ("shadow-on", "`piigate shadow-on` (switching the shadow mode on)"),
+            ("shadow-off", "`piigate shadow-off` (switching the shadow mode off)"),
         ):
             if not re.search(rf"(?<![\w-]){word}(?![\w-])", command):  # not the --reverse option (sort, git log)
                 continue

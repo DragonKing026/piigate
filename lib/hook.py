@@ -88,10 +88,27 @@ def gate(data: dict) -> dict | None:
     if tool.startswith("mcp__") and not gate_mod.unfiltered_entry(gate_mod.unfiltered_tools(cfg), tool):
         return None  # the hook matches every MCP tool; only those in `unfiltered_tools` are checked
     reason = gate_mod.Gate(cfg, data.get("cwd", "")).decision(tool, data.get("tool_input") or {})
+    if tool == "Bash":
+        _shadow(cfg, data, reason)
     if reason:
         _log({"hook": "gate", "tool": tool, "decision": "deny", "reason": denial_kind(reason)})
         return _deny(reason)
     return None
+
+
+def _shadow(cfg: dict, data: dict, reason: str | None) -> None:
+    """Shadow mode (piigate/shadow.py): the syntax-tree gate judges the same command in a forked child, after the decision
+    above; only counts are kept. The old gate's result is final — nothing here may raise, wait or change it."""
+    try:
+        if not cfg.get("shell_shadow"):
+            return
+        from piigate import shadow  # lazily: an import error must not touch the hook
+
+        command = (data.get("tool_input") or {}).get("command")
+        if isinstance(command, str):
+            shadow.observe(cfg, data.get("cwd", ""), command, reason)
+    except BaseException:  # noqa: BLE001, S110 — even a SystemExit of the shadow must not reach the decision
+        pass
 
 
 def denial_kind(reason: str) -> str:

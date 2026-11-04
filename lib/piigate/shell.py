@@ -26,7 +26,8 @@ from pathlib import Path
 
 DIALECTS = ("bash", "zsh")  # the grammar shfmt is asked for (`-ln`); the agent's Bash tool may run either shell
 DEFAULT_DIALECT = "bash"
-SHFMT_TIMEOUT = 5.0  # seconds; a pathological input must not hang the hook
+SHFMT_TIMEOUT = 5.0  # seconds; a pathological input must not hang the hook (the shadow mode sets it lower, see shadow.py)
+ABLATE: set[str] = set()  # features switched OFF to find the CAUSE of a difference (shadow.classify_cause); empty in use
 MAX_DEPTH = 4  # nesting of `bash -c '…'` / `eval` scripts that is parsed
 MAX_BYTES = 256 * 1024  # larger commands are refused (fail closed) instead of being parsed
 MAX_CALL_DEPTH = 4  # functions calling functions
@@ -155,10 +156,10 @@ def _platform() -> tuple[str, str]:
 
 
 def _shfmt_candidates() -> list[str]:
-    """Where the pinned binary may be: the plugin's own file, until it is bundled also the user's install. PATH is never
-    searched (the agent can put a program there)."""
+    """Where the pinned binary is: the plugin's own file `bin/shfmt-<os>-<arch>` (v3.14.1 from the mvdan/sh release, BSD-3, see
+    bin/shfmt-LICENSE). Nowhere else — not PATH, not the user's install (the agent can put a program there)."""
     system, arch = _platform()
-    return [str(PLUGIN_ROOT / "bin" / f"shfmt-{system}-{arch}"), os.path.expanduser("~/.local/bin/shfmt")]
+    return [str(PLUGIN_ROOT / "bin" / f"shfmt-{system}-{arch}")]
 
 
 def _shfmt_binary() -> tuple[str, bytes]:
@@ -666,6 +667,8 @@ class VarModel:
     def value(self, name: str, use: int, origin: str = "top", positional=None, pwd=None):
         """("static", text) | ("set", [texts]) | ("list", [texts]) (`$@`) | ("unknown", None). An array or a `for` variable
         is a SET: every element is a possible value (the index of `${a[1]}` is not trusted)."""
+        if "known-value-resolution" in ABLATE:
+            return "unknown", None
         if name.isdigit() and name != "0":
             if positional is None:
                 return "unknown", None
@@ -1017,9 +1020,9 @@ class _Walker:
         if t == "BinaryCmd":
             return self.binary(c, st, sub, inherited, origin)
         if t == "Subshell":
-            self.stmts(c.get("Stmts") or [], st, True, inherited, origin)
+            inner = self.stmts(c.get("Stmts") or [], st, True, inherited, origin)
             self.substs(stmt.get("Redirs") or [], st, None)
-            return st
+            return inner if "subshell-cd" in ABLATE else st  # a subshell does not change the directory of what follows
         if t == "Block":
             out = self.stmts(c.get("Stmts") or [], st, sub, inherited, origin)
             self.substs(stmt.get("Redirs") or [], st, None)
