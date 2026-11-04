@@ -234,9 +234,16 @@ marker, which the gate recreates on every command while the directory exists, an
 `.piigate-work/analysis-…` directory that is removed when the analysis ends (an empty `.piigate-work/` remains). Because of
 the marker, `rmdir Sensitive-data` fails with "Directory not empty" (the gate says so instead of letting it fail); remove
 the empty directory with `rm Sensitive-data/.gitignore && rmdir Sensitive-data` — the gate lets exactly this command
-through, and `rmdir` refuses to remove anything else that has appeared in the directory in the meantime. A recursive
-search from a directory above a `Sensitive-data` (also in a worktree) is denied; the gate walks up to three directory
-levels (at most 20000 directories) and denies a tree that is too large to check.
+through (typed with single spaces, nothing else), and `rmdir` refuses to remove anything else that has appeared in the
+directory in the meantime. After `piigate_analyze` the directory also holds an empty `.piigate-work/`; remove it first
+(`rmdir Sensitive-data/.piigate-work`), otherwise the recipe does not apply.
+
+A recursive search from a directory above a `Sensitive-data` (also in a worktree) is denied. The check walks the
+directory tree: up to three levels of directories between the searched directory and `Sensitive-data`, without following
+symlinks and without entering `.git` or `node_modules`; a tree of more than 20000 directories is denied as too large to
+check. It matters for tools that do not honour `.gitignore` (`grep -r`, `find`, `tar`…); `rg`, `fd` and `ag` rely on the
+marker `.gitignore` in the directory. A `Sensitive-data` deeper than that, behind a symlink or inside `node_modules` is not
+found by this check.
 
 ## Configuration
 
