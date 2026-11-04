@@ -555,6 +555,25 @@ class TestMonotonicity(Base):
         self.assertEqual([r["command"] for r in unlisted], [])
         self.assertTrue(set(counts) <= set(shell_monotone.CLASSES))
 
+    def test_the_class_is_the_cause_not_the_look_of_the_command(self):
+        """The class comes from switching a feature off, so a command that only LOOKS like a subshell `cd` is not filed there."""
+        import shell_monotone
+        from piigate import shadow
+
+        g = self.old()
+        for command, cause in (
+            ("echo | cd ..; cat S*/p*; (cd .)", "pipeline-cd"),  # the `( )` is not what makes the difference
+            ("(cd .); echo | cd ..; cat S*/p*", "pipeline-cd"),
+            ("( cd .. ); cat S*/p*", "subshell-cd"),
+        ):
+            with self.subTest(command=command):
+                self.assertIsNotNone(gate.Gate.bash(g, command, True), "the old gate must deny it for the case to count")
+                row = {"bash": {"category": "OLD-DENY-NEW-ALLOW", "cause": shadow.classify_cause(self.cfg, str(self.work), command, True, "bash")}}
+                self.assertEqual(shell_monotone.classify(row, "bash"), cause)
+        for command in ("cat ../S*/p*; echo x > $HOME/y",):  # denied by both: no class at all
+            self.assertIsNotNone(gate.Gate.bash(g, command, True))
+            self.assertIsNotNone(self.ast("bash").bash(command))
+
     def test_the_classes_are_few_and_explained(self):
         import shell_monotone
 

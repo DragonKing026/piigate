@@ -1142,7 +1142,7 @@ class _Walker:
         for i, stage in enumerate(stages):
             before = len(self.calls)
             last_here = i == len(stages) - 1 and (self.dialect == "zsh" or self.lastpipe) and not self.dry
-            if last_here:  # zsh (bash with `shopt -s lastpipe`) runs the LAST stage in the current shell: its `cd` stays
+            if last_here or "pipeline-cd" in ABLATE:  # zsh (bash with `shopt -s lastpipe`) runs the LAST stage in the current shell: its `cd` stays
                 out = self.stmt(stage, st, sub, redirs, origin)
             else:
                 self.stmt(stage, st, True, redirs, origin)

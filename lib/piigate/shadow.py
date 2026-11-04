@@ -31,7 +31,8 @@ CATEGORIES = (
     "same-allow", "same-deny", "old-deny-new-allow", "old-allow-new-deny", "parse-error", "shadow-error", "shadow-timeout",
 )
 # the cause of an old-deny-new-allow: the feature of the syntax-tree gate that, switched off, makes it deny again
-CAUSES = ("subshell-cd", "known-value-resolution", "other")
+FEATURES = ("subshell-cd", "pipeline-cd", "known-value-resolution")
+CAUSES = (*FEATURES, "other")
 REASON_LABELS = (
     "sensitive-dir", "filter-files", "unfiltered-tool", "data-file", "ssh-query", "mcp-piigate", "marker-dir", "human-only",
     "cannot-parse", "code-the-tree-cannot-read", "zsh-syntax", "other",
@@ -126,15 +127,15 @@ def record(category: str, ms: float | None = None, cause: str | None = None, old
     _update(lambda data: _bump(data["days"].setdefault(today, _empty_day()), category, ms, cause, old, new))
 
 
-def classify_cause(cfg: dict, cwd: str, command: str, files: bool) -> str:
+def classify_cause(cfg: dict, cwd: str, command: str, files: bool, dialect: str | None = None) -> str:
     """Why the syntax-tree gate allows what the old gate denies: switch one of its features off at a time and see which one
     brings the denial back. A command that no feature explains is `other`."""
     from . import shell, shell_gate
 
-    for feature in ("subshell-cd", "known-value-resolution"):
+    for feature in FEATURES:
         shell.ABLATE = {feature}
         try:
-            if shell_gate.AstGate(cfg, cwd).bash(command, files) is not None:
+            if shell_gate.AstGate(cfg, cwd, dialect).bash(command, files) is not None:
                 return feature
         finally:
             shell.ABLATE = set()

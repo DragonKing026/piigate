@@ -94,6 +94,8 @@ class Recorder:
         return out
 
     def record(self, old_gate, command: str, files: bool, old_reason, source: str, expected: str | None = None) -> None:
+        from piigate import shadow
+
         cfg, cwd = old_gate.cfg, old_gate.cwd
         key = (command, files, cwd, old_reason is None, source == "hook", config_key(cfg))
         if key in self.seen:
@@ -120,6 +122,8 @@ class Recorder:
                 "parse_error": n["parse_error"],
                 "adapter_error": n["adapter_error"],
             }
+            if entry[d]["category"] == "OLD-DENY-NEW-ALLOW":
+                entry[d]["cause"] = shadow.classify_cause(cfg, cwd, command, files, d)
         self.seen[key] = entry
         self.records.append(entry)
         self.compare_heuristics(old_gate, new["bash"]["gate"], command)

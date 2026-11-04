@@ -484,7 +484,7 @@ KNOWN: dict[str, str] = {
 
 
 def measure(world: zc.World | None = None, cases: list[Adv] | None = None) -> list[dict]:
-    from piigate import gate, shell_gate
+    from piigate import gate, shadow, shell_gate
 
     own = world is None
     world = world or zc.World()
@@ -507,6 +507,8 @@ def measure(world: zc.World | None = None, cases: list[Adv] | None = None) -> li
                     "OLD-DENY-NEW-ALLOW" if old is not None else "OLD-ALLOW-NEW-DENY")
                 row[d] = {"decision": "allow" if reason is None else "deny", "category": category,
                           "parse_error": g.parse_error, "internal_error": g.internal_error, "reason": (reason or "")[:160]}
+                if category == "OLD-DENY-NEW-ALLOW":
+                    row[d]["cause"] = shadow.classify_cause(old_gate.cfg, old_gate.cwd, case.command, True, d)
             why = case.norun or zc.refusal(case.command, world.work)
             if why:
                 real = {m: {"reads": False} for m in ("f", "cc", "bash")}
