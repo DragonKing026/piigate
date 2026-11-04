@@ -172,7 +172,7 @@ class TestDecisions(Base):
         g = self.ast()
         g.bash("echo $(cat x.csv) | grep a 2>/dev/null")
         tokens = g._current.tokens
-        self.assertEqual(tokens[:3], ["echo", "$(cat", "x.csv)"])  # the substitution keeps its text and is cut at blanks, as before
+        self.assertEqual(tokens[:7], ["echo", "$", "(", "cat", "x.csv", ")", "|"])  # its text is cut like the old gate cut it
         self.assertIn("|", tokens)
         self.assertEqual(tokens[tokens.index("2") : tokens.index("2") + 3], ["2", ">", "/dev/null"])
         g.bash("cat '' \"a b\" --opt='c'")
@@ -403,7 +403,7 @@ class TestRound5(Base):
     def test_unknown_values_are_text_and_nothing_is_replaced_by_a_letter(self):
         for command, expected in (
             ("cat $USER", ["cat", "$USER"]), ("cat ${USER/*/P}", ["cat", "${USER/*/P}"]), ("cat ${USER:-x}y", ["cat", "${USER:-x}y"]),
-            ("cat $(pwd)/x", ["cat", "$(pwd)/x"]), ("cat $PATH", ["cat", "$PATH"]), ("pwd() { echo x; }; cat $(pwd)", None),
+            ("cat $(pwd)/x", ["cat", "$", "(", "pwd", ")", "/x"]), ("cat $PATH", ["cat", "$PATH"]), ("pwd() { echo x; }; cat $(pwd)", None),
         ):
             g = self.ast()
             g.bash(command)

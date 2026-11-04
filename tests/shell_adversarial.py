@@ -378,6 +378,15 @@ KNOWN: dict[str, str] = {
     "assign-default-then-use": "`${d:={V}}` assigns a default at run time; the later `$d` is judged as the text `$d`. README: NOT spelled out",
     "short-sensitive-name-by-user": "`cat <root>/$USER/zeta/people.csv`: the value of `$USER` comes from the environment (it stays the text `$USER`, "
     "by decision) and the sensitive directory has a short name, so no name marker fires. README: NOT covered (environment variables as path parts)",
+    "operand-bare-subst": "`cat $(echo ../S*/p*.csv)`: the operand is the OUTPUT of a substitution; the glob is inside the text of `echo`, and "
+    "the output is not a value the line holds (by decision it passes as in the old gate, with the substitution's text judged as the old gate "
+    "judges it). README: covered (issue #22)",
+    "operand-default": "`cat ${f:-$(echo P)}`: as `operand-bare-subst`, through a default. README: covered (issue #22)",
+    "operand-from-substitution": "the same as `operand-bare-subst` (round 5 listing). README: covered (issue #22)",
+    "quoted-operand-from-substitution": "`cat \"$(echo P)\"`: as `operand-subst`. README: covered (issue #22)",
+    "for-variable-substitution": "`for d in $(echo P); do cat $d`: the items are the output of a substitution. README: covered (issue #22)",
+    "unset-variable-in-name": "`cat ../Sens${LANG}itive-data/people.csv`: an unset or empty variable inside a name; the value is the environment's, "
+    "the text stays `${LANG}` (by decision). README: NOT spelled out (environment variables as path parts)",
     "eval-variable": "bash only: `x='cat ../S*/p*'; eval $x` — an unquoted `$x` is globbed by bash, so its value is not one certain word (zsh does not "
     "glob it, and refuses). README: covered (assembled at run time)",
 }
@@ -391,6 +400,7 @@ def measure(world: zc.World | None = None, cases: list[Adv] | None = None) -> li
     rows = []
     try:
         for case in cases if cases is not None else CASES:
+            world.reset()
             command = case.command.replace("{ROOT}", str(world.root))
             case = dataclasses.replace(case, command=command)
             old_gate = world.gate()

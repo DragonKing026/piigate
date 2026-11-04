@@ -128,6 +128,13 @@ class AstGate(gate.Gate):
 
         variants, unresolved = shell.subst_word(w, lookup, self.dialect)
         text0 = variants[0][0] if len(variants) == 1 and len(variants[0]) == 1 else None
+        if text0 is not None and text0.startswith("/proc/"):
+            # `/proc/self/cwd/..`, `/proc/$$/cwd/..`, `/proc/self/root/…`: the directory of the shell itself, said in another way
+            m = re.match(r"/proc/(?:self|thread-self|\$\$|\$\{\$\})/(cwd|root)(?:/(.*))?$", text0)
+            if m and (m.group(1) == "root" or pwd is not None):
+                base = pwd if m.group(1) == "cwd" else ""
+                variants = [[(base + "/" + (m.group(2) or "")) if m.group(2) is not None else (base or "/")]]
+                text0 = variants[0][0]
         if text0 is not None and "tilde" in w.kinds:
             if w.text.startswith("~+") and pwd is not None:  # `~+/x` is $PWD/x
                 variants = [[pwd + text0[2:]]]
@@ -136,10 +143,11 @@ class AstGate(gate.Gate):
                 if m and m.group(1) in self._named_dirs:  # zsh `hash -d name=path`, then `~name/x`
                     variants = [[self._named_dirs[m.group(1)] + text0[m.end() :]]]
         words = variants[0] if len(variants) == 1 or all(len(v) == 1 for v in variants) else [w.text]
-        if "cmd" in w.kinds and w.quoting == "none" and len(words) == 1 and re.search(r"\s", words[0]):
-            # an unquoted `$(echo cat P)` / `` `echo cat P` ``: the shell runs it, and the old tokenizer cut its text at
-            # the blanks, so each piece was judged as a word of its own (the path `P` among them) — as here
-            words = words[0].split()
+        if {"cmd", "proc"} & w.kinds and w.quoting == "none" and len(words) == 1:
+            # an unquoted `$(echo cat P)` / `` `echo cat P` `` / `<(…)`: the shell runs it, and the old tokenizer cut its text
+            # at the blanks and at `$ ( )`, so each piece was judged as a word of its own (a path `P` among them) — exactly
+            # as here: the text of a substitution is judged the way the old gate judges it
+            words = [str(t) for t in gate.Gate._tokens(words[0]) or words[0].split()]
         out: list[str] = []
         for text in words:
             tok = QuotedToken(text, w.quote) if w.quote else text
@@ -285,6 +293,11 @@ class AstGate(gate.Gate):
             pending.clear()
 
         before: shell.Call | None = None
+        for c in calls:  # text printed by a function may be the PATH it hands back (`pwd() { echo ../Sensitive-data; }`)
+            if c.origin == "function" and c.name in ("echo", "printf"):
+                words = [str(t) for w in c.argv[1:] for t in self._word_tokens(w, c, self._index.get(id(c), 0), c.origin)]
+                if words:
+                    text_bodies.append(" ".join(words))
         for c in top:
             # a pipeline stage may hold several commands (`{ a; b; } | c`, `while …; done | c`, `( … ) | c`): all of them
             # are connected to the next stage, and the commands of one stage to each other

@@ -185,6 +185,18 @@ class World:
     def __init__(self):
         self.root = Path(tempfile.mkdtemp(prefix="piigate-zsh-"))
         self.work = self.root / "work"
+        self._populate()
+
+    def reset(self) -> None:
+        """Every case starts from the same files: a case that writes (`tee`, `> file`) must not hide the dummy of the next."""
+        for child in self.root.iterdir():
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                child.unlink()
+        self._populate()
+
+    def _populate(self) -> None:
         self.work.mkdir()
         (self.root / SENSITIVE_NAME).mkdir()
         (self.root / SENSITIVE_NAME / "people.csv").write_text(CANARY + "\n", encoding="utf-8")

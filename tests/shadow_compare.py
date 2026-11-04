@@ -311,6 +311,7 @@ def main() -> None:
     zsh_rows = []
     try:
         for case in shell_zsh_cases.CASES:
+            world.reset()
             g = world.gate()
             old_reason = rec.original(g, case.command, True)
             row = {"name": case.name, "command": case.command, "what": case.what, "old": "allow" if old_reason is None else "deny"}
