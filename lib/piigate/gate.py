@@ -6,9 +6,15 @@ is documented in the README. Rule: with a sensitive source only a single pipelin
 is allowed (followed only by grep/head/tail/wc/sort/uniq/cut on its output), or a command with no content in its
 output and its target inside a sensitive directory. Tools listed in `unfiltered_tools` (their output bypasses the
 filter, e.g. a local LLM subagent) are denied on sensitive data and in forms where their directory is unknown.
+
+Principle (#23): deny only when the output of a command can bring the CONTENT of sensitive data into the model's context.
+Location and content decide — never a file type or a name alone: a file that does not exist has no content (creating it
+is fine), names are not content (ls, find, tree, git status…), text arguments (commit messages, issue bodies, patterns,
+echo) are not paths, and a data-extension glob is expanded and every match is judged by its content.
 """
 
 import fnmatch
+import glob
 import json
 import os
 import re
@@ -54,6 +60,21 @@ DIRECT_LAUNCHERS = {
     "stdbuf", "chrt", "taskset", "unbuffer",
 }
 SHELL_KEYWORDS = {"{", "}", "!", "if", "then", "elif", "else", "fi", "do", "done", "while", "until", "for", "case"}
+# commands that never run what they are given (a file written earlier in the same command may be their argument)
+NON_RUNNING = {"ls", "rm", "stat", "mv", "cp", "touch", "mkdir", "chmod", "diff", "echo", "printf", "true", "test", "["}
+# dotfiles and directories whose content later runs by itself (seeding): writing there while the command names a
+# sensitive path is refused
+SEEDING = re.compile(
+    r"(?:/\.git/hooks/|/\.(?:bashrc|bash_profile|bash_login|profile|zshrc|zshenv|zprofile|zlogin|bash_logout)$|/\.config/fish/"
+    r"|/\.config/autostart/|/\.config/systemd/user/|/\.xinitrc$|/\.xprofile$|/var/spool/cron/"
+    r"|/\.ssh/(?:rc|config)$|/\.gitconfig$|/\.git/config$|/\.config/environment\.d/|/\.envrc$|/\.local/bin/"
+    r"|/\.claude/(?:settings[^/]*\.json|hooks/)|/BASH_ENV/ENV)"
+)
+# commands that do not read the content of the files they are given
+NO_READ_COMMANDS = {"stat", "touch", "rm", "rmdir", "mkdir", "test", "[", "ln", "chmod", "chown", "chgrp", "file"}
+COPY_INSIDE = {"cp", "mv", "install", "dd", "rsync", "ln"}
+GLOB_LIMIT = 200  # data files judged per glob / search root; more — denied as a precaution
+WALK_LIMIT = 100000  # directory entries visited when looking for data files under a search root
 REDIRECT_ALONE = re.compile(r"\d*(?:[<>]+&?|&>+)\d*-?")
 REDIRECT_GLUED = re.compile(r"\d*(?:[<>]+&?|&>+)\S+")
 
@@ -203,12 +224,19 @@ def strip_db_services(text: str) -> str:
         return "_" if SERVICE_COMMANDS.search(segment) else m.group()
 
     return DB_CLIENT.sub(substitute, text)
-RECURSIVE_FLAGS = re.compile(r"^-(?:[a-zA-Z]*[rR][a-zA-Z]*|-recursive|-dereference-recursive)$")
+CHAIN_SAFE = {
+    "ls", "tree", "du", "cat", "head", "tail", "wc", "stat", "file", "echo", "printf", "true",
+    "grep", "egrep", "fgrep", "rg", "fd", "find",
+}
+LS_LONG_PLAIN = {"--color", "--all", "--almost-all", "--directory", "--classify", "--human-readable", "--size", "--inode"}
+# GNU getopt accepts any unambiguous prefix of a long option: `--rec`, `--recur`… are --recursive (`--re` is ambiguous)
+_RECURSIVE_LONG = r"-rec(?:u(?:r(?:s(?:i(?:v(?:e)?)?)?)?)?)?"
+RECURSIVE_FLAGS = re.compile(rf"^-(?:\w*[rR]\w*|{_RECURSIVE_LONG}|-dereference-recursive)$")
 # -r/-R is not recursion here (jq -r raw output, gh -R repository, sort -r reverse, sed -r ERE, curl -r range…) —
 # otherwise a jq filter with `[]` counts as a pattern searched from cwd. Other commands keep the flag (deny by default).
 NOT_RECURSIVE_R = {"jq", "gojq", "yq", "gh", "sort", "sed", "date", "curl", "ssh", "less", "bat", "head", "tail", "tac"}
 # only -R is recursion (ls -r reverse order, chmod -r removes the read permission)
-RECURSIVE_UPPER_ONLY = re.compile(r"^(?:-[a-zA-Z]*R[a-zA-Z]*|--recursive)$")
+RECURSIVE_UPPER_ONLY = re.compile(rf"^(?:-\w*R\w*|-{_RECURSIVE_LONG})$")
 UPPER_ONLY_COMMANDS = {"ls", "chmod", "chown", "chgrp"}
 
 
@@ -250,59 +278,6 @@ IGNORE_FILES = {"rg": (".ignore", ".rgignore"), "fd": (".ignore", ".fdignore"), 
 NO_IGNORE = re.compile(r"^(?:--no-ignore\S*|--unrestricted|-[a-zA-Z]*u[a-zA-Z]*|-I|--skip-vcs-ignores|-U)$")
 COPY_COMMANDS = {"cp", "mv", "scp", "rsync"}  # copying: all paths inside a sensitive directory
 COPY_FLAGS = re.compile(r"^(?:-[aprRvinfuzPq]+|--(?:archive|recursive|verbose|progress|preserve|no-clobber))$")
-
-
-def _find_dirs_only(arguments: list[str]) -> bool:
-    """The find expression prints directories only — allow-listed forms: `-type d` at the top level (no `!`/`-not`
-    before it), name/depth tests with an argument (`-name X`, `-iname`, `-path`, `-maxdepth N`…), parentheses,
-    `!`/`-not`, `-a`; alternation (`-o`) only inside parentheses. Test arguments are skipped when counting parentheses
-    (`-name ')'`); other tests and actions — denied. `find ~ -type d ( -iname a -o -iname b ) -not -path '*/x/*'` yes,
-    `-type d -o -name x` no."""
-    depth, has_type_d, i = 0, False, 0
-    paths = True
-    while i < len(arguments):
-        t = arguments[i]
-        if paths and not t.startswith(("-", "(", "!")):
-            i += 1
-            continue
-        paths = False
-        if t in FIND_WITH_ARG:
-            if i + 1 >= len(arguments):
-                return False
-            if t == "-type":
-                if depth == 0 and arguments[i + 1] == "d" and not (i and arguments[i - 1] in ("!", "-not")):
-                    has_type_d = True
-            i += 2
-            continue
-        if t == "(":
-            depth += 1
-        elif t == ")":
-            depth -= 1
-            if depth < 0:
-                return False
-        elif t in ("-o", "-or"):
-            if depth == 0:
-                return False
-        elif t not in ("!", "-not", "-a", "-and"):
-            return False  # unknown test or action (-print0, -printf, -newer…)
-        i += 1
-    return has_type_d and depth == 0
-
-
-def _du_dirs_only(arguments: list[str]) -> bool:
-    """du without -a: only allow-listed options (-s -h -c -x, -d N, --max-depth=N, --summarize, --human-readable), the rest are paths."""
-    i = 0
-    while i < len(arguments):
-        t = arguments[i]
-        if t == "-d" and i + 1 < len(arguments) and arguments[i + 1].isdigit():
-            i += 2
-            continue
-        if t.startswith("-") and not (
-            re.fullmatch(r"-[shcx]+|-d\d+|--max-depth=\d+|--summarize|--human-readable|--total|--one-file-system", t)
-        ):
-            return False
-        i += 1
-    return True
 
 
 def _inside(path: str, directories: list[str]) -> bool:
@@ -364,6 +339,208 @@ def unfiltered_entry(entries: list[dict], tool: str) -> dict | None:
     return next((e for e in entries if e.get("mcp_tools") and re.search(e["mcp_tools"], tool)), None)
 
 
+# --- option allow-lists (#23) ---------------------------------------------------------------------------------------
+# A command is judged by its OPTIONS, not by its name: `git log` prints commit messages, `git log -U1` prints file
+# content. One parser (`_scan`) understands short clusters (-am, -U1, -Fplik, -xcat), glued values (--format=%H,
+# -x=cat) and `--`; a spec lists the options that neither show file content nor run a command. Anything else — an
+# unknown option, an abbreviated long option — makes the stage an ordinary reader.
+
+
+def _scan(args: list[str], s1: set[str] | str = "", l1: set[str] | tuple = ()) -> tuple[list[tuple], list[int]]:
+    """Options and positionals of `args`. Options: (name, value, name index, value index or None) with name `-x` or
+    `--long`; s1 — short options that take a value (glued or the next word), l1 — long options that take a value
+    (glued with `=` or the next word). Positionals: indices into `args` (everything after `--` too)."""
+    opts: list[tuple] = []
+    positional: list[int] = []
+    i = 0
+    while i < len(args):
+        t = args[i]
+        if t == "--":
+            positional += range(i + 1, len(args))
+            break
+        if t.startswith("--"):
+            name, eq, value = t.partition("=")
+            if eq:
+                opts.append((name, value, i, None))
+            elif name[2:] in l1 and i + 1 < len(args):
+                opts.append((name, args[i + 1], i, i + 1))
+                i += 1
+            else:
+                opts.append((name, None, i, None))
+        elif t.startswith("-") and len(t) > 1:
+            for j, c in enumerate(t[1:], 1):
+                if c in s1:
+                    rest = t[j + 1 :]
+                    if rest:
+                        opts.append((f"-{c}", rest, i, None))
+                    elif i + 1 < len(args):
+                        opts.append((f"-{c}", args[i + 1], i, i + 1))
+                        i += 1
+                    else:
+                        opts.append((f"-{c}", None, i, None))
+                    break
+                opts.append((f"-{c}", None, i, None))
+        else:
+            positional.append(i)
+        i += 1
+    return opts, positional
+
+
+def _spec(s0="", s1="", l0=(), l1=(), lg=(), files=()):
+    return {"s0": set(s0), "s1": set(s1), "l0": set(l0), "l1": set(l1), "lg": set(lg), "files": set(files)}
+
+
+def _allowed(args: list[str], spec: dict) -> tuple[list[int], list[str]] | None:
+    """The positionals (indices) and the values of file options when every option is in the spec, else None."""
+    opts, positional = _scan(args, spec["s1"], spec["l1"])
+    files: list[str] = []
+    for name, value, _, _ in opts:
+        if name.startswith("--"):
+            n = name[2:]
+            known = n in spec["l1"] or n in spec["lg"] or (n in spec["l0"] and value is None)
+        else:
+            known = name[1] in spec["s0"] or name[1] in spec["s1"]
+        if not known:
+            return None
+        # every option that names a file (`--pathspec-from-file`, `--exclude-from`, `--file`, `--template`, `--blob`…)
+        if value and (name in spec["files"] or (name.startswith("--") and re.search(r"file|from|template|blob|reference|config", name))):
+            files.append(value)
+    return positional, files
+
+
+_LOG0 = (
+    "oneline graph decorate no-decorate stat shortstat numstat name-only name-status summary all branches tags remotes "
+    "abbrev-commit no-abbrev-commit no-merges merges first-parent reverse follow topo-order date-order author-date-order "
+    "no-color left-right cherry cherry-pick cherry-mark boundary full-history simplify-by-decoration source "
+    "walk-reflogs relative-date no-walk parents children graph-all merge-base"
+).split()
+_LOG1 = "max-count skip since until after before author committer grep format pretty date min-parents max-parents glob exclude".split()
+_LOGG = "color abbrev decorate pretty format stat date no-walk show-notes".split()
+# diff/stash show: only these format options (names, counts), plus the scope options; --check, --exit-code alone,
+# -U, -p… print or imply the patch. DIFF_NAMES_ONLY = the options that make the output names/counts.
+_DIFFN = "name-only name-status stat numstat shortstat summary cached staged quiet no-patch no-renames exit-code".split()
+DIFF_NAMES_ONLY = {"--name-only", "--name-status", "--stat", "--numstat", "--shortstat", "--summary", "--quiet", "--no-patch", "-s"}
+GIT_LOG = _spec("q0123456789", "n", _LOG0, _LOG1, _LOGG)
+GIT_DIFF_NAMES = _spec("zMqs", "", _DIFFN, (), "stat find-renames color abbrev".split())
+GIT_SPECS = {
+    "status": _spec("sbzquonal", "", "short branch porcelain long ignored no-renames renames show-stash ahead-behind "
+                    "no-ahead-behind no-column column".split(), (), "porcelain untracked-files ignored ignore-submodules column find-renames".split()),
+    "log": GIT_LOG,
+    "reflog": GIT_LOG,
+    "add": _spec("AunvfN", "", "all update dry-run verbose force intent-to-add ignore-errors renormalize no-all ignore-removal sparse refresh pathspec-file-nul".split(),
+                 ("pathspec-from-file",), ("chmod",), ("--pathspec-from-file",)),
+    "commit": _spec("aqsn", "mCcFt", "all quiet signoff no-verify amend no-edit allow-empty allow-empty-message dry-run short porcelain "
+                    "branch reset-author no-post-rewrite status no-status".split(), "message author date cleanup fixup squash "
+                    "reuse-message reedit-message file template trailer".split(), ("gpg-sign", "untracked-files"), ("-F", "-t", "--file", "--template")),
+    "merge": _spec("qvn", "msXF", "ff-only no-ff ff squash no-commit commit abort continue quit quiet verbose no-edit edit no-verify "
+                   "stat no-stat allow-unrelated-histories autostash no-autostash signoff".split(), "message strategy strategy-option file into-name".split(),
+                   ("log", "gpg-sign", "cleanup"), ("-F", "--file")),
+    "worktree": _spec("fq", "bB", "force detach checkout no-checkout lock quiet porcelain verbose dry-run guess-remote track no-track orphan".split(),
+                      "reason expire".split(), ()),
+    "branch": _spec("avrlDdfmMcCq", "u", "all verbose remotes list delete force move copy show-current quiet unset-upstream track no-track "
+                    "edit-description".split(), "set-upstream-to contains no-contains merged no-merged sort format points-at".split(),
+                    ("color", "abbrev", "column", "merged", "no-merged", "contains", "no-contains")),
+    "push": _spec("uqvfnd", "o", "all tags force dry-run set-upstream delete prune quiet verbose no-verify follow-tags atomic mirror no-thin progress".split(),
+                  "push-option repo".split(), ("force-with-lease", "signed", "force-if-includes", "recurse-submodules", "porcelain", "thin")),
+    "fetch": _spec("aqvfnptu", "j", "all append quiet verbose force dry-run prune tags no-tags prune-tags update-head-ok multiple atomic "
+                   "set-upstream unshallow no-recurse-submodules progress".split(), "depth deepen shallow-since shallow-exclude jobs filter".split(),
+                   ("recurse-submodules", "negotiate-tip", "porcelain")),
+    "pull": _spec("qvfrnpa", "sX", "ff-only no-ff ff rebase no-rebase autostash no-autostash quiet verbose all tags prune force squash "
+                  "no-commit commit no-edit edit stat no-stat dry-run update-head-ok".split(), "strategy strategy-option depth jobs".split(),
+                  ("rebase", "recurse-submodules", "gpg-sign", "log")),
+    "checkout": _spec("qfmt", "bB", "force quiet detach track no-track merge ours theirs ignore-other-worktrees guess no-guess progress "
+                      "no-progress overlay no-overlay".split(), "orphan conflict pathspec-from-file".split(), ("recurse-submodules",),
+                      ("--pathspec-from-file",)),
+    "switch": _spec("qfdm", "cC", "detach force discard-changes guess no-guess track no-track merge quiet progress ignore-other-worktrees".split(),
+                    "create force-create orphan conflict".split(), ("recurse-submodules",)),
+    "restore": _spec("SWq", "s", "staged worktree quiet ours theirs merge overlay no-overlay progress ignore-unmerged ignore-skip-worktree-bits".split(),
+                     "source pathspec-from-file".split(), ("recurse-submodules",), ("--pathspec-from-file",)),
+    "reset": _spec("q", "", "soft mixed hard merge keep quiet no-refresh refresh no-recurse-submodules".split(), ("pathspec-from-file",),
+                   ("recurse-submodules",), ("--pathspec-from-file",)),
+    "rebase": _spec("qvfn", "sX", "continue abort skip quit autostash no-autostash keep-base root force-rebase no-ff ff quiet verbose stat "
+                    "no-stat reapply-cherry-picks no-fork-point fork-point update-refs no-update-refs".split(), "onto strategy strategy-option whitespace".split(),
+                    ("rebase-merges", "gpg-sign", "empty")),
+    "tag": _spec("alfdsn", "muF", "list delete annotate force sign no-sign create-reflog".split(), "message file local-user sort contains "
+                 "no-contains points-at merged no-merged format".split(), ("color", "column"), ("-F", "--file")),
+    "remote": _spec("vfn", "tm", "verbose tags no-tags fetch push add delete dry-run auto".split(), ("mirror",), ()),
+    "ls-files": _spec("cdmoksuvtzfiX", "xX", "cached deleted modified others ignored stage unmerged killed exclude-standard full-name error-unmatch "
+                      "directory no-empty-directory resolve-undo deduplicate recurse-submodules eol sparse".split(),
+                      "exclude exclude-from exclude-per-directory format with-tree".split(), (), ("-X", "--exclude-from")),
+    "ls-tree": _spec("drltz", "", "name-only name-status full-name full-tree long".split(), ("format",), ("abbrev",)),
+    "rev-parse": _spec("q", "", "show-toplevel git-dir abbrev-ref short verify is-inside-work-tree show-prefix show-cdup absolute-git-dir "
+                       "git-common-dir symbolic-full-name quiet is-bare-repository show-superproject-working-tree".split(), ("git-path",),
+                       ("short", "abbrev-ref")),
+    "rev-list": _spec("n0123456789", "n", "count all reverse no-merges merges first-parent objects left-right no-walk abbrev-commit parents "
+                      "children topo-order date-order boundary branches tags remotes quiet".split(),
+                      "max-count since until after before author committer grep skip max-parents min-parents".split()),
+    "describe": _spec("", "", "tags always long all contains first-parent exact-match".split(), "match exclude candidates".split(),
+                      ("dirty", "broken", "abbrev")),
+    "merge-base": _spec("a", "", "all octopus is-ancestor independent fork-point".split()),
+    "name-rev": _spec("", "", "tags all name-only no-undefined always".split(), "refs exclude".split()),
+    "show-ref": _spec("d", "", "heads tags verify head dereference quiet exists".split(), (), ("hash", "abbrev")),
+    "for-each-ref": _spec("", "", "shell perl python tcl ignore-case".split(), "format sort count points-at merged no-merged contains no-contains".split()),
+    "symbolic-ref": _spec("dq", "m", "short quiet delete".split()),
+    "count-objects": _spec("vH", "", "verbose human-readable".split()),
+    "ls-remote": _spec("q", "", "heads tags refs quiet get-url symref".split(), ("sort",)),
+    "mv": _spec("fnkv", "", "force dry-run verbose".split()),
+    "rm": _spec("fnrq", "", "force dry-run cached quiet ignore-unmatch sparse".split(), ("pathspec-from-file",), (), ("--pathspec-from-file",)),
+    "clean": _spec("fdnxXq", "e", "force dry-run quiet".split()),
+    "init": _spec("q", "b", "quiet bare".split(), "initial-branch separate-git-dir".split()),
+    "clone": _spec("qvnsl", "bj", "bare mirror quiet verbose no-checkout shallow-submodules recursive single-branch no-tags local "
+                   "no-hardlinks shared progress sparse no-single-branch".split(), "branch origin depth jobs reference separate-git-dir filter "
+                   "shallow-since shallow-exclude".split(), ("recurse-submodules",)),
+    "cherry-pick": _spec("nxeq", "mXs", "continue abort skip quit no-commit edit no-edit signoff ff allow-empty keep-redundant-commits "
+                         "allow-empty-message".split(), "mainline strategy strategy-option".split(), ("gpg-sign",)),
+    "revert": _spec("neq", "mXs", "continue abort skip quit no-commit edit no-edit signoff allow-empty".split(), "mainline strategy strategy-option".split(),
+                    ("gpg-sign",)),
+    "gc": _spec("", "", "auto quiet aggressive".split()),
+}
+# `git config` only to read (a key = get; two words set a value — alias.x, core.pager, core.sshCommand run commands)
+GIT_CONFIG_READ = _spec("lz", "", "list local global system worktree get get-all get-regexp show-origin show-scope name-only null bool int path "
+                        "includes no-includes".split())
+# subcommands that copy content out of a repository: with a repository (or a source) in a sensitive directory they are readers
+GIT_EXPORT = {"clone", "worktree", "mv", "push", "fetch", "pull", "remote", "ls-remote"}  # a sensitive source/repository = a read
+# `file`: only options that do not read a magic/names file or look inside archives; on documents and images it prints
+# metadata (author, title, camera) — a read
+FILE_SPEC = _spec("bihL0", "", "mime mime-type mime-encoding brief dereference no-dereference null".split())
+FILE_METADATA = re.compile(r"\.(?:docx?|xlsx?|pptx?|odt|ods|odp|pdf|jpe?g|png|gif|webp|heic|tiff?|rtf|msg|eml)$", re.I)
+# filters that may follow a lister of a sensitive directory: only options that read stdin and print text
+FILTER_SPECS = {
+    "grep": _spec("ivcnEFGwxoqHhsPzZ", "emABC", "ignore-case invert-match count line-number extended-regexp fixed-strings word-regexp "
+                  "line-regexp only-matching quiet no-messages null null-data no-filename with-filename".split(), "regexp max-count after-context before-context context".split(), ("color",)),
+    "head": _spec("qvz0123456789", "nc", "quiet silent verbose zero-terminated".split(), "lines bytes".split()),
+    "tail": _spec("qvz0123456789", "nc", "quiet silent verbose zero-terminated".split(), "lines bytes".split()),
+    "wc": _spec("lwcmL", "", "lines words bytes chars max-line-length".split()),
+    "sort": _spec("rnuzfbdgMhVRsi", "kt", "reverse numeric-sort unique zero-terminated ignore-case ignore-leading-blanks dictionary-order "
+                  "general-numeric-sort month-sort human-numeric-sort version-sort random-sort stable".split(), "key field-separator".split()),
+    "uniq": _spec("cduiz", "fsw", "count repeated unique ignore-case zero-terminated".split(), "skip-fields skip-chars check-chars".split()),
+    "cut": _spec("szn", "dfcb", "only-delimited complement zero-terminated".split(), "delimiter fields characters bytes output-delimiter".split()),
+    "tr": _spec("cdst", "", "complement delete squeeze-repeats truncate-set1".split()),
+    "column": _spec("tx", "sto", "table".split()),
+    "nl": _spec(""), "tac": _spec(""), "rev": _spec(""), "basename": _spec("as"), "dirname": _spec(""), "cat": _spec("nAbeEstTuv"),
+}
+GH_FILE_LONG = {"field", "raw-field", "body-file", "input", "notes-file", "file", "template", "source"}
+# gh subcommands that run commands or change how gh runs them
+GH_EXEC = {"alias", "extension", "ext", "config", "codespace", "cs", "ssh-key", "browse", "completion"}
+
+
+class QuotedToken(str):
+    """A word that came whole from one quoted fragment: no glob, no brace expansion (issue #19). `quote` is the kind of
+    quote: a single-quoted word is literal text — no `$(…)`, backtick or `$VAR` substitution inside it (issue #23)."""
+
+    quoted = True
+    quote = ""
+
+    def __new__(cls, value: str, quote: str = ""):
+        obj = super().__new__(cls, value)
+        obj.quote = quote
+        return obj
+
+    @property
+    def single(self) -> bool:
+        return self.quote == "'"
+
+
 class Gate:
     def __init__(self, cfg: dict, cwd: str):
         self.cfg = cfg
@@ -397,6 +574,12 @@ class Gate:
         self._public_dirs: dict[str, bool] = {}
         self._phi_under: dict[str, bool] = {}
         self._text = ""  # current Bash command (_touches)
+        self._raw = ""  # the Bash command as given (before heredoc bodies written to files are cut out)
+        self._textual = True  # text arguments are only text (False: the command executes text it prints)
+        self._written: set[str] = set()  # data files the current command writes (a read of one has no verdict yet)
+        self._appears: dict[str, set[int]] = {}  # missing data file → stages that name it
+        self._names_seen: set[tuple[str, ...]] = set()  # stages that listed names inside a sensitive directory (#23)
+        self.notes: dict[str, str] = {}  # why a path without a verdict is denied (describe_verdict)
 
     # --- paths ----------------------------------------------------------------------------------
 
@@ -486,7 +669,15 @@ class Gate:
         if any(e in text for e in self.extensions):
             return not self._files_public(command)
         names = "|".join(re.escape(e.lstrip(".")) for e in self.extensions)
-        return bool(re.search(rf"\{{[^}}]*\b(?:{names})\b", text))
+        if re.search(rf"\{{[^}}]*\b(?:{names})\b", text):
+            return True
+        # a glob that matched nothing before the command ran (`python gen.py; cat out.*`, `cat ./out.cs?`) may match what
+        # the command created: its output is checked for personal data
+        tokens = self._tokens(command) or command.split()
+        return any(re.search(r"[*?\[]", t) and not self._files_public_pattern(t) for t in tokens)
+
+    def _files_public_pattern(self, t: str) -> bool:
+        return self.is_public_tree(self._pattern_root(t))
 
     def _files_public(self, command: str) -> bool:
         """Every file with a data extension named in the command lies in a public place — the output is not checked.
@@ -519,8 +710,12 @@ class Gate:
         ]
         return all(self.is_public_tree(t) for t in (paths if paths and not no_path else [self.cwd]))
 
-    @staticmethod
-    def _commit_message(stage: list[str]) -> set[int]:
+    def _substituting(self, t: str) -> bool:
+        """The word contains a substitution the shell runs. A single-quoted word is literal text (#23) — unless the
+        command feeds text to a shell/interpreter (`echo '$(cat x)' | bash`, see `_executes_text`)."""
+        return bool(SUBSTITUTION.search(t)) and not (getattr(t, "single", False) and self._textual)
+
+    def _commit_message(self, stage: list[str]) -> set[int]:
         """Indices of message text — not a path (a directory name in a change description): `git commit|tag -m …`,
         `gh issue|pr … --title/--body/--search/--comment` (not `--body-file`/`-F`, which read a file) and the query of
         `gh search <kind> …`."""
@@ -540,7 +735,7 @@ class Gate:
             result |= {i + 1 for i, t in enumerate(stage[:-1]) if re.fullmatch(options, t)}
             result |= {i for i, t in enumerate(stage) if t.split("=", 1)[0] in long_options and "=" in t}
         # `-m "$(cat …)"` — the shell runs the substitution: such a message is a command, not text
-        return {i for i in result if i < len(stage) and not SUBSTITUTION.search(stage[i])}
+        return {i for i in result if i < len(stage) and not self._substituting(stage[i])}
 
     @staticmethod
     def _program_text(stage: list[str]) -> set[int]:
@@ -644,8 +839,11 @@ class Gate:
         return {i for i in text if i < len(stage)}
 
     def _text_args(self, stage: list[str]) -> set[int]:
-        """Indices of tokens that are text, not paths: a commit message, and echo/printf arguments (printed back, not
-        read) — except redirections, their targets and tokens with a command substitution."""
+        """Indices of tokens that are text, not paths: a commit message, an issue/PR title or body, and echo/printf
+        arguments (printed back, not read) — except redirections, their targets and tokens with a substitution the
+        shell runs. Not when the command executes text it prints (`_textual`)."""
+        if not self._textual:
+            return set()
         result = self._commit_message(stage)
         if stage and stage[0] in TEXT_COMMANDS:
             targets = self._write_targets(stage)
@@ -657,75 +855,335 @@ class Gate:
                 and t not in REDIRECTS
                 and not re.fullmatch(r"\d*[<>]+&?\d*", t)
                 and not (i > 0 and stage[i - 1] in ("<", "<>", "<&"))
-                and not re.search(r"\$\(|`|<\(", t)
+                and not (re.search(r"\$\(|`|<\(", t) and not getattr(t, "single", False))
             }
         return result
 
-    def _strip_commit_message(self, tokens: list[str] | None, text: str) -> str:
-        """The command text without commit messages and echo/printf text (for the directory-name markers)."""
+    def _safe_receiver(self, core: list[str]) -> bool:
+        """A stage that receives piped text and certainly only filters/prints it: a text filter with allow-listed options
+        (FILTER_SPECS), piigate, or an allow-listed git/gh stage. Everything else — a shell, an interpreter, `at`,
+        `crontab -`, `sudo`, `ssh`, `flock`, `watch`, `xargs`, `sed` (its `e` command) — may run the text."""
+        if not core:
+            return False
+        if self._is_piigate(core[0]):
+            return True
+        if core[0] == "tee":  # prints its input and writes files (a file used again is checked in `_executes_text`)
+            return _allowed([t for t in core[1:] if t.startswith("-")], _spec("ai", "", ("append", "ignore-interrupts"))) is not None
+        if core[0] in FILTER_SPECS:
+            args = [t for t in strip_2to1(core[1:]) if not re.fullmatch(r"\d*[<>]+&?\d*|/dev/null", t)]
+            return _allowed(args, FILTER_SPECS[core[0]]) is not None
+        return self._stage_class(core) == "remote"
+
+    def _safe_stage(self, core: list[str]) -> bool:
+        """A stage that certainly does not run a file or text it is given."""
+        return (
+            Path(core[0]).name in NON_RUNNING
+            or core[0] in FILTER_SPECS
+            or core[0] == "tee"
+            or self._is_piigate(core[0])
+            or self._stage_class(core) in ("remote", "names")
+        )
+
+    def _script_stages(self, tokens: list[str]) -> tuple[list[list[str]], list[tuple[int, int, str]], bool]:
+        """The command's stages (prefixes cut), the write targets (stage, token index, path) and whether text reaches a
+        stage that is not a known filter (a pipe into anything else, `<(…)`, `>(…)`, `| (…)`)."""
+        stages: list[list[str]] = []
+        writes: list[tuple[int, int, str]] = []
+        unsafe_pipe = False
+        piped, previous, stage = False, "", []
+        for t in [*tokens, ";"]:
+            if t == "(" and previous in ("<", ">", "|", "|&"):
+                unsafe_pipe = True
+            if not (t in FORBIDDEN_OPERATORS or t in ("|", "|&") or re.fullmatch(r"[;&|()]+", t)):
+                stage.append(t)
+                previous = t
+                continue
+            parts = self._strip_prefixes([stage]) if stage else []
+            core = parts[-1] if parts else []
+            if stage and piped and not self._safe_receiver(core):
+                unsafe_pipe = True
+            if core:
+                stages.append(core)
+                writes += [(len(stages) - 1, i, os.path.normpath(core[i])) for i in self._write_targets(core) if i < len(core)]
+            piped = t in ("|", "|&")
+            previous, stage = t, []
+        return stages, writes, unsafe_pipe
+
+    def _executes_text(self, tokens: list[str]) -> bool:
+        """Text arguments (a commit message, an issue body, echo/printf) are text only if nothing runs them: every stage
+        that receives piped text is a known filter (allow-list, `_safe_receiver`), there is no process substitution or
+        subshell fed by a pipe, and when the command writes a file (`> s.sh`, `tee`, `-o`) no LATER stage can run it —
+        any stage that is not a known non-running one (a glob or variable as the command word, `./x`, a shell, an
+        interpreter, `eval`, `.`, `for … do`) counts, whatever name the file is given. Otherwise the text is code."""
+        stages, writes, unsafe_pipe = self._script_stages(tokens)
+        if unsafe_pipe:
+            return True
+        if writes:
+            first = min(k for k, _, _ in writes)
+            if any(not self._safe_stage(core) for core in stages[first + 1 :]):
+                return True
+        written = {w for _, _, w in writes if w != "." and not w.startswith("/dev/")}
+        for n, core in enumerate(stages):
+            if self._safe_stage(core):
+                continue
+            # the stage's own write target is not a use of the file — but only where the target really is one
+            # (`> file`, tee, curl -o…); `ssh -o ProxyCommand=./s.sh` or a script name inside a code string is a use
+            plain = core[0] in ("tee", "curl", "wget", "cp", "mv", "install", "rsync", "dd", "sort", "pdftotext")
+            ignore = {i for k, i, _ in writes if k == n and (plain or (i and core[i - 1] in (">", ">>", ">|", "&>", "&>>")))}
+            for i, w in enumerate(core):
+                if i not in ignore and any(name in w for name in written):
+                    return True
+        return False
+
+    def _unvettable_script(self, tokens: list[str]) -> bool:
+        """A file is written from text that the gate cannot read as a literal (`printf '…%s…' x > s.sh`, `echo "$x" >
+        s.sh`) and a later stage may run it: the written code can name a sensitive path built at run time."""
+        stages, writes, _ = self._script_stages(tokens)
+        if not writes:
+            return False
+        first = min(k for k, _, _ in writes)
+        if all(self._safe_stage(core) for core in stages[first + 1 :]):
+            return False
+        for k, _, target in writes:
+            core = stages[k]
+            scripty = re.search(r"\.(?:sh|bash|zsh|ksh|fish|py|pl|rb|js|php|mk)$", target) or "." not in os.path.basename(target)
+            if scripty and core[0] in ("echo", "printf", "cat", "tee") and any(
+                ("%" in t and core[0] == "printf") or (re.search(r"\$", t) and not getattr(t, "single", False)) for t in core[1:]
+            ):
+                return True
+        return False
+
+    def _stage_class(self, stage: list[str]) -> str:
+        """'names' — a program that prints names or metadata, not content (#23): ls, tree, du, find and fd without a
+        content action, stat, file, cd; 'remote' — a git subcommand whose OPTIONS are all on the allow-list (GIT_SPECS)
+        or gh (GitHub): no local file content comes back; '' — anything else, judged as a reader."""
+        cmd = Path(stage[0]).name if stage else ""
+        if not stage or stage[0] != cmd:  # /tmp/ls, ./git — an arbitrary program
+            return ""
+        arguments = stage[1:]
+        if any(self._substituting(t) for t in arguments):
+            return ""
+        if cmd in ("cd", "pushd", "popd"):
+            return "names"
+        if cmd in ("ls", "tree", "du", "find", "fd", "fdfind", "stat", "file"):
+            return "names" if self._lists_only(cmd, arguments) else ""
+        if cmd in COPY_INSIDE:
+            return "names" if self._copies_inside(cmd, arguments) else ""
+        if cmd == "gh":
+            sub = next((t for t in arguments if not t.startswith("-")), "")
+            if any(re.match(r"~[+-]", t) for t in arguments):  # a tilde the gate cannot expand: judged as a reader
+                return ""
+            return "" if sub in GH_EXEC else "remote"
+        if cmd == "git":
+            return "remote" if self._git_call(arguments) is not None else ""
+        return ""
+
+    def _copies_inside(self, cmd: str, arguments: list[str]) -> bool:
+        """cp/mv/install/dd/rsync/ln where EVERY operand (sources and targets) lies in a sensitive directory: the data
+        stays there and the command prints at most names (#23)."""
+        if cmd == "dd":
+            pairs = dict(t.split("=", 1) for t in arguments if "=" in t and not t.startswith("-"))
+            if "of" not in pairs:
+                return False  # without of= dd writes the data to stdout
+            operands = [pairs[k] for k in ("if", "of") if k in pairs]
+        else:
+            operands = [t.split("=", 1)[1] if t.startswith("--") else t for t in arguments if not t.startswith("-") or "=" in t]
+            if len(operands) < 2:
+                return False
+        symbolic = cmd == "ln" and any(re.fullmatch(r"-[a-zA-Z]*s[a-zA-Z]*|--symbolic", t) for t in arguments)
+        resolved = []
+        for k, t in enumerate(operands):
+            if symbolic and k < len(operands) - 1:
+                continue  # a symlink's target is text, relative to the link's directory (below)
+            real = self._operand_locations(t)
+            if real is None:
+                return False
+            resolved += real
+        if symbolic and len(operands) >= 2:
+            # the link's TARGET (relative to the link's directory) must stay in the sensitive directory too: a symlink
+            # that leads out is a way to carry the data away
+            link_dir = os.path.dirname(os.path.join(self.cwd, operands[-1]))
+            for t in operands[:-1]:
+                target = t if os.path.isabs(t) else os.path.join(link_dir, t)
+                resolved.append(os.path.realpath(target))
+        return all(self._resolved_sensitive(p) for p in resolved)
+
+    def _operand_locations(self, t: str) -> list[str] | None:
+        """The real locations a copy operand may name: realpath (`..` and symlinks followed, a missing leaf keeps its
+        parent's), a leading tilde and braces expanded like the shell, every match of a pattern by its own real location
+        (a match may be a symlink leading out); None when the location cannot be known here — a variable, a
+        substitution, or a pattern that climbs out after its prefix (`S/*/../../`, review of #23)."""
+        if re.search(r"[$`]", t):
+            return None
+        result: list[str] = []
+        for w in expand_braces(t):
+            if re.search(r"\{[^{}]*(?:,|\.\.)[^{}]*\}", w):
+                return None  # braces beyond the expansion limit
+            prefix = re.split(r"[*?\[]", w)[0] or "."
+            if prefix == w:
+                result.append(_path(w, self.cwd))
+                continue
+            if ".." in w[len(prefix) :].split("/"):
+                return None
+            pattern = os.path.join(self.cwd, config.expand_tilde(w))  # an absolute pattern replaces cwd
+            result += [_path(prefix, self.cwd)] + [os.path.realpath(m) for m in glob.glob(pattern)]
+        return result
+
+    def _resolved_sensitive(self, p: str) -> bool:
+        """An ALREADY RESOLVED path lies in a sensitive directory (by the real location, never by a name in the text)."""
+        return _inside(p, self.sensitive) or bool(self.sensitive_name and self.sensitive_name in Path(p).parts)
+
+    @staticmethod
+    def _fd_exec(arguments: list[str]) -> bool:
+        """fd runs a command for its results (-x, -X, --exec, --exec-batch, however glued: -xcat, -Hxcat, -x=cat)."""
+        opts, _ = _scan(arguments, "eEtdSxXjcoD", {"extension", "exclude", "type", "max-depth", "min-depth", "size", "exec",
+                                                    "exec-batch", "threads", "color", "changed-within", "changed-before", "owner",
+                                                    "search-path", "base-directory", "path-separator", "ignore-file", "max-results"})
+        return any(name in ("-x", "-X", "--exec", "--exec-batch") for name, *_ in opts)
+
+    def _lists_only(self, cmd: str, arguments: list[str]) -> bool:
+        """The lister prints names/metadata only: no action that runs or reads (find -exec…, fd -x, a names file)."""
+        if any("from" in t.casefold() for t in arguments):  # --fromfile, --files0-from, --files-from
+            return False
+        if cmd == "find":
+            return not any(t in FIND_ACTIONS for t in arguments)
+        if cmd.startswith("fd"):
+            return not self._fd_exec(arguments)
+        if cmd == "file":
+            parsed = _allowed(arguments, FILE_SPEC)
+            return parsed is not None and not any(
+                FILE_METADATA.search(arguments[k]) or re.search(r"[*?\[{]", arguments[k]) for k in parsed[0]
+            )
+        return True
+
+    def _repo_dir(self, repo_dirs: list[str]) -> str:
+        base = self.cwd
+        for d in repo_dirs:
+            base = _path(d, base)
+        return base
+
+    def _git_call(self, arguments: list[str]) -> dict | None:
+        """`git [-C dir]… <subcommand> <options>` when the subcommand is in GIT_SPECS and EVERY option is on its
+        allow-list (no patches, no `-c`/`--exec`/`--upload-pack`, no `-U1`…); else None — the stage is a reader.
+        Returns {sub, args, files (values of file options), repo (directory it works in)}."""
+        repo_dirs: list[str] = []
+        i = 0
+        while i < len(arguments):
+            t = arguments[i]
+            if t == "-C" and i + 1 < len(arguments):
+                repo_dirs.append(arguments[i + 1])
+                i += 2
+            elif t in ("--no-pager", "-P", "--paginate", "-p", "--no-optional-locks"):
+                i += 1
+            elif t.startswith("-"):
+                return None
+            else:
+                break
+        if i >= len(arguments):
+            return None
+        sub, rest = arguments[i], arguments[i + 1 :]
+        if any(t.startswith("ext::") or re.search(r"\$\(|`", t) for t in rest):
+            return None
+        names_option = False
+        if sub == "stash":
+            action = next((t for t in rest if not t.startswith("-")), "push")
+            if action == "list":
+                spec = GIT_LOG
+            elif action == "show":
+                spec, names_option = GIT_DIFF_NAMES, True
+            elif action in ("push", "save", "pop", "apply", "drop", "clear", "branch", "create", "store"):
+                spec = _spec("uaqk", "m", "include-untracked all keep-index no-keep-index quiet staged index".split(), "message pathspec-from-file".split(), (), ("--pathspec-from-file",))
+            else:
+                return None
+        elif sub == "diff":
+            spec, names_option = GIT_DIFF_NAMES, True
+        elif sub == "config":
+            spec = GIT_CONFIG_READ
+        else:
+            spec = GIT_SPECS.get(sub)
+        if spec is None or (parsed := _allowed(rest, spec)) is None:
+            return None
+        positional, files = parsed
+        words = [rest[k] for k in positional]
+        if names_option and not any(
+            name in DIFF_NAMES_ONLY for name, *_ in _scan(rest, spec["s1"], spec["l1"])[0]
+        ):
+            return None  # `git diff` / `stash show` without a names option print the changes themselves
+        if sub == "config" and len(words) > 1:
+            return None  # a key and a value: setting alias.*, core.pager, core.sshCommand… runs commands
+        base = self._repo_dir(repo_dirs)
+        in_sensitive = lambda w: self.path_kind(_path(w, base)) == "sensitive"  # noqa: E731
+        if sub in GIT_EXPORT:
+            leaves = lambda w: not in_sensitive(w)  # noqa: E731
+            if sub == "mv":
+                if words and (any(in_sensitive(w) for w in words[:-1]) or self.path_kind(base) == "sensitive") and leaves(words[-1]):
+                    return None
+            elif sub == "worktree":
+                if words[:1] == ["add"] and len(words) > 1 and self.path_kind(base) == "sensitive" and leaves(words[1]):
+                    return None
+            elif any(in_sensitive(w) for w in words) or (sub == "push" and self.path_kind(base) == "sensitive"):
+                return None
+        return {"sub": sub, "words": words, "files": files, "repo": base}
+
+    @staticmethod
+    def _redirect_sources(stage: list[str]) -> list[str]:
+        return [stage[i + 1] for i, t in enumerate(stage[:-1]) if t in ("<", "<>", "<&")]
+
+    def _remote_paths(self, stage: list[str], c: set[int]) -> list[str]:
+        """The local files a git-metadata / gh stage may read: redirect sources, values of file options (`-F`,
+        `-t`, `--body-file`, `--input`, `-f key=@file`, glued or not), and for gh positional arguments that name a
+        local path or glob (gist create, release upload; a `#label` suffix is cut)."""
+        found = self._redirect_sources(stage)
+        if stage[0] == "git":
+            call = self._git_call(stage[1:]) or {}
+            repo = call.get("repo", self.cwd)  # file options are relative to the repository (`git -C D commit -F x`)
+            return found + [t if os.path.isabs(t) else os.path.join(repo, t) for t in call.get("files", []) if t != "-"]
+        text = self._text_args(stage)
+        opts, positional = _scan(stage[1:], set("FfqtHXRbBdlLmaAecpr"), GH_FILE_LONG)
+        for name, value, _, _ in opts:
+            if not value:
+                continue
+            if name in ("-F", "-f", "--field", "--raw-field"):
+                if "=@" in value:
+                    found.append(value.split("=@", 1)[1])
+                elif value.startswith("@"):
+                    found.append(value[1:])
+                elif "=" not in value:  # api: key=value; secret set -f FILE, issue create -F FILE
+                    found.append(value)
+            elif name in ("--body-file", "--input", "--notes-file", "--file") and value != "-":
+                found.append(value)
+            elif name == "--source":  # `gh repo create --source=DIR --push` uploads the whole directory
+                found.append(value)
+        skip = c | text | self._program_text(stage)
+        candidates = [stage[k + 1] for k in positional if k + 1 not in skip]
+        # any option value that names a local path (`--source=dir`, `gist edit -a FILE`); jq/template programs and text excluded
+        candidates += [v for _, v, i, vi in opts if v and (vi if vi is not None else i) + 1 not in skip]
+        for t in candidates:
+            clean = t.split("#", 1)[0]
+            glob_chars = re.search(r"[*?\[]", clean)
+            local = os.path.lexists(clean if os.path.isabs(clean) else os.path.join(self.cwd, clean))
+            if (glob_chars or local) and (glob_chars or "/" in clean or re.search(r"\.\w+$", clean)):
+                found.append(clean)
+        return found
+
+    def _marker_text(self, tokens: list[str] | None, text: str, protected: bool = False) -> str:
+        """The command text for the directory-name markers: without text arguments (commit messages, issue bodies,
+        echo/printf, search patterns and name filters) and without the stages that print names only or work on
+        GitHub/git metadata (a name in their arguments is not an access). protected=True: names-only stages stay (the
+        filter's own files are off-limits even to `ls`)."""
         if tokens is None:
             return text
-        stages = self._stages_loose(tokens)
-        if not any(self._text_args(e) for e in stages):
-            return text
-        return " ".join(t for e in stages for i, t in enumerate(e) if i not in self._text_args(e))
-
-    def _names_only(self, command: str, tokens: list[str] | None) -> bool:
-        """The command only lists names (ls, find without actions, tree, du) of directories that CONTAIN a filter or
-        sensitive directory (`ls ~`, `find ~ -maxdepth 3 -type d -iname '*proj*'`) — no content comes back. Not inside a
-        sensitive/protected directory; descending into an ancestor of a sensitive directory only by directories (ls
-        without -R, find -type d, tree -d), because data file names can be personal. The other stages (`| grep x`)
-        are judged separately like a normal command."""
-        if tokens is None or "\n" in command.strip() or re.search(r"\$\(|`|<\(|>\(|\$\{", command):
-            return False
-        stages: list[list[str]] = [[]]
-        for t in tokens:
-            if t in (";", "&&", "||", "|", "|&"):
-                stages.append([])
-            elif t in FORBIDDEN_OPERATORS and t not in ("(", ")"):
-                return False
-            else:
-                stages[-1].append(t)
-        rest: list[str] = []
-        listing = 0
-        for stage in (e for e in stages if e):
-            cmd = Path(stage[0]).name
-            if stage[0] != cmd or cmd not in LISTING_COMMANDS:  # /tmp/ls, ./find — no
-                if "(" in stage or ")" in stage:
-                    return False
-                rest += [*stage, ";"]
-                continue
-            listing += 1
-            if any(z in " ".join(stage) for z in self.markers + self.protected_markers):
-                return False
-            arguments = list(stage[1:])
-            if len(arguments) >= 3 and arguments[-1] == "/dev/null" and arguments[-2] == ">" and arguments[-3].isdigit():
-                arguments = arguments[:-3]  # 2 > /dev/null (as the tokenizer splits it)
-            elif len(arguments) >= 2 and arguments[-1] == "/dev/null" and re.fullmatch(r"\d?>|&>", arguments[-2]):
-                arguments = arguments[:-2]
-            if any(t in REDIRECTS or t in FIND_ACTIONS or "from" in t.casefold() for t in arguments):
-                return False  # tree --fromfile, du --files0-from, find -files0-from read names from a file
-            for s in _listing_paths(cmd, arguments) or ["."]:
-                if re.search(r"[*?\[{]", s):
-                    return False  # glob/braces in the path — the inside of a sensitive directory cannot be checked here
-                p = _path(s, self.cwd)
-                if _inside(p, self.protected + self.sensitive) or self._in_project_sensitive(s, p):
-                    return False
-                if _ancestor(p, [k for k in self.sensitive if self._counts_under(k, False, p)]) or self._contains_project_sensitive(p):
-                    if cmd == "ls" and any(re.fullmatch(r"-[a-zA-Z]*R[a-zA-Z]*|--recursive", t) for t in arguments):
-                        return False
-                    if cmd == "find" and not _find_dirs_only(arguments):
-                        return False
-                    if cmd == "du" and not _du_dirs_only(arguments):
-                        return False
-                    if cmd == "tree" and not any(re.fullmatch(r"-[a-zA-Z]*d[a-zA-Z]*", t) for t in arguments):
-                        return False
-        if not listing:
-            return False
-        if not rest:
-            return True
-        kind, _ = self._touches(" ".join(rest), rest)
-        return kind is None
+        parts: list[str] = []
+        for stage in self._stages_loose(tokens):
+            for core in self._strip_prefixes([stage]):
+                kind = self._stage_class(core)
+                if kind == "remote" or (kind == "names" and not protected):
+                    continue
+                skip = self._text_args(core) | self._searcher_args(core)[0]
+                if not protected:
+                    skip |= self._write_targets(core)  # writing into a directory shows nothing
+                parts += [t for i, t in enumerate(core) if i not in skip]
+        return " ".join(parts)
 
     def _in_project_sensitive(self, s: str, p: str) -> bool:
         """The path (as given or resolved) passes through a directory named `project_directories.sensitive`."""
@@ -795,7 +1253,8 @@ class Gate:
         self, s: str, *, ancestor: bool = False, content: bool = True, searching: bool = False, protected: bool = True
     ) -> str | None:
         """'protected' | 'sensitive' | 'extension' | None; ancestor=True — also a directory containing a sensitive one.
-        content=True: a file with an extension whose content the rules found clean is not 'extension'.
+        'extension' = an EXISTING file with a data extension whose content has personal data or cannot be checked
+        (#23: a missing file, a directory and a clean file are None). content=False: a write target — not judged.
         searching=True (Grep): in-project data directories hidden by `.gitignore` do not make an ancestor sensitive.
         protected=False: protected directories are not checked (a pattern that cannot reach them)."""
         p = _path(s, self.cwd)
@@ -813,24 +1272,24 @@ class Gate:
             or self._in_project_sensitive(s, p)
         ):
             return "sensitive"
-        if self.has_extension(p):
-            if content:
-                w = self.verdicts[p] = self.verdicts.get(p) or self.judge.file(p)
-                if w.result == verdict.CLEAN:
-                    return None
-            return "extension"
+        if content and self.has_extension(p) and os.path.isfile(p):
+            # #23: only an existing file has content to judge (a missing one is being created; names are not content)
+            w = self.verdicts[p] = self.verdicts.get(p) or self.judge.file(p)
+            if w.result != verdict.CLEAN:
+                return "extension"
         return None
 
     def describe_verdict(self, s: str) -> str:
         """Why a file with an extension is denied — categories and counts or the reason, without values."""
-        w = self.verdicts.get(_path(s, self.cwd))
+        p = _path(s, self.cwd)
+        if note := self.notes.get(p) or self.notes.get(s):
+            return note
+        w = self.verdicts.get(p)
         if w is None or w.result == verdict.CLEAN:
-            return (
-                "a file type that usually holds personal data (a pattern or a write target — its content cannot be checked)"
-            )
+            return "a data file whose content cannot be checked before the command runs"
         if w.result == verdict.PERSONAL:
             return f"the file contains personal data (filter rules: {w.description})"
-        return f"a file type that usually holds personal data, and its content cannot be checked: {w.description}"
+        return f"the file's content cannot be checked, so it may hold personal data: {w.description}"
 
     def _path_reason(self, kind: str, s: str, tool: str) -> str:
         if kind == "protected":
@@ -844,6 +1303,8 @@ class Gate:
             if kind == "sensitive"
             else self.describe_verdict(s)
         )
+        if kind == "extension":  # a false positive: only a human exempts a single file (the model cannot edit the config)
+            what += f"; if it is a false positive, a human can add the path {_path(s, self.cwd)} to `sources.exempt_directories`"
         if tool in ("Edit", "Write", "NotebookEdit"):
             return f"piigate: {tool} on {s} denied — {what} (the edit result shows the file content). {HINT}"
         return f"piigate: direct read of {s} denied — {what}. {HINT}"
@@ -855,26 +1316,29 @@ class Gate:
             return reason
         if tool in ("Read", "Edit", "Write", "NotebookEdit"):
             s = tool_input.get("file_path") or tool_input.get("notebook_path") or ""
+            # Write: new content from the model, nothing comes back (a data file is not judged); a missing file has no content
             kind = self.path_kind(s, content=tool != "Write") if s else None
-            if kind == "extension" and tool == "Write":
-                return None  # a new CSV/SQL file with content from the model — nothing sensitive comes back
+            if tool == "Write" and kind in ("sensitive", "extension"):
+                kind = None  # #23: Write returns nothing of the file (Edit and Read show it)
             return self._path_reason(kind, s, tool) if kind else None
         if tool in ("Grep", "Glob"):
             s = tool_input.get("path") or self.cwd
             # an rg glob takes precedence over .gitignore — with one, Grep would enter the data directory
-            kind = self.path_kind(s, ancestor=True, searching=tool == "Grep" and not tool_input.get("glob"))
-            if kind in ("protected", "sensitive") or (kind == "extension" and tool == "Grep"):
+            if tool == "Glob":
+                # #23: file names are not content — Glob is denied only inside the filter's own directories
+                if self.path_kind(s) == "protected":
+                    return self._path_reason("protected", s, tool)
+                patterns = " ".join(str(tool_input.get(k) or "") for k in ("pattern", "glob", "type")).casefold()
+                if any(z.casefold() in patterns for z in self.protected_markers):
+                    return f"piigate: {tool} reaches into the filter's files (pattern). {HINT}"
+                return None
+            kind = self.path_kind(s, ancestor=True, searching=not tool_input.get("glob"))
+            if kind in ("protected", "sensitive", "extension"):
                 return self._path_reason(kind, s, tool)
-            patterns = " ".join(
-                str(tool_input.get(k) or "") for k in ("pattern", "glob", "type") if tool == "Glob" or k != "pattern"
-            ).casefold()
+            patterns = " ".join(str(tool_input.get(k) or "") for k in ("glob", "type")).casefold()
             if any(z.casefold() in patterns for z in self.markers + self.protected_markers):
                 return f"piigate: {tool} reaches into a sensitive directory (pattern). {HINT}"
-            if (
-                tool == "Grep"
-                and any(e.lstrip(".") in patterns for e in self.extensions)
-                and (reason := self._grep_by_files(s, tool_input))
-            ):
+            if any(e.lstrip(".") in patterns for e in self.extensions) and (reason := self._grep_by_files(s, tool_input)):
                 return f"piigate: Grep over {patterns.strip()} files denied — {reason}. {HINT}"
             return None
         if tool == "Bash":
@@ -887,13 +1351,13 @@ class Gate:
         """Grep with a data-extension glob/type: None when every matching file has clean content (file count limited by
         the configuration); otherwise the reason. The file list comes from `rg --files` with the same `--glob`/`--type`
         (the same glob engine as Grep), with `--hidden --no-ignore` — more files than Grep will search; an rg error = deny."""
-        glob = str(tool_input.get("glob") or "").strip()
+        globs = str(tool_input.get("glob") or "").strip()
         type_ = str(tool_input.get("type") or "").strip()
         directory = _path(s, self.cwd)
         if not os.path.isdir(directory):
-            return None if os.path.isfile(directory) else "the path does not exist"  # path_kind has already checked a file
+            return None  # a file (path_kind has already judged it) or a missing path (no content)
         arguments = ["rg", "--files", "--null", "--hidden", "--no-ignore", "--no-config", "--glob", "!.git"]
-        for part in glob.split():  # Grep: parts separated by spaces and by commas outside braces
+        for part in globs.split():  # Grep: parts separated by spaces and by commas outside braces
             arguments += [a for g in re.split(r",(?![^{]*\})", part) if g for a in ("--glob", g)]
         if type_:
             arguments += ["--type", type_]
@@ -971,22 +1435,25 @@ class Gate:
 
     @staticmethod
     def _substitutions(text: str) -> list[str]:
-        """Contents of $(…), <(…), >(…) and `…` outside single quotes (substitution works in double quotes too)."""
-        result, i, apostrophe = [], 0, False
+        """Contents of $(…), <(…), >(…) and `…` that the shell runs: unquoted or in double quotes, never inside single
+        quotes (#23: a single-quoted word is literal — its backticks and `$(` are text)."""
+        result, i, single, double = [], 0, False, False
         while i < len(text):
             z = text[i]
-            if apostrophe:
-                apostrophe = z != "'"
+            if single:
+                single = z != "'"
             elif z == "\\":
                 i += 1
-            elif z == "'" and text.count('"', 0, i) % 2 == 0:
-                apostrophe = True
+            elif z == "'" and not double:
+                single = True
+            elif z == '"':
+                double = not double
             elif z == "`":
                 j = text.find("`", i + 1)
                 j = len(text) if j < 0 else j
                 result.append(text[i + 1 : j])
                 i = j
-            elif z in "$<>" and text[i + 1 : i + 2] == "(":
+            elif (z == "$" or (z in "<>" and not double)) and text[i + 1 : i + 2] == "(":
                 depth, j = 1, i + 2
                 while j < len(text) and depth:
                     depth += {"(": 1, ")": -1}.get(text[j], 0)
@@ -995,6 +1462,26 @@ class Gate:
                 i = j - 1
             i += 1
         return result
+
+    @staticmethod
+    def _without_single_quoted(command: str) -> str:
+        """The command with the insides of single-quoted words emptied (`'…'` → `''`): what the local shell may expand."""
+        result, single, double, i = [], False, False, 0
+        while i < len(command):
+            z = command[i]
+            if single:
+                if z == "'":
+                    single = False
+                    result.append(z)
+            elif z == "\\" and i + 1 < len(command):
+                result.append(command[i : i + 2])
+                i += 1
+            else:
+                single = z == "'" and not double
+                double = double != (z == '"')
+                result.append(z)
+            i += 1
+        return "".join(result)
 
     def _invocations(self, command: str, names: set[str], depth: int = 0) -> list[list[str] | None]:
         """Where the command RUNS one of `names` (matched by the base name, also glued from quotes): the argv of each
@@ -1130,13 +1617,14 @@ class Gate:
     @staticmethod
     def _tokens(command: str) -> list[str] | None:
         # an unquoted newline separates commands like `;` (issue #21): shlex would treat it as blank space, and
-        # `echo x<newline>cat <dir>/a.txt` would look like one `echo` stage. It becomes the token "\n"; a
-        # backslash-newline is a line continuation (blank space).
+        # `echo x<newline>cat <dir>/a.txt` would look like one `echo` stage. It becomes the token "\n". A
+        # backslash-newline is removed and joins the words around it, as in bash (`Sens\<nl>itive` is one word).
         marked, quote, i = [], "", 0
         while i < len(command):
             z = command[i]
             if z == "\\" and quote != "'" and i + 1 < len(command):
-                marked.append(" " if command[i + 1] == "\n" and not quote else command[i : i + 2])
+                if command[i + 1] != "\n":
+                    marked.append(command[i : i + 2])
                 i += 2
                 continue
             if quote:
@@ -1147,13 +1635,61 @@ class Gate:
                 z = " \x00 "
             marked.append(z)
             i += 1
-        lex = shlex.shlex("".join(marked), posix=True, punctuation_chars=";&|()<>")
+        text = "".join(marked)
+        lex = shlex.shlex(text, posix=True, punctuation_chars=";&|()<>")
         lex.whitespace_split = True
         lex.commenters = ""
         try:
-            return ["\n" if t == "\x00" else t for t in lex]
+            words = list(lex)
         except ValueError:
             return None
+        flags = Gate._quoted_words(text)
+        if flags is None or len(flags) != len(words):
+            flags = [""] * len(words)
+        return [QuotedToken(t, q) if q else ("\n" if t == "\x00" else t) for t, q in zip(words, flags)]
+
+    @staticmethod
+    def _quoted_words(text: str) -> list[str] | None:
+        """For every token of `text` (as shlex splits it): the quote character (`'` or `"`) when the token is one whole
+        quoted fragment, alone or after `--option=` — the shell neither globs nor brace-expands it — otherwise "". A
+        token with any unquoted character, escaped or not (`''*`, `'a'b`, `\\*`), is not. None when the scan cannot be
+        trusted."""
+        flags: list[str] = []
+        i, n = 0, len(text)
+        while i < n:
+            z = text[i]
+            if z in " \t\r":
+                i += 1
+            elif z in ";&|()<>":
+                while i < n and text[i] in ";&|()<>":
+                    i += 1
+                flags.append("")
+            else:
+                before, quotes, after, quote = "", 0, False, ""
+                while i < n and text[i] not in " \t\r;&|()<>":
+                    z = text[i]
+                    if z == "\\":
+                        after = after or quotes > 0
+                        before += "\\" if not quotes else ""
+                        i += 2
+                    elif z in "'\"":
+                        j = i + 1
+                        while j < n and text[j] != z:
+                            j += 2 if z == '"' and text[j] == "\\" else 1
+                        if j >= n:
+                            return None
+                        after = after or quotes > 0
+                        quotes += 1
+                        quote = z
+                        i = j + 1
+                    else:
+                        if quotes:
+                            after = True
+                        else:
+                            before += z
+                        i += 1
+                flags.append(quote if quotes == 1 and not after and re.fullmatch(r"(?:--[\w-]+=)?", before) else "")
+        return flags
 
     def _token_kind(
         self, t: str, recursion: bool, content: bool = True, literal: bool = False, verbatim: bool = False
@@ -1191,17 +1727,74 @@ class Gate:
                         r = self._pattern_hits_dir(directory, k.rsplit("/", 1)[-1])
                     if r:
                         return r, directory
-                    if (
-                        re.search(r"\.[\w*?\[\]]*$", k)
-                        and (k.casefold().endswith(self.extensions) or (not literal and self._pattern_hits_extension(k)))
-                        and not _inside(_path(directory, self.cwd), self.system)
-                        and not self.is_public_tree(directory)
-                    ):
-                        return "extension", k  # *.csv or *.c?v / *.*
+                    # #23: a glob is expanded; every match is judged by its content (no match — no content)
+                    if content and (r := self._glob_kind(k, recursion, literal)):
+                        return r
                     continue
                 r = self.path_kind(k, ancestor=recursion, content=content)
                 if r:
                     return r, k
+        return None
+
+    def _glob_kind(self, k: str, recursion: bool, literal: bool) -> tuple[str, str] | None:
+        """A glob (`*.csv`, `dir/*`): the files it matches NOW, each judged like a plain path (a match in a sensitive
+        directory, a data file with personal data or an unverifiable one); a data file the command writes and the
+        pattern would match is denied too (its content comes after the check). `literal` (text of a heredoc read by a
+        non-shell): only a pattern ending in a data extension counts. More than GLOB_LIMIT data files — denied."""
+        if literal and not k.casefold().endswith(self.extensions):
+            return None
+        pattern = config.expand_tilde(os.path.expandvars(k))
+        pattern = pattern if os.path.isabs(pattern) else os.path.join(self.cwd, pattern)
+        matches, deadline = [], time.monotonic() + 3
+        for m in glob.iglob(pattern, recursive=True):
+            matches.append(m)
+            if len(matches) > 20000 or time.monotonic() > deadline:
+                return self._note("extension", pattern, "the pattern matches too many files to check in the gate — narrow it")
+        judged = 0
+        for m in sorted(matches):
+            p = os.path.realpath(m)
+            if self.has_extension(p) and os.path.isfile(p):
+                judged += 1
+                if judged > GLOB_LIMIT:
+                    return self._note(
+                        "extension", pattern, f"the pattern matches over {GLOB_LIMIT} data files — too many to check in the gate"
+                    )
+            if r := self.path_kind(m, ancestor=recursion):
+                return r, m
+        for w in sorted(self._written):
+            if fnmatch.fnmatchcase(w, pattern):
+                return self._note("extension", w, "a data file this command writes and the pattern would read — checked only after it runs")
+        return None
+
+    def _note(self, kind: str, what: str, note: str) -> tuple[str, str]:
+        """A denial that has no file verdict: remembered for the message."""
+        self.notes[what] = note
+        return kind, what
+
+    def _walk_data(self, root: str) -> tuple[str, str] | None:
+        """A content search (grep -r --include=*.csv, find … -exec) from `root`: the data files under it, each judged by
+        its content. Not for a public tree; entries or data files over the limits — denied as a precaution."""
+        base = _path(root, self.cwd)
+        if self.is_public_tree(root):
+            return None
+        if os.path.isfile(base):
+            return (kind, root) if (kind := self.path_kind(base)) else None
+        judged = visited = 0
+        for directory, names, files in os.walk(base):
+            names[:] = [n for n in names if n != ".git"]
+            visited += len(names) + len(files)
+            if visited > WALK_LIMIT:
+                return self._note("extension", base, "the tree is too large to check its data files in the gate — narrow the path")
+            for name in files:
+                p = os.path.join(directory, name)
+                if self.has_extension(p):
+                    judged += 1
+                    if judged > GLOB_LIMIT:
+                        return self._note(
+                            "extension", base, f"over {GLOB_LIMIT} data files under it — too many to check in the gate"
+                        )
+                    if kind := self.path_kind(p):
+                        return kind, p
         return None
 
     def _literal_kind(
@@ -1288,6 +1881,21 @@ class Gate:
                         skip.add(i + 1)
                         filters.append(stage[i + 1])
                         i += 1
+                elif family == "grep" and not name.startswith("--"):
+                    # a short cluster: the first option that takes a value ends it (`-ie pat`, `-A3`, `-d recurse`,
+                    # `-drecurse`); the value of -m/-A/-B/-C/-d/-D is not a pattern or a path
+                    for j, c in enumerate(name[1:], 1):
+                        if c in "ef":
+                            from_option = True
+                            break
+                        if c in "mABCdD":
+                            if not name[j + 1 :] and not eq and i + 1 < len(stage):
+                                skip.add(i + 1)
+                                i += 1
+                            break
+                elif family == "grep" and not eq and name in ("--directories", "--devices") and i + 1 < len(stage):
+                    skip.add(i + 1)
+                    i += 1
                 elif pattern_option and pattern_option.match(name):
                     from_option = True
             else:
@@ -1295,7 +1903,11 @@ class Gate:
             i += 1
         if family in ("grep", "rg", "ag", "fd") and positional and not from_option:
             skip.add(positional.pop(0))  # the first positional argument is the pattern
-        recursive = family in ("rg", "ag", "fd") or any(RECURSIVE_FLAGS.match(t) for t in stage[1:])
+        recursive = (
+            family in ("rg", "ag", "fd")
+            or any(RECURSIVE_FLAGS.match(t) for t in stage[1:])
+            or (family == "grep" and GREP_RECURSE.search(" ".join(stage)) is not None)
+        )
         return skip, filters, family != "find" and recursive and not positional
 
     def _data_filter(self, v: str) -> bool:
@@ -1383,7 +1995,11 @@ class Gate:
         dests |= {i for i, t in enumerate(stage) if i and re.match(r"^--(?:output|out)=", t)}
         cmd = Path(stage[0]).name if stage else ""
         if cmd == "tee":
-            dests |= {i for i, t in enumerate(stage) if i and not t.startswith("-") and t not in REDIRECTS}
+            dests |= {
+                i
+                for i, t in enumerate(stage)
+                if i and not t.startswith("-") and t not in REDIRECTS and stage[i - 1] not in ("<", "<>", "<&")
+            }
         if cmd in ("cp", "mv") and not any(
             t in REDIRECTS or re.match(r"^-[a-zA-Z]*t|^--target", t) for t in stage[1:]
         ):
@@ -1396,9 +2012,18 @@ class Gate:
         """The strongest reason: protected > sensitive > command > extension."""
         text = command.replace("\\ ", " ")
         self._text = text
-        if any(z in self._strip_commit_message(tokens, text) for z in self.protected_markers):
+        saved = (self._textual, self._written, self._appears)
+        self._textual = not self._executes_text(tokens)
+        try:
+            return self._touches_inner(command, tokens, text)
+        finally:
+            self._textual, self._written, self._appears = saved
+            self._text = text
+
+    def _touches_inner(self, command: str, tokens: list[str], text: str) -> tuple[str | None, str]:
+        if any(z in self._marker_text(tokens, text, protected=True) for z in self.protected_markers):
             return "protected", "a filter file"
-        if re.search(r"PIIGATE_\w+|XDG_DOCUMENTS_DIR", text):
+        if re.search(r"PIIGATE_\w+|XDG_DOCUMENTS_DIR", self._marker_text(tokens, text, protected=True)):
             return "protected", "PIIGATE_* / XDG_DOCUMENTS_DIR variables (they change where the filter looks)"
         stages, dirs = [], []
         for stage, ds in zip(self._stages_loose(tokens), self._stage_dirs(command, tokens)):
@@ -1408,29 +2033,49 @@ class Gate:
         outside, literal, verbatim, body = self._heredoc_text(text)
         kinds: dict[str, str] = {}
         dests = [self._write_targets(stage) for stage in stages]
-        # paths the command reads (everything except write targets) — a write target read in the same command
-        # (`curl … > x.csv; cat x.csv`) gets its content only after the gate's check
-        read_paths = {
-            _path(k, d)
-            for stage, c, ds in zip(stages, dests, dirs)
-            for d in ds
-            for i, t in enumerate(stage)
-            if i not in c
-            for k in (t, t.split("=", 1)[-1])
-            if k and not re.fullmatch(r"[|<>&;()]+|\d?>&?\d?", k)
-        }
+        # data files the command writes, and the stages that name a data file which does not exist yet: such a file gets
+        # its content only after the gate's check (`curl … > x.csv; cat x.csv`, `python gen.py x.csv && cat x.csv`)
+        self._written, self._appears = set(), {}
+        for n, (stage, c, ds) in enumerate(zip(stages, dests, dirs)):
+            for d in ds:
+                for i, t in enumerate(stage):
+                    if not t or re.fullmatch(r"[|<>&;()]+|\d?>&?\d?", t):
+                        continue
+                    for k in {t, t.split("=", 1)[-1]}:
+                        p = _path(k, d)
+                        if not p.casefold().endswith(self.extensions) or not self.has_extension(p):
+                            continue
+                        if i in c:
+                            self._written.add(p)
+                        if not os.path.exists(p):
+                            self._appears.setdefault(p, set()).add(n)
         own = self.cwd
         try:
             for stage, c, ds in zip(stages, dests, dirs):
                 for d in ds:  # every directory the stage may run in (issue #18: `cd sub && ls -d */`)
                     self.cwd = d
-                    for r in self._stage_kinds(stage, c, text, literal, verbatim, body, read_paths):
+                    for r in self._stage_kinds(stage, c, text, literal, verbatim, body):
                         if d != own and os.path.lexists(_path(r[1], d)):
                             r = (r[0], _path(r[1], d))  # the message resolves `what` against the session directory
                         kinds.setdefault(*r)
         finally:
             self.cwd = own
-        paths_text = self._strip_commit_message(tokens, text)
+        # seeding: writing a file that runs later (.git/hooks, shell rc files, autostart, cron) in a command that names a
+        # sensitive path — the text written may be a command that reads it
+        mentions = (self._raw or text).casefold()
+        if any(m.casefold() in mentions for m in self.markers) or "sensitive" in kinds:
+            for stage, c, ds in zip(stages, dests, dirs):
+                for d in ds:
+                    targets = [_path(stage[i], d) for i in c if i < len(stage)]
+                    if stage[0] == "crontab":
+                        targets.append("/var/spool/cron/")
+                    if any(re.match(r"(?:BASH_ENV|ENV)=", t) for t in stage):
+                        targets.append("/BASH_ENV/ENV variable (a file that every shell starts with)")
+                    if hit := next((t for t in targets if SEEDING.search(t)), None):
+                        kinds.setdefault("sensitive", f"{hit} (a file that runs later, in a command naming a sensitive path)")
+        if self._unvettable_script(tokens):
+            kinds.setdefault("sensitive", "a script written from text built at run time and then run in the same command")
+        paths_text = self._marker_text(tokens, text)
         for z in self.markers:
             if z in paths_text:
                 kinds.setdefault("sensitive", z)
@@ -1438,67 +2083,133 @@ class Gate:
         for w in self.commands:
             if w.search(queries_text):
                 kinds.setdefault("command", "a database query on a server")
-        # substitutions inside quotes (`echo "$(cat x.csv)"`, backticks) stay one token above — checked as commands
+        # substitutions inside quotes (`echo "$(cat x.csv)"`, backticks) stay one token above — checked as commands, in
+        # every directory a stage may run in (`cd sub && echo "$(cat ../x.csv)"` reads from sub, not the session dir)
+        everywhere = list(dict.fromkeys(d for ds in dirs for d in ds)) or [own]
         for inner in self._substitutions(outside):
             if inner.strip() and inner.strip() != text.strip():
-                r, w = self._touches(inner, self._tokens(inner) or inner.split())
-                if r:
-                    kinds.setdefault(r, w)
-        self._text = text
+                try:
+                    for d in everywhere:
+                        self.cwd = d
+                        r, w = self._touches(inner, self._tokens(inner) or inner.split())
+                        if r:
+                            kinds.setdefault(r, _path(w, d) if d != own and os.path.lexists(_path(w, d)) else w)
+                finally:
+                    self.cwd = own
         for r in ("protected", "sensitive", "command", "extension"):
             if r in kinds:
                 return r, kinds[r]
         return None, ""
 
+    @staticmethod
+    def _chain_safe(stage: list[str]) -> bool:
+        """A stage that certainly keeps the working directory and runs no shell or other code: a plain (unwrapped,
+        no assignments) reader or lister from CHAIN_SAFE without an option that executes something."""
+        if not stage or stage[0] not in CHAIN_SAFE:
+            return False
+        cmd = stage[0]
+        for t in stage[1:]:
+            if cmd == "find" and t in FIND_ACTIONS:
+                return False
+            if cmd == "rg" and t.startswith(("--pre", "--hostname-bin")):
+                return False
+            if cmd == "fd" and (t in ("-x", "-X") or t.startswith(("--exec", "-x", "-X"))):
+                return False
+        return True
+
+    @staticmethod
+    def _cd_target(stage: list[str]) -> str | None:
+        """The literal directory of `cd X` / `cd -L|-P X` / `pushd X` (redirections ignored), None for anything else —
+        `cd -`, `cd ~-`, `cd $X`, a glob, `pushd -n X`, `pushd +1`, a second operand."""
+        if stage[0] not in ("cd", "pushd"):
+            return None
+        args, skip = [], 0
+        for j, a in enumerate(stage[1:], 1):  # without redirections (`cd x 2>/dev/null`, `cd x &>f`)
+            follows = stage[j + 1] if j + 1 < len(stage) else ""
+            if skip:
+                skip -= 1
+            elif a in REDIRECTS or re.fullmatch(r"\d?>&?|&>>?", a):
+                skip = 1  # the file after it
+            elif a.isdigit() and (follows in REDIRECTS or re.fullmatch(r"\d?>&?|&>>?", follows)):
+                skip = 2  # the descriptor, the operator and the file
+            else:
+                args.append(a)
+        while args and (args[0] == "--" or (stage[0] == "cd" and args[0] in ("-L", "-P"))):
+            args.pop(0)
+        if len(args) > 1:
+            return None
+        target = args[0] if args else "~"
+        if not target or target[0] in "-+" or re.search(r"[$`*?\[\]{}\\()!]", target):
+            return None
+        if "~" in target and target != "~" and not target.startswith("~/"):
+            return None
+        return target
+
     def _stage_dirs(self, command: str, tokens: list[str]) -> list[list[str]]:
-        """For every stage of _stages_loose: the directories it may run in. `cd X` / `pushd X` with a literal X moves
-        the stages joined to it by `&&` to X; after any other operator (`;`, `||`, `|`, `&`, parentheses — the cd may
-        have failed or run in a subshell) a stage may run in any directory seen so far. A non-literal target (`cd -`,
-        `cd "$D"`) and a multi-line command keep the session directory among the candidates."""
-        sure = [self.cwd]  # where the stage runs when every `&&` before it succeeded
+        """For every stage of _stages_loose: the directories it may run in (the session directory is always one).
+        The directory is narrowed only while the command is a chain of `&&` that consists of `cd X` / `pushd X` with a
+        literal X and plain readers or listers (CHAIN_SAFE): then each stage runs in the last literal target. Anything
+        else — another operator (`;`, `||`, `|`, `&`, a newline, a parenthesis), a wrapper (`builtin`, `command`, `env`,
+        `eval`), an assignment, a function or alias, `popd`, a non-literal `cd` (`cd -`, `cd "$D"`), a shell — ends the
+        narrowing for the rest of the command: from there every stage is checked in the session directory and in every
+        directory the literal `cd`s reached (relative to each of them). `cd` through CDPATH is not followed."""
         seen = [self.cwd]  # every directory a stage may run in
-        multiline = "\n" in command.strip()
+        sure = [self.cwd]  # where the stage runs while the narrowing holds
+        narrow = True
         result: list[list[str]] = []
         stage: list[str] = []
-        previous = ";"  # the operator before the stage
+        depth = 0
         for t in [*tokens, ";"]:
+            if t in ("(", ")") and self._find_paren(stage, t, depth):
+                depth += 1 if t == "(" else -1
+                stage.append(t)
+                continue
             if not (t in FORBIDDEN_OPERATORS or t in ("|", "|&") or re.fullmatch(r"[;&|()]+", t)):
                 stage.append(t)
                 continue
+            depth = 0
             if stage:
-                result.append(list(sure))
-                args, skip = [], 0
-                for j, a in enumerate(stage[1:], 1):  # without options and redirections (`cd x 2>/dev/null`, `cd x &>f`)
-                    follows = stage[j + 1] if j + 1 < len(stage) else ""
-                    if skip:
-                        skip -= 1
-                    elif a in REDIRECTS or re.fullmatch(r"\d?>&?|&>>?", a):
-                        skip = 1  # the file after it
-                    elif a.isdigit() and (follows in REDIRECTS or re.fullmatch(r"\d?>&?|&>>?", follows)):
-                        skip = 2  # the descriptor, the operator and the file are skipped
-                    elif a not in ("-L", "-P", "--"):
-                        args.append(a)
-                if Path(stage[0]).name in ("cd", "pushd") and len(args) <= 1 and not multiline:
-                    target = args[0] if args else "~"
-                    if re.fullmatch(r"~?[^$`~*?\[\]{}\\]*", target) and target != "-":
-                        moved = [_path(target, d) for d in sure]
-                        # after `||`, `|`, `&` the cd may have been skipped (`true || cd x && ls` runs ls where it was)
-                        sure = moved if previous in (";", "&&", "\n", "(") else [*seen, *moved]
-                        seen += [d for d in moved if d not in seen]
-                elif Path(stage[0]).name in ("popd",):
-                    sure = list(seen)
+                target = self._cd_target(stage)
+                if narrow and target is None and not self._chain_safe(stage):
+                    narrow = False
+                result.append(list(sure if narrow else seen))
+                if target is not None:
+                    moved = [_path(target, d) for d in (sure if narrow else seen)]
+                    seen += [d for d in moved if d not in seen]
+                    if narrow:
+                        sure = moved
                 stage = []
             if t != "&&":
-                sure = list(seen)
-            previous = t
+                narrow = False
         return result
 
+    @staticmethod
+    def _ls_plain(stage: list[str]) -> bool:
+        """An `ls` that certainly does not recurse: only short option clusters, `--` and a few known long options (GNU
+        ls accepts abbreviated long options, so any other long one — `--recur` — is not trusted)."""
+        for t in stage[1:]:
+            if t == "--":
+                break
+            if t.startswith("--"):
+                if t.split("=", 1)[0] not in LS_LONG_PLAIN:
+                    return False
+            elif t.startswith("-") and not re.fullmatch(r"-[A-QS-Za-z0-9]*", t):
+                return False
+        return True
+
     def _stage_kinds(
-        self, stage: list[str], c: set[int], text: str, literal, verbatim, body: str, read_paths: set[str]
+        self, stage: list[str], c: set[int], text: str, literal, verbatim, body: str
     ) -> list[tuple[str, str]]:
         """Reasons the stage touches data, resolved against self.cwd."""
         found: list[tuple[str, str]] = []
         cmd = Path(stage[0]).name if stage else ""
+        kind_of_stage = self._stage_class(stage)
+        original = tuple(stage)
+        if kind_of_stage == "remote":  # git metadata / gh: only the local files it is told to read
+            if cmd == "git":  # `git ls-files Sensitive-data` prints names — they must not be piped on to a reader
+                call = self._git_call(stage[1:]) or {}
+                self._record_names(stage, [call.get("repo", self.cwd), *call.get("words", [])])
+            return [r for t in self._remote_paths(stage, c) if (r := self._token_kind(t, False))]
         # grep without -r/-R/-d recurse reads only the given files (skips directories) — the pattern `../x*.yml`
         # does not reach subdirectories; rg, fd, ag, find… search the tree by default
         recursion = (
@@ -1520,38 +2231,154 @@ class Gate:
             no_path = not _listing_paths(cmd, arguments)
         skip |= self._text_args(stage)
         program = self._program_text(stage)
-        for v in filters:  # --include=*.csv, -t csv: the name filter reaches for data files
-            if self._data_filter(v) and not self._stage_public(stage, skip, no_path):
-                found.append(("extension", v))
         family = FAMILIES.get(cmd)
+        if kind_of_stage != "names" and any(self._data_filter(v) for v in filters) and self._reads_content(stage, family):
+            # #23: a name filter (--include=*.csv, -t csv) is not a denial by itself — the data files it can reach are
+            # judged by their content
+            roots = [
+                t
+                for i, t in enumerate(stage)
+                if i and i not in skip and not t.startswith("-") and not re.fullmatch(r"[|<>&;()]+|\d?>&?\d?", t)
+            ]
+            if family == "find":
+                roots = _listing_paths(cmd, stage[1:])
+            for root in roots if roots and not no_path else [self.cwd]:
+                if r := self._walk_data(root):
+                    found.append(r)
+        if cmd == "git":  # `git show HEAD:dir/file`, `git cat-file -p :file` — a path in the repository, from its root
+            root = config.git_root(self.cwd) or self.cwd
+            for t in stage[1:]:
+                if m := re.fullmatch(r"[\w.^~@{}/-]*:(?!/)(.+)", t):
+                    if r := self._token_kind(os.path.join(root, m.group(1)), False):
+                        found.append(r)
         if no_path:  # rg foo, fd php, grep -r foo — they search cwd
             stage = [*stage, "."]
         for i, t in enumerate(stage):
             if i in skip or not t or re.fullmatch(r"[|<>&;()]+|\d?>&?\d?", t):
                 continue
+            if i == 0 and re.fullmatch(r"[\w.+@-]+", t) and not t.casefold().endswith(self.extensions):
+                continue  # the command word is looked up in PATH, not in the working directory (`cd D && pwd`)
+            read = i not in c and kind_of_stage != "names"  # a write target and a name listing read no content
             if family in IGNORE_FILES and i and self._ignore_excludes(t, family, stage):
-                r = self._token_kind(t, False, content=i not in c)  # sensitive directories under t are skipped (.ignore)
+                r = self._token_kind(t, False, content=read)  # sensitive directories under t are skipped (.ignore)
                 if not r and _ancestor(_path(t, self.cwd), self.protected):
                     r = ("protected", t)
-            elif i in program and re.search(
-                rf"(['\"]){re.escape(t)}\1" if not t.startswith("--") or "=" not in t
-                else rf"{re.escape(t.split('=', 1)[0])}=(['\"]){re.escape(t.split('=', 1)[1])}\1",
-                text,
-            ):
-                # quoted in the command (`--jq='…'`: the value): one word, no glob (an unquoted `sed ~/D*` expands
-                # into the file operands)
-                r = self._token_kind(t, False, content=i not in c, verbatim=True)
+            elif i in program and getattr(t, "quoted", False):
+                # this very word is one quoted fragment (`'…'`, `--jq='…'`): no glob, no braces (an unquoted
+                # `sed ~/D*` expands into the file operands; a same-looking quoted word elsewhere changes nothing)
+                r = self._token_kind(t, False, content=read, verbatim=True)
             elif t in literal:
-                r = self._literal_kind(t, t in verbatim, body, recursion, content=i not in c)
+                r = self._literal_kind(t, t in verbatim, body, recursion, content=read)
             else:
-                r = self._token_kind(t, recursion, content=i not in c)
-            if r and r[0] == "extension" and i in c and _path(r[1], self.cwd) not in read_paths:
-                continue  # write only — no content comes back to the model
-            if r and r[0] == "extension" and stage[0] == "ls" and not recursion:
-                continue  # `ls .markdownlint*`: names only, a pattern here reads no data file (issue #20)
+                r = self._token_kind(t, recursion, content=read)
+            if not r and i not in c and cmd not in NO_READ_COMMANDS:
+                r = self._pending_write(t)
+            if r and i in c and r[0] in ("sensitive", "extension"):
+                r = None  # a write target: nothing comes back (#23); the filter's own files stay protected
+            if r and kind_of_stage == "names":
+                # names are not content (#23); only the filter's own files stay off-limits (listing an ancestor of
+                # their directory shows just the names of its entries; a pattern is judged by where it can reach)
+                if r[0] == "sensitive":
+                    self._names_seen.add(original)
+                inside = _inside(_path(r[1], self.cwd), self.protected) or re.search(r"[*?\[{]", t)
+                r = r if r[0] == "protected" and inside else None
             if r:
                 found.append(r)
         return found
+
+    def _record_names(self, stage: list[str], candidates: list[str]) -> None:
+        """The stage names a path inside a sensitive directory and only prints names: remembered, so that `bash` can
+        check where the names go (`find Sensitive-data | xargs cat` would read what the listing found)."""
+        for t in candidates:
+            if self.path_kind(t) == "sensitive" or (os.path.isabs(t) is False and self.path_kind(_path(t, self.cwd)) == "sensitive"):
+                self._names_seen.add(tuple(stage))
+                return
+
+    def _names_flow_ok(self, command: str, tokens: list[str]) -> bool:
+        """Names of files inside a sensitive directory (a lister, `git ls-files`) may reach the screen only: the command
+        has no substitution, background job or subshell, and each pipeline holding such a lister continues only through
+        text filters (NAME_FILTERS_OK) with no redirection to a file — otherwise `xargs cat`, `$(find …)`, `> list`
+        would turn the names into a read."""
+        if re.search(r"\$\(|`|<\(|>\(", self._without_single_quoted(command)):
+            return False
+        allowed = {";", "&&", "||", "\n", "|", "|&"}
+        pipeline: list[list[str]] = [[]]
+        pipelines: list[list[list[str]]] = []
+        depth = 0
+        previous = ""
+        for t in tokens:
+            if t in ("(", ")") and self._find_paren(pipeline[-1], t, depth):  # find's `\( … \)`
+                depth += 1 if t == "(" else -1
+                pipeline[-1].append(t)
+            elif t in ("(", ")"):  # a subshell group `(cd D && ls)`: its output must not be piped on either
+                if t == "(" and previous in ("|", "|&"):
+                    return False
+                pipelines.append(pipeline)
+                pipeline = [[]]
+            elif t in ("|", "|&"):
+                if previous == ")":
+                    return False
+                pipeline.append([])
+            elif t in (";", "&&", "||", "\n"):
+                pipelines.append(pipeline)
+                pipeline = [[]]
+            elif t in FORBIDDEN_OPERATORS or re.fullmatch(r"[;&()]+", t) or re.fullmatch(r"\|[|&]+.*", t):
+                if t not in allowed:
+                    return False
+            else:
+                pipeline[-1].append(t)
+            previous = t
+        pipelines.append(pipeline)
+        for stages in pipelines:
+            cores = [
+                parts[-1]
+                for stage in stages
+                if stage and (parts := self._strip_prefixes([stage]))
+                if not (parts[-1][0] == "env" and stage[0] != "env")  # only assignments: prints nothing
+            ]
+            if not any(tuple(e) in self._names_seen for e in cores):
+                continue
+            for e in cores:
+                rest = list(strip_2to1(e))
+                for k in range(len(rest) - 1):  # `2>/dev/null`, `>/dev/null`, `&>/dev/null`
+                    if rest[k] and re.fullmatch(r"\d?>|&>", rest[k]) and rest[k + 1] == "/dev/null":
+                        rest[k] = rest[k + 1] = ""
+                if any(t in REDIRECTS or re.fullmatch(r"\d*[<>]+&?\d*", t) for t in rest if t):
+                    return False
+                if tuple(e) in self._names_seen:
+                    if e[0] == "tree" and any(OUTPUT_OPTIONS.match(t) for t in e[1:]):  # tree -o FILE writes the listing
+                        return False
+                elif e[0] not in FILTER_SPECS:
+                    return False
+                else:
+                    args = [t for t in rest[1:] if t]
+                    parsed = _allowed(args, FILTER_SPECS[e[0]])
+                    if parsed is None or (e[0] in ("uniq", "cat") and any(args[k] != "-" for k in parsed[0])):
+                        return False  # an option that reads or writes a file (sort -o, --files0-from, --compress-program)
+        return True
+
+    def _reads_content(self, stage: list[str], family: str | None) -> bool:
+        """The searcher returns file content (matching lines), or runs a command on the files it finds."""
+        if family in ("grep", "rg", "ag"):
+            return True
+        if family == "find":
+            return any(t in FIND_ACTIONS for t in stage[1:])
+        if family == "fd":
+            return self._fd_exec(stage[1:])
+        return False
+
+    def _pending_write(self, t: str) -> tuple[str, str] | None:
+        """A data file that this command writes in another stage (or names in several stages while it does not exist
+        yet): reading it in the same command — its content is unknown at the gate (#23)."""
+        for k in dict.fromkeys((t, t.split("=", 1)[-1])):
+            p = _path(k, self.cwd)
+            if not p.casefold().endswith(self.extensions):
+                continue
+            if p in self._written or (not os.path.exists(p) and len(self._appears.get(p, ())) >= 2):
+                return self._note(
+                    "extension", p, "a data file that an earlier stage of this command writes — its content cannot be checked before it runs"
+                )
+        return None
 
     @staticmethod
     def _strip_prefixes(stages: list[list[str]]) -> list[list[str]]:
@@ -1575,12 +2402,25 @@ class Gate:
         return result
 
     @staticmethod
+    def _find_paren(stage: list[str], t: str, depth: int) -> bool:
+        """The parenthesis `t` is an argument of `find` (`find . -type d ( -name a -o -name b )`), not a subshell or the
+        `(` of `$(…)` / `<(…)` — the stage keeps it (#23, so that a names-only `find` stays one stage)."""
+        if not stage or stage[0] != "find":
+            return False
+        return (t == "(" and stage[-1] not in ("$", "<", ">")) or (t == ")" and depth > 0)
+
+    @staticmethod
     def _stages_loose(tokens: list[str]) -> list[list[str]]:
         """Simple commands split on any operator (for detection, not for allowing)."""
         stages: list[list[str]] = [[]]
+        depth = 0
         for t in tokens:
-            if t in FORBIDDEN_OPERATORS or t in ("|", "|&") or re.fullmatch(r"[;&|()]+", t):
+            if t in ("(", ")") and Gate._find_paren(stages[-1], t, depth):
+                depth += 1 if t == "(" else -1
+                stages[-1].append(t)
+            elif t in FORBIDDEN_OPERATORS or t in ("|", "|&") or re.fullmatch(r"[;&|()]+", t):
                 stages.append([])
+                depth = 0
             else:
                 stages[-1].append(t)
         return [e for e in stages if e]
@@ -1614,9 +2454,9 @@ class Gate:
 
     def _piigate_safe(self, command: str, tokens: list[str]) -> str | None:
         """None = correct use of piigate (all output through the filter); otherwise the denial reason."""
-        if "\n" in command.strip():
+        if "\n" in tokens:
             return "multi-line command — with a sensitive source only one command on one line"
-        if re.search(r"\$\(|`|<\(|>\(|\$\{", command):
+        if re.search(r"\$\(|`|<\(|>\(|\$\{", self._without_single_quoted(command)):
             return "substitution ($(…), `…`, <(…), ${…}) — not allowed with a sensitive source"
         split_result = self._stages(tokens)
         if split_result is None:
@@ -1729,7 +2569,8 @@ class Gate:
             for a in arguments:
                 if re.match(r"^[\w.@-]+:", a) and cmd in ("scp", "rsync"):
                     continue
-                if not all(_inside(_path(w, self.cwd), self.sensitive) for w in expand_braces(a)):
+                real = self._operand_locations(a)  # the same resolution as _copies_inside (globs, symlinks, `..`)
+                if real is None or not all(_inside(p, self.sensitive) for p in real):
                     return False
             return True
         return True
@@ -1822,7 +2663,12 @@ class Gate:
             return command  # an unterminated heredoc or the written file used later (`bash s.sh`) — unchanged
         return text
 
-    def bash(self, command: str) -> str | None:
+    def bash(self, command: str, files: bool = True) -> str | None:
+        """None = allow, otherwise the denial reason. files=False (the PostToolUse safety net): data files are not judged
+        again — a file the command created is checked through its output instead."""
+        if "\x00" in command:
+            return "piigate: command denied — a NUL byte in the command"
+        self._raw = command
         command = self._strip_file_heredocs(command)
         tokens = self._tokens(command)
         if reason := self._human_only(command, tokens):
@@ -1835,17 +2681,23 @@ class Gate:
             calls = self._invocations(command, entry["commands"]) if entry["commands"] else []
             if calls and (reason := self.unfiltered_bash(entry, command, tokens, calls)):
                 return reason
+        self._names_seen = set()
         if tokens is None:
             kind, _ = self._touches(command, command.split())
-            if kind:
+            kind = kind or ("sensitive" if self._names_seen else None)
+            if kind and (kind != "extension" or files):
                 return (
                     f"piigate: cannot parse the command (quotes) with a sensitive source. {HINT}"
                 )
             return None
         kind, what = self._touches(command, tokens)
-        if kind is None:
-            return None
-        if kind in ("protected", "sensitive") and self._names_only(command, tokens):
+        if kind is None and self._names_seen and not self._names_flow_ok(command, tokens):
+            return (
+                "piigate: command denied — the names of files in a sensitive data directory are passed on (xargs, a "
+                "substitution, a loop, a file or another program) and would turn the listing into a read; a listing may "
+                f"be filtered only by grep/head/tail/sort/uniq/cut/wc. {HINT}"
+            )
+        if kind is None or (kind == "extension" and not files):
             return None
         if kind == "protected":
             return (

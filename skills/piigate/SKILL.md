@@ -28,9 +28,13 @@ MCP tools of the `piigate` server (absolute paths; the server checks them):
 | filter state | `piigate status` (Bash) |
 | a project with its own identifiers (patient numbers, `first_name` columns, tables with data) | add them to `.claude/piigate.json` (`patterns`, `sensitive_columns`, `tables`, `directories` — tighten only) |
 
-`piigate analyze` / `anonymize` in Bash are denied — use the MCP tools. A `.sql`/`.csv`/`.pdf` file outside sensitive
-directories (schema, migration) can be read directly; the gate checks its content. A deny saying "contains personal data"
-or "content cannot be checked" → `piigate_show`. A false positive (demo data) → tell the human
+`piigate analyze` / `anonymize` in Bash are denied — use the MCP tools. The gate decides by **content and location**, not
+by file type or name: file names (`ls`, `find`, `tree`, Glob — also in sensitive directories), creating files
+(`python gen.py new.xlsx`, `curl -o new.csv`) and text (commit messages, issue bodies, `echo`) are fine. An existing
+`.sql`/`.csv`/`.pdf` file outside sensitive directories (schema, migration) can be read directly; the gate checks its
+content (`cat *.csv` — every match). Do not read a file in the command that writes it (`curl … > x.csv; cat x.csv`) —
+read it in the next call; do not pipe names from a sensitive directory to `xargs`/`$(…)`. A deny saying "contains personal
+data" or "content cannot be checked" → `piigate_show`. A false positive (demo data) → tell the human
 (`sources.exempt_directories`), do not work around it. `piigate table`/`text` pipeline: one line, `2>&1` before every `|`
 into piigate, no `;`, `&&`, `$(…)`, `tee` or redirections; after piigate only grep/head/tail/wc/sort/uniq/cut without
 files.

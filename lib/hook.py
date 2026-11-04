@@ -265,7 +265,7 @@ def output_filter(data: dict):
 
     if tool == "Bash" and isinstance(resp, dict):
         command = inp.get("command", "")
-        reason = b.bash(command)
+        reason = b.bash(command, files=False)
         if reason:  # the gate would have denied — should not happen; the output is withheld
             return _replacement(error_result("Bash", resp, ERROR_MESSAGE.format(error="command with a sensitive source")))
         if b.touches_extension(command):

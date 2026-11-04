@@ -276,6 +276,8 @@ KRS_RE = re.compile(r"(?i)\bKRS\s*[:.]?\s*(?:nr\.?\s*)?(\d{10})\b")
 IPV6_RE = re.compile(r"(?<![\w:.])(?=[0-9A-Fa-f:]*\d)(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?![\w:])")
 DIGITS_RE = re.compile(r"(?<![\d])\d[\d -]{9,22}\d(?![\d])")
 WORD_RE = re.compile(rf"{NAME}")
+# capital letters glued to a name and not starting another capitalized word (MariaDB, JanSQL — unlike JanKowalski)
+ACRONYM_TAIL = re.compile(rf"[{UPPER}]+(?![{LOWER}])")
 
 
 def _group(m: re.Match) -> tuple[int, int]:
@@ -334,6 +336,8 @@ def find_persons(text: str) -> list[Fragment]:
     for i, m in enumerate(words):
         if m.group().casefold() not in known:
             continue
+        if ACRONYM_TAIL.match(text, m.end()):  # MariaDB, MariaDB10 — a product name, not "Maria" + "DB"
+            continue
         s, k = m.start(), m.end()
         # capitalized neighbour right next to it (Jan Kowalski, KOWALSKA JANINA) — both words are the person;
         # a field label ("Imię: Bożydar Nazwisko: …") and an institution name are not part of the person
@@ -369,6 +373,52 @@ def _after_institution(text: str, start: int) -> bool:
     "Uniwersytet"… (Szpital Wolski, Uniwersytet Medyczny Warszawski)."""
     before = re.findall(rf"[{UPPER}{LOWER}]+", text[max(0, start - 60) : start])[-2:]
     return any(_institution(s) for s in before)
+
+
+# Well-known technology names that NER takes for people, places or companies (issue #3). Only names that are not
+# plausible Polish first names or surnames; a user adds more in `text.plain_words`.
+TECH_NAMES = frozenset(
+    s.casefold()
+    for s in (
+        "Nuxt Vite Vitest Cypress Webpack Rollup Esbuild Babel ESLint Prettier Tailwind Bootstrap Symfony Doctrine "
+        "Twig Composer Packagist Docker Traefik Sablier Playwright Puppeteer Mocha Jest Vue Vuex Pinia Svelte Astro "
+        "Gulp Grunt Nginx Apache Redis Memcached Kubernetes Terraform Ansible Grafana Prometheus Webpackbar "
+        "Axios Lodash Express Laravel Django Flask Selenium Storybook Sass Less Stylelint Husky Lerna Turborepo "
+        "Fedora Debian Ubuntu Alpine Pandoc Hunspell Shellcheck Ripgrep Lighthouse Wireshark"
+    ).split()
+)
+_TOKEN_CHAR = re.compile(r"[\w@./-]")
+_LOWER_IDENTIFIER = re.compile(r"[a-z0-9]+(?:[-_./][a-z0-9]+)*")
+_CAMEL_CASE = re.compile(r"[A-Za-z][a-z0-9]*(?:[A-Z][a-z0-9]*)+")
+
+
+def technical_term(text: str, start: int, end: int, type_: str) -> bool:
+    """Whether a NER hit (PERSON / ORG / ADDRESS) is a technology or package name, not data (issue #3): a known
+    name (`TECH_NAMES`), a lowercase identifier with a separator (`cypress-axe`, `ps_customersignin`, `vendor/package`,
+    `@scope`; never a bare word — it may be a surname)
+    or — for ORG / ADDRESS — a CamelCase product name (CommonJS). A part that is a first name (`jan-kowalski`) or a
+    surname by suffix keeps the hit: user names built of a person's name stay masked."""
+    value = text[start:end].strip(" \t\r\n,;:()[]\"'.")
+    if not value or re.search(r"\s", value):  # several words — a name or a sentence, not an identifier
+        return False
+    s, k = start, end
+    while s > 0 and _TOKEN_CHAR.match(text[s - 1]):
+        s -= 1
+    while k < len(text) and _TOKEN_CHAR.match(text[k]):
+        k += 1
+    token = text[s:k].strip(".-/@ \t\r\n,;:()[]\"'")
+    if not token:
+        return False
+    parts = [p for p in re.split(r"[-_./@]+", token.casefold()) if p]
+    if any(p in first_names() or SURNAME_SUFFIXES.fullmatch(p.capitalize()) for p in parts):
+        return False
+    if value.casefold() in TECH_NAMES or token.casefold() in TECH_NAMES:
+        return True
+    # a bare lowercase word without a separator may be a surname ("nowak") — only kebab/snake/vendor/@scope qualify
+    scoped = text[s:k].lstrip(" \t\r\n,;:()[]\"'.-/").startswith("@")
+    if _LOWER_IDENTIFIER.fullmatch(token) and (scoped or re.search(r"[-_/]", token)):
+        return True
+    return type_ in ("ORG", "ADDRESS") and bool(_CAMEL_CASE.fullmatch(token))
 
 
 def stems(fragment: str) -> list[str]:

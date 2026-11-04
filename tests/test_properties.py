@@ -215,6 +215,25 @@ class TestGateParsing(unittest.TestCase):
     def test_ssh_valid_never_raises(self, arguments):
         self.assertIsInstance(gate.ssh_valid(arguments), bool)
 
+    @given(TOKENISH)
+    def test_substitutions_ignore_single_quoted_text(self, t):
+        """#23: a single-quoted word is literal — wrapping any text in single quotes hides it from `_substitutions`."""
+        quoted = "'" + t.replace("'", "") + "'"
+        self.assertEqual(gate.Gate._substitutions(quoted), [])
+        self.assertNotIn("$(", gate.Gate._without_single_quoted(quoted))
+
+    @given(TOKENISH)
+    def test_bash_gate_never_raises(self, command):
+        """#23: whatever the command text, the Bash gate answers with None or a reason (it does not crash)."""
+        answer = self.gate.bash(command)
+        self.assertTrue(answer is None or isinstance(answer, str))
+
+    @classmethod
+    def setUpClass(cls):
+        cfg = config.load()
+        cfg["sources"]["only_phi_projects"] = False
+        cls.gate = gate.Gate(cfg, str(TMP))
+
 
 if __name__ == "__main__":
     unittest.main()

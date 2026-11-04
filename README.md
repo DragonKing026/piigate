@@ -23,7 +23,7 @@ the agent is told which piigate tool to use instead.
 flowchart TD
     call(["Claude calls a tool"]) --> which{"Which tool?"}
 
-    which -->|"Read · Grep · Glob"| read{"Sensitive directory,<br>or a data file<br>(.csv .xlsx .pdf .sql …)<br>with personal data?"}
+    which -->|"Read · Grep · Glob"| read{"Content of a sensitive<br>directory, or of an existing<br>data file with personal data<br>(or that cannot be checked)?"}
     which -->|Bash| bash{"Reads sensitive data<br>without piping it into<br>piigate table / text?"}
     which -->|"Edit · Write"| own{"piigate's own files?<br>map, key, config"}
     which -->|"Mail MCP"| runs
@@ -72,9 +72,15 @@ same value always gets the same mask or pseudonym, also across sessions.
 
 ## What it does
 
-- **Gate** (PreToolUse) — denies direct reads of configured sensitive sources: directories, command patterns (`ssh …
-  dbal:run-sql`, `ssh … psql`) and files with a data extension **whose content contains personal data**. The deny reason
-  tells the model which piigate tool to use instead.
+- **Gate** (PreToolUse) — denies a command only when its output can bring the **content** of sensitive data into the
+  context: reading anything inside a sensitive directory, an **existing** file with a data extension whose content has
+  personal data (or cannot be checked: corrupt, binary, too large), a file read in the same command that wrote it
+  (`curl … > x.csv; cat x.csv`), command patterns (`ssh … dbal:run-sql`, `ssh … psql`) and piigate's own files. Location
+  and content decide, never a file type or a name: creating a file (`python gen.py new.xlsx`, `curl -o new.csv`, a
+  missing path), file **names** (`ls`, `find`, `tree`, `git status`, Glob — also inside sensitive directories) and text
+  (commit messages, issue/PR bodies, `echo`, search patterns, single-quoted words) are never denied. A glob such as
+  `cat *.csv` is expanded and every match is judged by its content. The deny reason tells the model which piigate tool
+  to use instead.
 - **PHI places only** — file content is checked only in projects that opt in (`.claude/piigate.json`, even `{}`), outside
   git repositories and in fresh or non-public repos. Ordinary repositories are not slowed down. Sensitive directories, mail,
   SQL over SSH, piigate's own files and the sensors are always on.
@@ -261,14 +267,34 @@ through the full text filter.
   passes as clean. Keep client files in a sensitive directory (always denied).
 - **The gate can be bypassed on purpose.** It analyses the command text: code that assembles a path at run time
   (`python -c` with string concatenation, base64, a script written earlier) gets through; only the sensors see the
-  output then. Globs without a dot (`cat p*`, `cat *sv`) are not recognised as data-file patterns either, nor is
-  `name.*` in a heredoc body read by a program other than a shell (the shell expands no globs there — a script's own
+  output then. Globs are expanded and each match judged (more than 200 data files — denied as a precaution); `name.*` in
+  a heredoc body read by a program other than a shell is text (the shell expands no globs there — a script's own
   `glob('name.*')` is code assembling a path). Text is not read as paths: the title, body and search of `gh issue/pr`
   (not `--body-file`/`-F`), a dotted name used only as a call (`json.dump(`) and `$VAR` in a quoted heredoc body read
-  by a non-shell, and a quoted sed/awk program as a glob (it is still checked as a plain path and for directory names).
+  by a non-shell, a single-quoted word (nothing is substituted in it — unless a shell or interpreter receives the text,
+  `echo '$(cat x)' | bash`) and a quoted sed/awk program as a glob (it is still checked as a plain path and for directory
+  names). File names are not content: a lister (`ls`, `find`, `tree`, `du`, `fd`, `git ls-files`) of a sensitive
+  directory is allowed, but its names may only be filtered (`grep`, `head`, `sort`…) — piping them to `xargs`, a
+  `while read` loop, a substitution or a file is denied. A data file the command creates and reads back is denied. git and gh are judged by their
+  **options**, not by the subcommand name: a git subcommand is treated as metadata only when every option is on its
+  allow-list (`log -U1`, `-p`, `--unified`, `rebase -x`, `--upload-pack`, `config -f`, `commit -F FILE` are not), and
+  `gh` only for subcommands that do not run commands (`gh alias`, `extension`, `config` do). Copying out of a sensitive
+  repository (`clone`, `worktree add`, `mv`, `push`) is a read. Writing into a sensitive directory (`> dir/new`, `cp x
+  dir/`, `tee dir/f`, the Write tool) is allowed — nothing comes back.
   `-r`/`-R` is recursion except for commands where it means something else (`jq -r`, `gh -R`, `sort -r`, `sed -r`…;
-  for `ls`/`chmod` only `-R`), so a jq filter with `[]` is not a pattern searched from the working directory; `ls -R`,
-  `tree`, `find` and `du` without a path list the working directory and are checked like `ls -R .`.
+  for `ls`/`chmod` only `-R`), so a jq filter with `[]` is not a pattern searched from the working directory.
+  An unquoted newline separates commands like `;` (a backslash-newline joins words). Quoting is judged per word: only
+  a word that is wholly one quoted string is a program (sed/awk/jq/yq, `gh -q/--jq/--template`) checked as a plain
+  path. After `cd DIR &&` relative paths are resolved against DIR only along a chain of literal `cd`s and plain readers
+  (`ls`, `cat`, `grep`, `rg`, `find` without actions…) joined by `&&`; after any other operator or command a stage is
+  checked in the session directory and in every directory reached. The output of a command substitution used as an operand (`cat $(echo …)`) is not
+  followed yet (issue #22).
+  A project repository that TRACKS its sensitive directory is not protected against reading the history without naming
+  a path (`git log -U1`, `git cat-file --batch`, `git config --blob` in the root).
+  Code written earlier and run later is not followed between commands (`Makefile`, `package.json`, `conftest.py`,
+  `sitecustomize.py`, `.vscode/tasks.json`, `.pre-commit-config.yaml`, a script run by a later call); inside one command,
+  writing a script and running it is refused when the command names a sensitive path or builds the script from text
+  assembled at run time (`printf '…%s…'`, `"$x"`).
   The gate is a seat belt against mistakes and shortcuts, not a sandbox.
 - **The engine is trusted by address.** piigate protects the socket directory and refuses non-loopback engines, but a
   process of the same user that answers on the engine socket or port first can make NER report nothing (the rules

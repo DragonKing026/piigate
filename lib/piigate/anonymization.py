@@ -201,7 +201,8 @@ def anonymize_tables(
         w.writerow(headers)
         for row in tab.rows:
             w.writerow([cell(i, v) for i, v in enumerate(row)])
-        sheet = "" if len(tables) == 1 else "-" + safe_name(tab.name, cfg, pseudonym_map, forbidden)
+        # sheet number, not its name: Klienci / Wizyty would come out as PERSON_n; the number is also in the description
+        sheet = "" if len(tables) == 1 else f"-{number}"
         file = directory / f"{base}{sheet}.{'tsv' if separator == chr(9) else 'csv'}"
         save(file, buffer.getvalue())
         description = ", ".join(
