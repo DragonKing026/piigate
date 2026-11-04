@@ -4520,6 +4520,33 @@ class TestEmailVersions(unittest.TestCase):
         "jan@v1.2.pl",
     )
 
+    # an address followed by something glued to it (a digit, an underscore, a number after a dot or a hyphen) is still
+    # an address: only a domain that is wholly a version is not one
+    GLUED = (
+        "jan@kowalski.pl1", "jan@kowalski.pl123", "jan.kowalski@wp.pl2", "jan@kowalski.pl.501502503",
+        "jan@kowalski.pl-501502503", "jan@kowalski.pl_", "jan@2.0.dev",
+    )
+
+    def test_an_address_with_something_glued_to_it_is_still_an_address(self):
+        from piigate import rules
+
+        for value in self.GLUED:
+            with self.subTest(value):
+                self.assertTrue(rules.email_valid(value), value)
+                found = [f"dane: {value}"[f.start : f.end] for f in rules.detect(f"dane: {value}") if f.type_ == "EMAIL"]
+                self.assertEqual(len(found), 1, value)
+                self.assertTrue(found[0].startswith(value.split("@")[0]), value)
+                self.assertEqual(verdict.check_text(f"dane: {value}\n", CONFIG), {"EMAIL": 1}, value)
+
+    @unittest.skipUnless(PRESIDIO, PRESIDIO_SKIP)
+    def test_glued_addresses_are_masked_with_presidio(self):
+        for value in self.GLUED:
+            with self.subTest(value):
+                result, _ = text.filter_text(f"dane: {value}", CONFIG)
+                self.assertNotIn("kowalski", result)
+                self.assertNotIn("2.0.dev", result)
+                self.assertIn("EMAIL_", result)
+
     def test_rules_do_not_take_versions_for_addresses(self):
         from piigate import rules
 

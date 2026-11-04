@@ -327,21 +327,23 @@ _TLD_RE = re.compile(r"[^\W\d_]{2,}|xn--[A-Za-z0-9-]+")
 
 
 # a version written as a domain: `1.2.3`, `v7.13.1`, `1.2.3-next.4`, `1.2.3.beta`, `1.0.0-rc.1` — the whole domain, so
-# that `1.2.pl` is not one
+# that `1.2.pl` is not one (`dev` is a real TLD, so `2.0.dev` is not on the list: when in doubt it is masked)
 _VERSION_DOMAIN_RE = re.compile(
-    r"v?\d+(?:\.\d+)+(?:[-.](?:alpha|beta|rc|next|dev|pre|canary|snapshot|final)(?:[.-]?\d+)*)?", re.IGNORECASE
+    r"v?\d+(?:\.\d+)+(?:[-.](?:alpha|beta|rc|next|pre|canary|snapshot|final)(?:[.-]?\d+)*)?", re.IGNORECASE
 )
 
 
 def email_valid(address: str) -> bool:
-    """Whether what follows the last `@` can be a domain: the last label (TLD) is made of letters, and the whole of it
-    is not a version (`pkg@1.2.3`, `module/v7@v7.13.1`, `pkg@1.2.3-next.4`, `pkg@1.2.3.beta`); `jan@1.2.pl` is an
-    address."""
-    domain = address.rsplit("@", 1)[-1].strip(".")
-    labels = domain.split(".")
-    if len(labels) < 2 or not _TLD_RE.fullmatch(labels[-1]):
-        return False
-    return not _VERSION_DOMAIN_RE.fullmatch(domain)
+    """Whether what follows the last `@` starts with a domain: a label after the first one begins with letters (a TLD),
+    and the domain up to there is not wholly a version (`pkg@1.2.3`, `module/v7@v7.13.1`, `pkg@1.2.3-next.4`,
+    `pkg@1.2.3.beta`). `jan@1.2.pl` is an address, and so is `jan@kowalski.pl1` or `jan@kowalski.pl.501502503`: what is
+    glued behind the TLD does not make the address something else."""
+    labels = address.rsplit("@", 1)[-1].strip(".").split(".")
+    for i in range(1, len(labels)):
+        if m := _TLD_RE.match(labels[i]):
+            if not _VERSION_DOMAIN_RE.fullmatch(".".join([*labels[:i], m.group()])):
+                return True
+    return False
 
 
 # ISO 8601 / RFC 3339 timestamps (2026-11-02T20:11:01Z, 2026-11-02 20:11:01+01:00): a technical value (release time,
