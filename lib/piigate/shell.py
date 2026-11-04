@@ -627,7 +627,8 @@ def subst_word(w: Word, lookup, dialect: str = DEFAULT_DIALECT) -> tuple[list[li
                 continue
             values = [val] if kind == "static" else list(val)
             for v in values:
-                if not quoted and dialect == "bash" and (re.search(r"\s", v) and not single or _GLOB_CHARS.search(v)):
+                # a glob among the items of a `for` is judged as the pattern it is; the names it gives are not globbed again
+                if not quoted and dialect == "bash" and (re.search(r"\s", v) and not single or (kind == "static" and _GLOB_CHARS.search(v))):
                     options.append(["${" + name + "}"])
                     unresolved.append(name)
                     break

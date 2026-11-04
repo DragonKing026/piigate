@@ -134,21 +134,24 @@ class TestDecisions(Base):
             self.assertIsNotNone(g.bash(command), command)
             self.assertFalse(g.parse_error, command)
 
-    def test_zsh_qualifier_is_judged_by_the_options_not_by_its_text(self):
+    def test_zsh_qualifier_with_code_letters_is_denied_whatever_the_line_says(self):
+        """No context: an `e`, a `+` or a `#q` inside the parentheses of a word with a qualifier, with any separator
+        (`/ , ! + [ ] { }`), is refused. `*(.)`, `*.csv(N)`, `+(a|b)` pass."""
         for command in (
-            "setopt bareglobqual; echo *(e:'cat ../S*/p*.csv >&2':)",
-            "setopt bareglobqual; echo *(e,'cat ../S*/p*.csv >&2',)",  # separators `, / ! + [ ] { }`: never matched by text
-            "options[bareglobqual]=on; echo *(e/'cat ../S*/p*.csv >&2'/)",
-            "set -o extendedglob; echo *(#qe:'cat ../S*/p*.csv >&2':)",
-            "unsetopt NO_BARE_GLOB_QUAL; echo *(+f)",
-            "emulate zsh; ls *(.)",
-            "zsh -o bareglobqual -c 'echo *(+f)'",
-            "eval 'echo *(.)'",
+            "echo *(e:'cat ../S*/p*.csv >&2':)",
+            "echo *(e,'cat ../S*/p*.csv >&2',)",
+            "echo *(e!'cat ../S*/p*.csv >&2'!)",
+            "echo *(e/'cat ../S*/p*.csv >&2'/)",
+            "echo *.csv(.e:'x':)",
+            "echo *(+f)",
+            "echo *(#qe:f:)",
+            "setopt bareglobqual; echo *(e:'x':)",
+            "echo *(e:'cat ../Sensitive-data/people.csv >&2':)",
         ):
             for dialect in shell.DIALECTS:
                 g = self.ast(dialect)
                 self.assertIsNotNone(g.bash(command), (command, dialect))
-        for command in ("ls *(.)", "echo *.csv(N)", "echo +(a|b)", "echo *(e:'x':)"):  # no option change: an inert qualifier
+        for command in ("ls *(.)", "echo *.csv(N)", "echo +(a|b)", "echo *(om[1,3])", "echo *(/)"):
             self.assertIsNone(self.ast("zsh").bash(command), command)
 
     def test_text_heredoc_body_is_judged(self):
