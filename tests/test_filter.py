@@ -4096,7 +4096,81 @@ class TestWorktreeDataDirs(unittest.TestCase):
         (target / ".gitignore").write_text(config.GITIGNORE, encoding="utf-8")
         shutil.rmtree(self.wt1 / "Sensitive-data", ignore_errors=True)
         (self.wt1 / "Sensitive-data").symlink_to(target)
-        self.assertFalse(b._marker_recipe(["rm", "Sensitive-data/.gitignore", "&&", "rmdir", "Sensitive-data"]))
+        self.assertFalse(b._marker_recipe("rm Sensitive-data/.gitignore && rmdir Sensitive-data", True))
+
+    def test_recipe_output_survives_the_filter_hook(self):
+        """gate -> run -> filter: after the recipe the directory is gone, the PostToolUse check must not hide the output."""
+        d = self.empty()
+        self.gate(self.main, self.wt1)
+        recipe = "rm Sensitive-data/.gitignore && rmdir Sensitive-data"
+        env = {"CLAUDE_PROJECT_DIR": str(self.main)}
+        call = {"cwd": str(self.wt1), "tool_name": "Bash", "tool_input": {"command": recipe}}
+        self.assertIsNone(hook("gate", {**call, "hook_event_name": "PreToolUse"}, env))
+        subprocess.run(["bash", "-c", recipe], cwd=self.wt1, check=True)
+        self.assertFalse(d.exists())
+        response = {"stdout": "removed", "stderr": "", "interrupted": False, "isImage": False, "noOutputExpected": False}
+        self.assertIsNone(hook("filter", {**call, "hook_event_name": "PostToolUse", "tool_response": response}, env))
+        # the exception is not wider after the fact
+        b = self.gate(self.main, self.wt1)
+        self.assertIsNotNone(b.bash("rm Sensitive-data/.gitignore && rmdir Sensitive-data x", files=False))
+        self.assertIsNotNone(b.bash("rm Sensitive-data/.gitignore || rmdir Sensitive-data", files=False))
+        self.assertIsNone(b.bash(recipe, files=False))
+        # PreToolUse stays strict: a missing directory is no exception there
+        self.assertIsNotNone(b.bash(recipe))
+
+    def test_recipe_must_be_literal(self):
+        d = self.empty()
+        b = self.gate(self.main, self.wt1)
+        for command in (
+            "rm Sensitive-data/.gitignore '&&' rmdir Sensitive-data",
+            'rm Sensitive-data/.gitignore "&&" rmdir Sensitive-data',
+            "rm Sensitive-data/.gitignore \\&\\& rmdir Sensitive-data",
+            "rm  Sensitive-data/.gitignore && rmdir Sensitive-data",
+            "rm Sensitive-data/.gitignore &&  rmdir Sensitive-data",
+            "rm Sensitive-data/.gitignore && rmdir Sensitive-data\r",
+            "rm Sensitive-data/.gitignore\r && rmdir Sensitive-data",
+            "rm 'Sensitive-data'/.gitignore && rmdir Sensitive-data",
+        ):
+            with self.subTest(command):
+                self.assertIsNotNone(b.bash(command))
+        self.assertIsNone(b.bash("rmdir Sensitive-data\r"))  # not claimed by the marker rule, left to rmdir
+        self.assertIsNone(b.bash("rmdir 'Sensitive-data\r'"))
+        self.assertTrue(d.is_dir())
+
+    PROBE_MARKER = (
+        "import os, resource, sys\n"
+        "resource.setrlimit(resource.RLIMIT_AS, (2 << 30, 2 << 30))\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "from piigate import config, gate\n"
+        "main, wt, kind = sys.argv[2], sys.argv[3], sys.argv[4]\n"
+        "os.environ['CLAUDE_PROJECT_DIR'] = main\n"
+        "d = os.path.join(wt, 'Sensitive-data')\n"
+        "m = os.path.join(d, '.gitignore')\n"
+        "if os.path.lexists(m): os.unlink(m)\n"
+        "os.makedirs(d, exist_ok=True)\n"
+        "if kind == 'fifo': os.mkfifo(m)\n"
+        "else:\n"
+        "    with open(m, 'wb') as f: f.truncate(300 << 20)\n"
+        "cfg = config.load(wt); cfg['sources']['non_public'] = []\n"
+        "g = gate.Gate(cfg, wt)\n"
+        "print(g.bash('rmdir Sensitive-data'))\n"
+        "print(g.bash('cat Sensitive-data/x') is not None)\n"
+        "print(os.path.getsize(m) if kind == 'big' else 'fifo')\n"
+    )
+
+    def test_marker_that_is_a_fifo_or_huge_does_not_hang(self):
+        for kind in ("fifo", "big"):
+            with self.subTest(kind):
+                done = subprocess.run(
+                    [sys.executable, "-I", "-c", self.PROBE_MARKER, str(ROOT / "lib"), str(self.main), str(self.wt1), kind],
+                    capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL,
+                )
+                self.assertEqual(done.returncode, 0, done.stderr[-500:])
+                lines = done.stdout.split("\n")
+                self.assertEqual(lines[0], "None")  # nothing claimed about a marker that is not the plain file
+                self.assertEqual(lines[1], "True")  # the directory stays protected by name
+                if kind == "big":
+                    self.assertEqual(lines[2], str(300 << 20))  # nothing appended
 
     def test_recipe_e2e(self):
         d = self.empty()

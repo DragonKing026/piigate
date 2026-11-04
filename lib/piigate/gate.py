@@ -2699,24 +2699,27 @@ class Gate:
             return command  # an unterminated heredoc or the written file used later (`bash s.sh`) — unchanged
         return text
 
-    def _marker_only_dir(self, operand: str) -> str | None:
+    def _marker_only_dir(self, operand: str, missing_ok: bool = False) -> str | None:
         """The operand (no shell metacharacters) names a piigate data directory — not a symlink — that holds nothing but
-        the untouched `.gitignore` marker: its real path, else None."""
-        if re.search(r"[;&|()<>\n$`*?\[{~\\]", operand) or not operand:
+        the untouched `.gitignore` marker: its real path, else None. missing_ok: the directory may be gone already (the
+        PostToolUse check after the recipe) — then only the name or the configured location is checked."""
+        if re.search(r"[;&|()<>\n\r$`*?\[{~\\]", operand) or not operand:
             return None
         given = os.path.join(self.cwd, operand)
         real = os.path.realpath(given)
         names = {n for n in ((self.cfg.get("project_directories") or {}).values()) if n}
         data = {*self.project_sensitive, *(config.expand(k) for k in self.cfg.get("in_project", {}).get("anonymized", []))}
-        if os.path.islink(given.rstrip("/")) or not os.path.isdir(real) or not (real in data or os.path.basename(real) in names):
+        if os.path.islink(given.rstrip("/")) or not (real in data or os.path.basename(real) in names):
+            return None
+        if not os.path.lexists(real):
+            return real if missing_ok else None
+        if not os.path.isdir(real):
             return None
         marker = os.path.join(real, ".gitignore")
         try:
-            if os.listdir(real) != [".gitignore"] or os.path.islink(marker):
+            if os.listdir(real) != [".gitignore"] or config.read_small(marker) != config.GITIGNORE.strip():
                 return None
-            if Path(marker).read_text(encoding="utf-8") != config.GITIGNORE:
-                return None
-        except (OSError, UnicodeDecodeError):
+        except OSError:
             return None
         return real
 
@@ -2725,7 +2728,7 @@ class Gate:
         (#7): it would fail with "Directory not empty", because the gate recreates the marker on every run. Denied with
         the one-command recipe — the command could not succeed anyway. Anything else (more files, an edited marker, a
         compound command, an option other than -p/-v) is left to rmdir itself."""
-        if not tokens or tokens[0] != "rmdir" or any(re.search(r"[;&|()<>\n]", t) for t in tokens):
+        if not tokens or tokens[0] != "rmdir" or "\r" in self._raw or any(re.search(r"[;&|()<>\n\r]", t) for t in tokens):
             return None
         options = [t for t in tokens[1:] if t.startswith("-")]
         if any(not (t == "--" or t in ("--parents", "--verbose") or re.fullmatch(r"-[pv]+", t)) for t in options):
@@ -2741,16 +2744,15 @@ class Gate:
             f"(rmdir refuses if anything else is in it): `rm {d}/.gitignore && rmdir {d}`."
         )
 
-    def _marker_recipe(self, tokens: list[str] | None) -> bool:
-        """The whole command is exactly `rm <dir>/.gitignore && rmdir <dir>` (the same literal <dir>, no options) for a
-        directory that holds only the untouched marker — the one compound command the gate lets through next to a data
-        directory. Nothing else qualifies."""
-        if not tokens or len(tokens) != 5 or tokens[0] != "rm" or tokens[2] != "&&" or tokens[3] != "rmdir":
+    def _marker_recipe(self, command: str, files: bool) -> bool:
+        """The whole command is, character for character, `rm <dir>/.gitignore && rmdir <dir>` (single spaces, the same
+        unquoted <dir>, no options) for a directory that holds only the untouched marker — the one compound command the
+        gate lets through next to a data directory. Nothing else qualifies. files=False (PostToolUse) also accepts the
+        directory already gone, because the recipe has just removed it; PreToolUse never does."""
+        m = re.fullmatch(r"rm (\S+)/\.gitignore && rmdir (\S+)", command)
+        if not m or m.group(1) != m.group(2) or shlex.quote(m.group(1)) != m.group(1) or m.group(1).startswith("-"):
             return False
-        target, directory = tokens[1], tokens[4]
-        if target != directory.rstrip("/") + "/.gitignore" or directory.startswith("-") or directory.endswith("/"):
-            return False
-        return self._marker_only_dir(directory) is not None
+        return self._marker_only_dir(m.group(1), missing_ok=not files) is not None
 
     def bash(self, command: str, files: bool = True) -> str | None:
         """None = allow, otherwise the denial reason. files=False (the PostToolUse safety net): data files are not judged
@@ -2764,7 +2766,7 @@ class Gate:
             return reason
         if reason := self._marker_only_rmdir(tokens):
             return reason
-        if self._marker_recipe(tokens):
+        if self._marker_recipe(command, files):
             return None
         if re.search(r"\b(?:analyze|anonymize)\b", command) and any(
             c is None or c[1:2] in (["analyze"], ["anonymize"]) for c in self._invocations(command, {"piigate"})

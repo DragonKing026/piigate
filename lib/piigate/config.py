@@ -48,6 +48,7 @@ def load(cwd: str | None = None) -> dict:
 
 # --- in-project directories --------------------------------------------------------------------------
 
+GITDIR_FILE_LIMIT = 4096  # pointer files and `.gitignore` markers are small; anything larger is not read
 GITIGNORE = "# piigate: sensitive data or filtered copies — nothing in this directory goes into git\n*\n"
 
 
@@ -82,11 +83,10 @@ def project_roots(cwd: str | None) -> list[str]:
     return result
 
 
-GITDIR_FILE_LIMIT = 4096
 WORKTREE_LIMIT = 64
 
 
-def _read_small(path: Path) -> str | None:
+def read_small(path: Path | str) -> str | None:
     """Text of a small pointer file (`.git`, `commondir`, `gitdir`); None when it is missing, not a regular file (a FIFO
     or a device would block or never end), too large, not UTF-8 or contains a NUL. Never blocks, never follows a symlink."""
     try:
@@ -133,10 +133,10 @@ def _worktree_roots(root: str) -> list[str]:
     if marker.is_dir() and not marker.is_symlink():
         common = marker
     elif marker.is_file():
-        text = _read_small(marker)
+        text = read_small(marker)
         if text and text.startswith("gitdir:"):
             git_dir = _resolve(text[len("gitdir:") :].strip(), start)
-            if (pointer := _read_small(git_dir / "commondir")) is not None:  # no commondir: a submodule, not a linked worktree
+            if (pointer := read_small(git_dir / "commondir")) is not None:  # no commondir: a submodule, not a linked worktree
                 common = _resolve(pointer, git_dir)
     if common is None:
         return [str(start)] if _outside_home(start) else []
@@ -148,7 +148,7 @@ def _worktree_roots(root: str) -> list[str]:
         entries = []
     found = 0
     for entry in entries[: 8 * WORKTREE_LIMIT]:  # only entries with a valid `gitdir` count towards the limit
-        if (pointer := _read_small(entry / "gitdir")) is None:
+        if (pointer := read_small(entry / "gitdir")) is None:
             continue
         try:
             dot_git = _resolve(pointer, entry)
@@ -201,12 +201,18 @@ def ensure_gitignore(folder: str | Path) -> None:
     try:
         if os.path.islink(folder) or not Path(folder).is_dir() or os.path.islink(p):
             return
-        fd = os.open(p, os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o644)
-        with os.fdopen(fd, "r+", encoding="utf-8") as f:
-            f.seek(0)
-            content = f.read()
-            if "*" not in content.splitlines():
-                f.write(("\n" if content and not content.endswith("\n") else "") + ("\n" if content else "") + GITIGNORE)
+        fd = os.open(p, os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o644)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > GITDIR_FILE_LIMIT:
+                return  # a FIFO, a device or a huge file: neither read nor appended to (the directory is protected by name)
+            with os.fdopen(fd, "r+", encoding="utf-8", closefd=False) as f:
+                f.seek(0)
+                content = f.read()
+                if "*" not in content.splitlines():
+                    f.write(("\n" if content and not content.endswith("\n") else "") + ("\n" if content else "") + GITIGNORE)
+        finally:
+            os.close(fd)
     except (OSError, UnicodeDecodeError):
         pass  # a missing .gitignore does not weaken the gate; a read-only directory stays as it is
 
