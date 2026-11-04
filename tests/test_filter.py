@@ -4441,6 +4441,49 @@ class TestLineSafety(unittest.TestCase):
         self.assertEqual(rules.fit_to_tokens(text_, dd, dd + 4), (dd, dd + 6))
         self.assertEqual(rules.fit_to_tokens(text_, dd + 2, dd + 6), (dd, dd + 6))
 
+    def test_a_hit_inside_a_dotted_token_covers_the_whole_token_unless_it_is_a_version(self):
+        """Fail closed: whatever piece of `14.03.1985r`, `85.03.14`, `14.03` or `12.345.678` NER tags, the whole token is
+        the hit; only a token with a leading `v`, or with three or more parts that cannot be a date or a number
+        like 12.345.678, is a version whose piece is dropped."""
+        from piigate import rules
+
+        for token in ("14.03.1985r", "14.03.1985", "85.03.14", "14.03", "12.345.678", "5.5.90", "1985.03.14", "14.03.85r",
+                      "1.5", "2.60"):
+            line = f"ur. {token}."
+            first = line.index(token)
+            last = first + len(token)
+            for a in range(first, last):
+                for b in range(a + 1, last + 1):
+                    if (a, b) == (first, last):
+                        continue
+                    with self.subTest(token=token, piece=line[a:b]):
+                        self.assertEqual(rules.fit_to_tokens(line, a, b), (first, last))
+        for token in ("v0.5.1", "V1.2.3", "1.80.0", "0.5.1", "125.5.1", "2.60.0", "1.2.3-next.4", "v1.2.3-rc.1", "10.0.0.1"):
+            line = f"wersja {token}."
+            first = line.index(token)
+            last = first + len(token)
+            for a in range(first, last):
+                for b in range(a + 1, last + 1):
+                    if (a, b) == (first, last):
+                        continue
+                    with self.subTest(token=token, piece=line[a:b]):
+                        self.assertIsNone(rules.fit_to_tokens(line, a, b))
+        # a hit that cuts nothing, and one that spans the whole token and more, stay as they are
+        self.assertEqual(rules.fit_to_tokens("ur. 14.03.1985r.", 0, 3), (0, 3))
+        self.assertEqual(rules.fit_to_tokens("ur. 14.03.1985r.", 0, 16), (0, 16))
+
+    @unittest.skipUnless(PRESIDIO, PRESIDIO_SKIP)
+    def test_dates_and_numbers_next_to_a_letter_are_masked_whole(self):
+        for sample in ("Jan Kowalski 14.03.1985r.", "ur. 14.03.1985r.", "ur. 85.03.14", "tel 12.345.678", "ur. 14.03.1985r",
+                       "urodzony 14.03.85r."):
+            with self.subTest(sample):
+                result, _ = text.filter_text(sample, CONFIG)
+                for part in re.findall(r"\d{2,}", sample):  # no piece of the number is left in the output
+                    self.assertNotRegex(result, rf"(?<![_\d]){part}(?!\d)")  # (not the number of a pseudonym: DATE_14)
+        for sample in ("Wersja v0.5.1 wydana", "Rust 1.80.0 stable", "ORG_125.5.1", "Wydanie 2.60.0 i 0.5.1 oraz 125.5.1"):
+            with self.subTest(sample):
+                self.assertEqual(text.filter_text(sample, CONFIG)[0], sample)
+
     @unittest.skipUnless(PRESIDIO, PRESIDIO_SKIP)
     def test_versions_in_tables_stay_intact(self):
         source = "\n".join(

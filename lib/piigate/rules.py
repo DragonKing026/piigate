@@ -368,22 +368,38 @@ def timestamp_spans(text: str) -> list[tuple[int, int]]:
     ]
 
 
-# a dotted number (`v0.5.1`, `1.80.0`, `1.2.3-next.4`): NER sometimes tags a piece of it ("v0", "80.") and the pseudonym
-# would cut the token (`ORG_5.5.1`, `1.DATE_7.0`)
-VERSION_TOKEN_RE = re.compile(r"(?<![\w.])v?\d+(?:\.\d+)+(?:[-+][\w.]+)?(?![\w])")
-_DATE_LIKE_RE = re.compile(r"(\d{1,2})\.(\d{1,2})\.(?:\d{2}|\d{4})")
+# a dotted number (`v0.5.1`, `1.80.0`, `14.03.1985r`, `12.345.678`): NER sometimes tags a piece of it ("v0", "80.",
+# "1985r") and a pseudonym would cut the token (`ORG_5.5.1`, `14.03.DATE_1.`)
+DOTTED_TOKEN_RE = re.compile(r"(?<![\w.])([vV]?)(\d+(?:\.\d+)+)(?:[-+][\w.]*\w)?\w*")
+
+
+def _date_or_number_like(parts: list[str]) -> bool:
+    """Whether dotted digit groups can be a date (dd.mm.yy, dd.mm.yyyy, yy.mm.dd, yyyy.mm.dd) or a number written with
+    dots (12.345.678); a pair of short numbers (14.03) too."""
+    if len(parts) == 2:
+        return True  # anything of two parts is kept whole (14.03, 2.60): not a version by itself
+    if len(parts) != 3:
+        return False
+    a, b, c = parts
+    if len(a) <= 2 and len(b) <= 2 and len(c) in (2, 4) and 1 <= int(a) <= 31 and 1 <= int(b) <= 12:
+        return True  # dd.mm.yy(yy)
+    if len(a) in (2, 4) and len(b) <= 2 and len(c) <= 2 and 1 <= int(b) <= 12 and 1 <= int(c) <= 31:
+        return True  # yy(yy).mm.dd
+    return bool(re.fullmatch(r"\d{2,3}", a) and len(b) == 3 and len(c) == 3)  # 12.345.678
 
 
 def fit_to_tokens(text: str, start: int, end: int) -> tuple[int, int] | None:
-    """A NER hit that begins or ends inside a dotted number: a number that can be a date (5.5.90) — the whole token
-    (fail closed); anything else (a version) — None, the hit is dropped. A hit that does not cut a token: unchanged."""
-    for m in VERSION_TOKEN_RE.finditer(text, max(0, start - 128), min(len(text), end + 128)):
-        if m.end() <= start or end <= m.start() or (start <= m.start() and m.end() <= end):
+    """A NER hit that begins or ends inside a dotted token. Fail closed: the whole token is the hit, unless it is a
+    version — it begins with `v`, or has three or more parts and cannot be a date or a number like 12.345.678 — then
+    None, the hit is dropped. A hit that does not cut a token: unchanged."""
+    for m in DOTTED_TOKEN_RE.finditer(text, max(0, start - 128)):
+        if m.start() >= end:
+            break
+        if m.end() <= start or (start <= m.start() and m.end() <= end):
             continue
-        d = _DATE_LIKE_RE.fullmatch(m.group())
-        if d and int(d.group(1)) <= 31 and int(d.group(2)) <= 12:
-            return min(start, m.start()), max(end, m.end())
-        return None
+        if m.group(1) or not _date_or_number_like(m.group(2).split(".")):
+            return None
+        return min(start, m.start()), max(end, m.end())
     return start, end
 
 
