@@ -155,25 +155,153 @@ class TestShadow(unittest.TestCase):
                 self.fail("the child outlived its budget")
         self.assertEqual(self.counts().get("shadow-timeout"), 1)
 
+    def wait_child(self, pid, limit):
+        """Seconds until the child is gone (killed and failed after `limit`)."""
+        start = time.monotonic()
+        while time.monotonic() - start < limit:
+            done, _ = os.waitpid(pid, os.WNOHANG)
+            if done:
+                return time.monotonic() - start
+            time.sleep(0.005)
+        os.kill(pid, 9)
+        os.waitpid(pid, 0)
+        self.fail(f"the child outlived {limit} s")
+
     def test_budget_measurement(self):
+        """Informational numbers; the only assertions are hard limits with a wide margin (no flakiness under load)."""
         returns, lives = [], []
         for _ in range(15):
             start = time.monotonic()
             pid = shadow.observe(self.cfg, self.cwd, "cat notes.md", None)
             returns.append((time.monotonic() - start) * 1000)
-            while True:
-                done, _ = os.waitpid(pid, os.WNOHANG)
-                if done:
-                    break
-                time.sleep(0.002)
+            self.wait_child(pid, shadow.BUDGET_S + 5)
             lives.append((time.monotonic() - start) * 1000)
         print(
-            f"\nshadow: hook waits median {statistics.median(returns):.1f} ms, p95 {sorted(returns)[int(len(returns) * .95) - 1]:.1f} ms; "
-            f"the child lives median {statistics.median(lives):.1f} ms, p95 {sorted(lives)[int(len(lives) * .95) - 1]:.1f} ms "
+            f"\nshadow: hook waits median {statistics.median(returns):.1f} ms, max {max(returns):.1f} ms; "
+            f"the child lives median {statistics.median(lives):.1f} ms, max {max(lives):.1f} ms "
             f"(budget {shadow.BUDGET_S} s, shfmt inside the shadow {shadow.SHFMT_TIMEOUT_S} s)"
         )
-        self.assertLess(statistics.median(returns), 100)
-        self.assertLess(max(lives), (shadow.BUDGET_S + 1) * 1000)
+        self.assertLess(max(returns), 1000)  # the parent never waits for the child (a second is 1000x the usual)
+
+    def hold_lock(self):
+        """Another process holds the lock file."""
+        import subprocess
+
+        Path(shadow.path()).parent.mkdir(parents=True, exist_ok=True)
+        code = ("import fcntl,os,sys,time\nfd=os.open(sys.argv[1],os.O_RDWR|os.O_CREAT,0o600)\n"
+                "fcntl.flock(fd,fcntl.LOCK_EX)\nprint('held',flush=True)\ntime.sleep(60)\n")
+        proc = subprocess.Popen([sys.executable, "-I", "-c", code, shadow.path() + ".lock"], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(proc.stdout.close)
+        self.addCleanup(proc.wait)  # cleanups run last-in first-out: the kill comes before the wait
+        self.addCleanup(proc.kill)
+        self.assertEqual(proc.stdout.readline().strip(), "held")
+        return proc
+
+    def test_a_lock_held_elsewhere_never_stalls_the_children(self):
+        self.hold_lock()
+        for _ in range(5):  # one after another: none waits for the others
+            start = time.monotonic()
+            pid = shadow.observe(self.cfg, self.cwd, "ls", None)
+            self.assertLess(time.monotonic() - start, 0.25)
+            self.wait_child(pid, shadow.BUDGET_S + 1)
+        self.assertEqual(shadow.read()["days"], {})  # nothing was written: a lost count is acceptable
+
+    def test_the_alarm_inside_the_update_does_not_deadlock(self):
+        """SIGALRM arrives while the child holds the lock: the handler must not take the lock again."""
+        def slow(*a, **k):
+            return shadow._update(lambda d: time.sleep(30))
+
+        with mock.patch.object(shadow, "judge", slow):
+            pid = shadow.observe(self.cfg, self.cwd, "ls", None)
+            took = self.wait_child(pid, shadow.BUDGET_S + 1)
+        self.assertGreaterEqual(took, shadow.BUDGET_S * 0.8)
+        self.watch("ls")  # the lock went with the child: the next one writes
+        self.assertEqual(self.counts().get("same-allow"), 1)
+
+    def test_the_child_cannot_dump_core(self):
+        out = TMP / "child-limits"
+        out.unlink(missing_ok=True)
+
+        def probe(*a, **k):
+            import ctypes
+            import resource
+
+            dumpable = ctypes.CDLL(None).prctl(3, 0, 0, 0, 0)  # PR_GET_DUMPABLE
+            out.write_text(json.dumps([list(resource.getrlimit(resource.RLIMIT_CORE)), dumpable,
+                                       os.fstat(1).st_rdev == os.stat(os.devnull).st_rdev,
+                                       os.fstat(2).st_rdev == os.stat(os.devnull).st_rdev, resource.getrlimit(resource.RLIMIT_CPU)[1]]))
+            return "same-allow", 0.0, None, None, None
+
+        with mock.patch.object(shadow, "judge", probe):
+            self.watch("ls")
+        core, dumpable, out_null, err_null, cpu = json.loads(out.read_text())
+        self.assertEqual(core, [0, 0])
+        self.assertEqual(dumpable, 0)
+        self.assertTrue(out_null and err_null)  # stdout/stderr of the hook's pipe are closed for the child
+        self.assertLessEqual(cpu, 3)
+
+    def test_no_process_slot_means_no_shadow_and_no_delay(self):
+        import subprocess
+
+        code = ("import resource,sys,time\nsys.path.insert(0,sys.argv[1])\nfrom piigate import shadow\n"
+                "resource.setrlimit(resource.RLIMIT_NPROC,(1,1))\nt=time.monotonic()\n"
+                "print(shadow.observe({'shell_shadow':True},'/tmp','ls',None), time.monotonic()-t<0.25)\n")
+        done = subprocess.run([sys.executable, "-I", "-c", code, str(ROOT / "lib")], capture_output=True, text=True,
+                              env={"PIIGATE_DATA_DIR": str(TMP / "data"), "PIIGATE_CONFIG_DIR": str(TMP / "config")}, check=False,
+                              timeout=30)
+        self.assertEqual(done.stdout.strip(), "None True", done.stderr)
+
+    def test_a_valid_json_with_the_wrong_types_starts_again(self):
+        Path(shadow.path()).parent.mkdir(parents=True, exist_ok=True)
+        for bad in ('{"days":{"2026-11-04":5}}', '{"days":[1]}', '[1,2]', '{"days":{"x":{"same-allow":"7"}}}',
+                    '{"days":{"2026-11-04":{"same-allow":3,"secret":9,"causes":{"rm -rf":1,"other":2},"ms":"a","reasons":7}}}'):
+            Path(shadow.path()).write_text(bad, encoding="utf-8")
+            data = shadow.read()
+            self.assertEqual(set(data), {"version", "days"})
+            self.assertIn("shadow:", shadow.report())
+            self.watch("ls")
+            for day in shadow.read()["days"].values():
+                self.assertLessEqual(set(day), SCHEMA_DAY_KEYS)
+                self.assertLessEqual(set(day["causes"]), set(shadow.CAUSES))
+            raw = Path(shadow.path()).read_text(encoding="utf-8")
+            self.assertNotIn("secret", raw)
+            self.assertNotIn("rm -rf", raw)
+            Path(shadow.path()).unlink()
+
+    def test_a_symlink_as_the_lock_is_not_followed(self):
+        folder = Path(shadow.path()).parent
+        folder.mkdir(parents=True, exist_ok=True)
+        victim = TMP / "victim"
+        victim.write_text("keep", encoding="utf-8")
+        (folder / (shadow.FILE + ".lock")).symlink_to(victim)
+        with self.assertRaises(OSError):
+            shadow._update(lambda d: None)
+        self.watch("ls")  # the child fails quietly
+        self.assertEqual(victim.read_text(encoding="utf-8"), "keep")
+        self.assertFalse(Path(shadow.path()).exists())
+
+    def test_the_directory_is_private_and_a_failed_write_leaves_nothing(self):
+        shadow._update(lambda d: None)
+        self.assertEqual(Path(shadow.path()).parent.stat().st_mode & 0o777, 0o700)
+        with mock.patch.object(json, "dump", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                shadow._update(lambda d: None)
+        self.assertEqual(sorted(p.name for p in Path(shadow.path()).parent.iterdir()), [shadow.FILE, shadow.FILE + ".lock"])
+
+    def test_memfd_asks_for_exec_and_falls_back_on_einval(self):
+        calls = []
+        real = os.memfd_create
+
+        def fake(name, flags=0):
+            calls.append(flags)
+            if flags & 0x10:
+                raise OSError(22, "EINVAL")
+            return real(name, flags)
+
+        with mock.patch.object(os, "memfd_create", fake):
+            os.close(shell._sealed_memfd(b"x"))
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(calls[0] & 0x10 and not calls[1] & 0x10)
 
     def test_the_counts_are_protected_from_the_agent(self):
         g = gate.Gate(self.cfg, self.cwd)

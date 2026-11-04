@@ -14,6 +14,7 @@ not leak, that `a || cd x` may skip the cd.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -183,7 +184,12 @@ def _sealed_memfd(data: bytes) -> int:
     """A memfd that holds exactly `data` and can no longer be written, grown or shrunk (nor can the seals change)."""
     import fcntl
 
-    fd = os.memfd_create("shfmt", os.MFD_ALLOW_SEALING)
+    try:  # MFD_EXEC (0x10): with `vm.memfd_noexec` set the kernel wants it said; an older kernel answers EINVAL — ask without it
+        fd = os.memfd_create("shfmt", os.MFD_ALLOW_SEALING | 0x10)
+    except OSError as e:
+        if e.errno != errno.EINVAL:
+            raise
+        fd = os.memfd_create("shfmt", os.MFD_ALLOW_SEALING)
     try:
         os.write(fd, data)
         fcntl.fcntl(fd, fcntl.F_ADD_SEALS, fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL)

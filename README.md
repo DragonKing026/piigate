@@ -342,7 +342,7 @@ after one second (a hung `shfmt` included), and an error or timeout in it change
 own commands, how often the two front-ends differ — it is not a new gate and nothing here promises that it becomes one.
 
 What is stored — numbers only, in `shell-shadow.json` in the filter's data directory (mode 0600, written under a lock,
-at most 60 days, a few KB; the gate treats it like the map: the agent can neither read nor write it):
+at most 60 days, a few KB, in a directory created with mode 0700; a busy lock or a failed write only loses a count — the shadow never waits; the gate treats it like the map: the agent can neither read nor write it):
 
 - per day, a count for each of: `same-allow`, `same-deny`, `old-deny-new-allow`, `old-allow-new-deny`, `parse-error`,
   `shadow-error`, `shadow-timeout`;
@@ -361,7 +361,7 @@ piigate shadow-reset    # deletes the counts (human only)
 
 Or edit `~/.config/piigate/config.json` yourself: `{"shell_shadow": true}`. `shfmt` v3.14.1 is bundled for linux and
 darwin on amd64 and arm64 (`bin/shfmt-<os>-<arch>`, pinned by sha256, BSD-3-Clause, [bin/shfmt-LICENSE](bin/shfmt-LICENSE),
-from <https://github.com/mvdan/sh>); on another platform the shadow counts `parse-error` and nothing else happens.
+from <https://github.com/mvdan/sh>); on Linux it is run from a sealed in-memory file (`memfd`), so with the kernel setting `vm.memfd_noexec=2` it cannot run and the shadow counts only `parse-error` (it never changes a decision); on another platform the shadow counts `parse-error` and nothing else happens.
 
 ## Testing
 

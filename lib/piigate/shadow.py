@@ -15,8 +15,11 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
+import resource
 import signal
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -80,31 +83,88 @@ def _empty_day() -> dict:
     return {**dict.fromkeys(CATEGORIES, 0), "causes": {}, "reasons": {}, "ms": {}}
 
 
-def _update(change) -> None:
-    """Applies `change(data)` to the counters under an exclusive lock; a corrupt or alien file starts again."""
-    folder = config.data_dir()
-    folder.mkdir(parents=True, exist_ok=True)
-    target = folder / FILE
-    fd = os.open(folder / (FILE + ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        data = {"version": 1, "days": {}}
+def _counts(value, allowed) -> dict:
+    """A dict of non-negative integers under keys from a fixed list; anything else is dropped."""
+    if not isinstance(value, dict):
+        return {}
+    return {k: v for k, v in value.items() if k in allowed and type(v) is int and v >= 0}
+
+
+def clean(loaded) -> dict:
+    """The file as the schema allows it: unknown keys, wrong types and malformed days are dropped (a corrupt or alien
+    file starts again from what is valid — never an exception)."""
+    days: dict = {}
+    if isinstance(loaded, dict) and isinstance(loaded.get("days"), dict):
+        for name, d in loaded["days"].items():
+            if not (isinstance(name, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", name) and isinstance(d, dict)):
+                continue
+            day = _empty_day()
+            day.update(_counts(d, CATEGORIES))
+            day["causes"] = _counts(d.get("causes"), CAUSES)
+            day["ms"] = _counts(d.get("ms"), MS_BUCKETS)
+            reasons = d.get("reasons")
+            if isinstance(reasons, dict):
+                day["reasons"] = {
+                    k: _counts(reasons.get(k), REASON_LABELS) for k in ("old-deny-new-allow", "old-allow-new-deny") if k in reasons
+                }
+            days[name] = day
+    return {"version": 1, "days": days}
+
+
+_HOLDING = False  # this process holds the lock: the alarm handler must not come back into `_update`
+LOCK_WAIT_S = 0.3
+
+
+def _lock(folder: str):
+    """The lock file, held (non-blocking, a short wait at most) or None. Never follows a symlink; mode 0600."""
+    fd = os.open(os.path.join(folder, FILE + ".lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    deadline = time.monotonic() + LOCK_WAIT_S
+    while True:
         try:
-            loaded = json.loads(target.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict) and isinstance(loaded.get("days"), dict):
-                data = loaded
-        except (OSError, ValueError):
-            pass
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except OSError:
+            if time.monotonic() >= deadline:
+                os.close(fd)
+                return None
+            time.sleep(0.01)
+
+
+def _update(change) -> bool:
+    """Applies `change(data)` to the counters under an exclusive lock; False when the lock is busy (nothing is written —
+    the shadow only counts, a lost count is acceptable, a wait is not)."""
+    global _HOLDING
+    folder = str(config.data_dir())
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    fd = _lock(folder)
+    if fd is None:
+        return False
+    _HOLDING = True
+    tmp = None
+    try:
+        try:
+            with open(os.path.join(folder, FILE), encoding="utf-8") as f:
+                loaded = json.load(f)
+        except (OSError, ValueError, RecursionError):
+            loaded = None
+        data = clean(loaded)
         change(data)
         days = data["days"]
         for old in sorted(days)[:-KEEP_DAYS]:
             del days[old]
-        tmp = folder / (FILE + ".tmp")
-        out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        out, tmp = tempfile.mkstemp(prefix=FILE + ".", dir=folder)  # 0600, an unpredictable name in the same directory
         with os.fdopen(out, "w", encoding="utf-8") as f:
             json.dump(data, f, sort_keys=True)
-        os.replace(tmp, target)
+        os.replace(tmp, os.path.join(folder, FILE))
+        tmp = None
+        return True
     finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        _HOLDING = False
         os.close(fd)
 
 
@@ -122,9 +182,9 @@ def _bump(day: dict, category: str, ms: float | None = None, cause: str | None =
         r[label] = r.get(label, 0) + 1
 
 
-def record(category: str, ms: float | None = None, cause: str | None = None, old: str | None = None, new: str | None = None) -> None:
+def record(category: str, ms: float | None = None, cause: str | None = None, old: str | None = None, new: str | None = None) -> bool:
     today = time.strftime("%Y-%m-%d")
-    _update(lambda data: _bump(data["days"].setdefault(today, _empty_day()), category, ms, cause, old, new))
+    return _update(lambda data: _bump(data["days"].setdefault(today, _empty_day()), category, ms, cause, old, new))
 
 
 def classify_cause(cfg: dict, cwd: str, command: str, files: bool, dialect: str | None = None) -> str:
@@ -164,13 +224,35 @@ def judge(cfg: dict, cwd: str, command: str, files: bool, old_reason: str | None
     return "old-allow-new-deny", ms, None, None, _label(new_reason)
 
 
-def _child(cfg: dict, cwd: str, command: str, files: bool, old_reason: str | None) -> None:
-    def too_slow(signum, frame):  # the budget is over (a hung shfmt, a pathological line)
+def _harden() -> None:
+    """The child holds the command in memory (it may hold personal data): no core dump, not ptrace-able; and a CPU limit that
+    does not depend on Python (the kernel kills it) next to the wall-clock alarm."""
+    for call in (
+        lambda: resource.setrlimit(resource.RLIMIT_CORE, (0, 0)),
+        lambda: resource.setrlimit(resource.RLIMIT_CPU, (2, 3)),
+        lambda: __import__("ctypes").CDLL(None, use_errno=True).prctl(4, 0, 0, 0, 0),  # PR_SET_DUMPABLE = 0
+    ):
         try:
-            record("shadow-timeout")
-        finally:
-            os._exit(0)
+            call()
+        except Exception:  # noqa: BLE001, S110 — best effort
+            pass
 
+
+def _child(cfg: dict, cwd: str, command: str, files: bool, old_reason: str | None) -> None:
+    def die(signum, frame):  # the last word: whatever the child was doing, it ends now
+        os._exit(0)
+
+    def too_slow(signum, frame):  # the budget is over (a hung shfmt, a pathological line)
+        signal.signal(signal.SIGALRM, die)
+        signal.setitimer(signal.ITIMER_REAL, 0.5)  # recording must fit in this
+        if not _HOLDING:  # inside `_update` the lock is ours already: do not come back into it
+            try:
+                record("shadow-timeout")
+            except BaseException:  # noqa: BLE001, S110
+                pass
+        os._exit(0)
+
+    _harden()
     signal.signal(signal.SIGALRM, too_slow)
     signal.setitimer(signal.ITIMER_REAL, BUDGET_S)
     try:
@@ -217,10 +299,9 @@ def observe(cfg: dict, cwd: str, command: str, old_reason: str | None, files: bo
 
 def read() -> dict:
     try:
-        data = json.loads(Path(path()).read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) and isinstance(data.get("days"), dict) else {"version": 1, "days": {}}
-    except (OSError, ValueError):
-        return {"version": 1, "days": {}}
+        return clean(json.loads(Path(path()).read_text(encoding="utf-8")))
+    except (OSError, ValueError, RecursionError):
+        return clean(None)
 
 
 def report() -> str:
@@ -247,8 +328,14 @@ def report() -> str:
 
 
 def reset() -> None:
-    for name in (FILE, FILE + ".tmp"):
-        try:
-            os.unlink(config.data_dir() / name)
-        except FileNotFoundError:
-            pass
+    folder = str(config.data_dir())
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return
+    for name in names:
+        if name == FILE or name.startswith(FILE + ".") and name != FILE + ".lock":
+            try:
+                os.unlink(os.path.join(folder, name))
+            except OSError:
+                pass
