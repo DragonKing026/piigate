@@ -534,6 +534,13 @@ def _redirect(r: dict, inherited: bool = False) -> Redirect:
 # `getopts`, `${x:=…}`, a second assignment, an assignment from another variable or from a substitution, a prefix
 # assignment `x=1 cmd` — makes the value unknown. A `for` / `select` variable takes each of its static items: a SET.
 
+# parameters whose value is never a path: a status, a count, a process id, the locale, the user name… (named on purpose;
+# a line that assigns one of them is judged by its assignment like any variable). Their value is shown as the plain letter X.
+SAFE_PARAMS = {
+    "?", "$", "!", "-", "PIPESTATUS", "pipestatus", "status", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "TERM", "USER", "LOGNAME",
+    "SHELL", "HOSTNAME", "HOST", "EUID", "UID", "PPID", "RANDOM", "SECONDS", "LINENO", "OSTYPE", "HOSTTYPE", "MACHTYPE", "SHLVL",
+    "COLUMNS", "LINES",
+}
 DECLARATIONS = {"declare", "typeset", "local", "readonly", "export"}
 # builtins that assign to the variables named in their arguments: every identifier among the arguments is unknown after
 ASSIGNING = {"read", "mapfile", "readarray", "getopts", "unset", "coproc"}
@@ -572,6 +579,8 @@ class VarModel:
             return "static", pwd
         if name in self.env:
             return "static", self.env[name]
+        if name in SAFE_PARAMS:
+            return "safe", None
         return "unknown", None
 
 
@@ -630,12 +639,17 @@ def subst_word(w: Word, lookup, dialect: str = DEFAULT_DIALECT, cmd_value=None) 
                 unresolved.append("(substitution)")
             else:
                 options.append([got])
+        elif seg[0] == "opaque" and seg[2] and all(lookup(n)[0] == "safe" for n in seg[2]):
+            options.append(["X"])  # , : a status or a name, never a path
         elif seg[0] == "opaque":
             options.append([seg[1]])
             unresolved.extend(seg[2] or ("(substitution)" if seg[1].startswith(("$(", "<(", ">(", "=(")) else "(expansion)",))
         else:
             _, name, quoted = seg
             kind, val = lookup(name)
+            if kind == "safe":
+                options.append(["X"])
+                continue
             if kind == "declared":  # a parameter of a function, seen where it is declared: judged where it is called
                 options.append(["${" + name + "}"])
                 continue

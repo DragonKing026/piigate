@@ -615,7 +615,8 @@ class TestNoWordDisappears(Base):
     def pieces(node, out: list[str]) -> None:
         if isinstance(node, dict):
             if node.get("Type") in ("Lit", "SglQuoted") and node.get("Value"):
-                out.append(node["Value"])
+                # `$'…'` holds escapes: what the shell makes of them is what is emitted
+                out.append(shell._ansi_c(node["Value"]) if node.get("Dollar") else node["Value"])
             for k, v in node.items():
                 if k not in ("Pos", "End", "Position"):
                     TestNoWordDisappears.pieces(v, out)

@@ -286,6 +286,112 @@ class TestRules(Base):
             self.assertTrue(g.parse_error)
 
 
+class TestRound4(Base):
+    def deny(self, command: str, dialect: str = "zsh") -> None:
+        g = self.ast(dialect)
+        self.assertIsNotNone(g.bash(command), command)
+
+    def allow(self, command: str, dialect: str = "zsh") -> None:
+        g = self.ast(dialect)
+        self.assertIsNone(g.bash(command), (command, g.bash(command)))
+
+    def test_pwd_and_tilde_plus_follow_the_directory(self):
+        self.deny("cd ../Sensitive-data; cat $PWD/people.csv")
+        self.deny("cd ../Sensitive-data; cat ~+/people.csv")
+        self.deny("cd ../Sens*; cat $PWD/people.csv")  # an unknown directory: PWD is unknown
+        self.allow("cat $PWD/notes.md")
+
+    def test_eval_and_variables_reach_the_functions_of_the_line(self):
+        for command in (
+            "f() { cd ../S*; }; eval f; cat people.csv",
+            "f() { cd ../S*; }; eval 'f'; cat people.csv",
+            "f() { cd ../S*; }; ff=f; $ff; cat people.csv",
+            "f() { cd ../S*; }; eval $x; cat people.csv",
+        ):
+            self.deny(command)
+        self.allow("f() { cd /tmp; }; eval f; cat hosts.txt")
+
+    def test_a_negated_or_until_condition_leaves_the_directory_unknown(self):
+        for command in (
+            "! cd ../S*; cat people.csv",
+            "if ! cd ../S*; then :; fi; cat people.csv",
+            "until cd ../S*; do :; done; cat people.csv",
+            "! cd /nonexistent && cat ../Sensitive-data/people.csv",
+        ):
+            self.deny(command)
+
+    def test_the_words_compose_the_line_for_the_human_only_commands(self):
+        for command in (
+            "piigate rev''erse x", 'piigate "rev"erse x', "piigate rever\\se x", "piigate $'rev\\x65rse' x",
+            "q=rev; piigate ${q}erse x", "piigate project app''rove", "piigate ana''lyze x", 'eval "piigate rev""erse"',
+        ):
+            with self.subTest(command):
+                self.deny(command, "bash")
+                self.deny(command, "zsh")
+
+    def test_gh_files_and_text(self):
+        for command in (
+            'gh issue create --body-file "$(echo ../S*/p*.csv)" --title t', 'gh issue create -F "$f" --title t',
+            'gh api x --input "$f"', 'gh api -F data=@"$f" x', 'gh gist create "$f"', 'gh release upload v1 "$f"',
+        ):
+            with self.subTest(command):
+                self.deny(command)
+        self.allow('gh issue create --title "$(date)" --body hi')
+        self.allow('gh issue comment 1 --body "$f"')
+
+    def test_listers_with_unknown_values_feed_the_names_flow(self):
+        for command in ('echo "$x"/* | xargs cat', "printf '%s\\n' \"$x\"/* | xargs cat", 'rg --files "$x" | xargs cat'):
+            self.deny(command)
+        self.allow('echo "$x"/* | head -3')
+        self.allow('rg --files "$x" | head -3')
+
+    def test_file_valued_options_with_unknown_values(self):
+        for command in ('grep --file="$x" a', 'grep -f "$x" a', 'rg --pre "$x" foo .', 'rg --pre="$x" foo .',
+                        'rg --hostname-bin "$x" foo', 'rg --ignore-file "$x" foo'):
+            self.deny(command)
+
+    def test_zsh_autoload_with_fpath_and_bash_glob_rules(self):
+        self.deny("fpath=(.); autoload -Uz hook; hook")
+        self.allow("autoload -Uz compinit")
+        self.deny("shopt -u globskipdots; cat .*/S*/p*.csv", "bash")
+        self.deny("GLOBIGNORE=; cat .*/S*/p*.csv", "bash")
+
+    def test_unquoted_heredoc_to_an_interpreter_with_an_unknown_value(self):
+        self.deny("x=..; python3 - <<EOF\nopen('$x/Sensitive-data/people.csv')\nEOF")  # a value known: the path is judged
+        self.deny("python3 - <<EOF\nopen('$(echo ../S*/p*.csv)')\nEOF")
+        self.deny("python3 - <<EOF\nopen('$UNKNOWN/x')\nEOF")
+        self.allow("python3 - <<'EOF'\nprint('$UNKNOWN')\nEOF")  # quoted: nothing is expanded
+        self.allow("cat <<EOF\n$UNKNOWN\nEOF")  # text for cat, not an interpreter
+
+    def test_known_values_cost_nothing(self):
+        for command in (
+            'D="a b"; cat "$D"', "D=sub; cd \"$D\" && cat notes.md", 'for f in *.md; do cat "$f".bak; done',
+            'T="ls -l"; $T', 't() { python3 x.py "$@"; }; t log', 't() { cat "$1"; }; t notes.md',
+            "cat $PWD/notes.md", "x=$(pwd); cat $x/notes.md", 'cat "$(pwd)/notes.md"', "cat log-$(date +%F).txt",
+            "echo $?; echo ${pipestatus[0]}", "ls *(om[1,3])",
+        ):
+            with self.subTest(command):
+                self.allow(command)
+
+    def test_known_values_are_judged(self):
+        for command in (
+            'D="../Sensitive-data"; cat "$D/people.csv"', "D=../Sensitive-data; cd \"$D\" && cat people.csv",
+            "for d in ../Sensitive-data ../x; do cat $d/people.csv; done", 't() { cat "$1"; }; t ../Sensitive-data/people.csv',
+            'x=$(pwd); cd ..; cat $x/../Sensitive-data/people.csv',
+        ):
+            with self.subTest(command):
+                self.deny(command)
+
+    def test_the_commands_with_a_known_output_are_explicit(self):
+        g = self.ast()
+        self.assertEqual(g._command_value(("pwd",), "/w"), "/w")
+        self.assertIsNone(g._command_value(("mktemp",), "/w"))
+        self.assertIsNone(g._command_value(("ls",), "/w"))
+        self.assertEqual(g._command_value(("date", "+%F"), "/w"), "X")
+        self.assertIsNone(g._command_value(("date", "+%d/%m"), "/w"))  # a `/` in the format: not a name any more
+        self.assertEqual(g._command_value(("dirname", "a/b/c"), "/w"), "a/b")
+
+
 class TestWordValuesAgainstARealShell(Base):
     """B1: the value of a word is computed from the pieces of the tree. For a corpus of static variables and every way to
     glue them to quotes, the words `AstGate` makes of `cat WORD` are what a real zsh / bash makes of `printf [%s] WORD`."""
