@@ -4816,7 +4816,7 @@ class TestChecksumNumbers(unittest.TestCase):
                     result, _ = text.filter_text(sample, CONFIG)
                     self.assertNotIn("600 700", result)
                     self.assertNotIn("600-700", result)
-        for sample in ("200 302 404 500 200", "kody: 200 302 200 200 200", "100 101 102 103", "503 504 511 451 431 226 208",
+        for sample in ("200 302 404 500 200", "kody: 200 302 200 200 200", "100 101 102 103", "451 431 226 208 503 504 511",
                        "200-302-404-500"):
             with self.subTest(sample):
                 self.assertEqual(phones(sample), [], sample)
@@ -4847,16 +4847,14 @@ class TestChecksumNumbers(unittest.TestCase):
         result, _ = text.filter_text("karta 4111 1111 1111 1111", CONFIG)
         self.assertNotIn("4111", result)
 
-    @unittest.skipUnless(PRESIDIO, PRESIDIO_SKIP)
     def test_http_code_lists_are_not_phones(self):
-        """Issue #30: four or more groups of three digits are a list of numbers; a phone stays a phone."""
+        """Issue #30: four or more groups of three digits are a list of numbers; a phone stays a phone (rules and
+        sensors only — it needs no NER engine)."""
         from piigate import rules
 
         for lst in ("200 302 200 200 200", "kody: 200 302 404 500 200", "200 302 404 500", "200-302-404-500"):
             with self.subTest(lst):
                 self.assertEqual([f for f in rules.detect(lst) if f.type_ == "PHONE"], [])
-                result, _ = text.filter_text(lst, CONFIG)
-                self.assertNotIn("PHONE_", result)
                 self.assertEqual(sensors_mask(lst)[1], 0)
         for phone in ("600 302 200", "tel. 600 302 200", "+48 600 302 200", "22 630 10 10", "600-302-200"):
             with self.subTest(phone):
@@ -4865,9 +4863,34 @@ class TestChecksumNumbers(unittest.TestCase):
         line = "kody 200 302 404 500 oraz tel. 600 302 200 i 22 630 10 10"
         found = [line[f.start : f.end] for f in rules.detect(line) if f.type_ == "PHONE"]
         self.assertEqual(sorted(set(found)), ["22 630 10 10", "600 302 200"])
+
+    @unittest.skipUnless(PRESIDIO, PRESIDIO_SKIP)
+    def test_http_code_lists_are_not_phones_with_presidio(self):
+        for lst in ("200 302 200 200 200", "kody: 200 302 404 500 200", "200 302 404 500", "200-302-404-500"):
+            with self.subTest(lst):
+                result, _ = text.filter_text(lst, CONFIG)
+                self.assertNotIn("PHONE_", result)
         result, _ = text.filter_text("tel 600 302 200, kody 200 302 200 200 200", CONFIG)
         self.assertNotIn("600 302 200", result)
         self.assertIn("200 302 200 200 200", result)
+
+    def test_a_list_does_not_start_with_a_5xx_number(self):
+        """Phones that start with 50x and 51x (501 502 503) are not the beginning of a list of status codes."""
+        from piigate import rules
+
+        def phones(sample: str) -> list[str]:
+            return [sample[f.start : f.end] for f in rules.detect(sample) if f.type_ == "PHONE"]
+
+        self.assertEqual(phones("501 502 503 200 200 200"), ["501 502 503", "200 200 200"])
+        self.assertEqual(phones("501 502 503 501 502 503"), ["501 502 503", "501 502 503"])
+        self.assertEqual(phones("500 200 200 200"), ["500 200 200"])  # on purpose: masking is the safer error
+        self.assertEqual(phones("503 200 200 200 200"), ["503 200 200"])
+        for lst in ("kody: 200 302 404 500 200", "200 500 502 503", "404 500 503 200", "200 302 200 200 200"):
+            with self.subTest(lst):
+                self.assertEqual(phones(lst), [], lst)
+        for sample in ("501 502 503 200 200 200", "501 502 503 501 502 503"):
+            self.assertEqual(sensors_mask(sample)[1], 0)  # (the masking of a phone is the filter's job, not the sensors')
+            self.assertEqual(verdict.check_text(sample + "\n", CONFIG), {"PHONE": 2}, sample)
 
     def test_a_list_of_numbers_stays_in_one_line_and_has_no_phone_label(self):
         """A column of phones is not a list, and neither is a labelled phone followed by a three-digit number."""

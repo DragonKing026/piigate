@@ -409,9 +409,11 @@ def _group(m: re.Match) -> tuple[int, int]:
 
 
 # four or more HTTP status codes in one line, with one kind of separator, are a list of numbers (`200 302 404 500`),
-# not a phone — groups that are not all status codes (`600 700 800 900`) stay phones; a line break never joins them (a column of phones), nor does a phone label
+# not a phone — groups that are not all status codes (`600 700 800 900`) stay phones, and so does a start with a 5xx
+# number (`501 502 503 200 200 200`); a line break never joins them (a column of phones), nor does a phone label
 _HTTP_CODE = r"(?:10[0-3]|20[0-8]|226|30[0-8]|4[0-2]\d|431|451|50\d|51[01])"
-NUMBER_LIST_RE = re.compile(rf"(?<![\w+.-]){_HTTP_CODE}([ \t-]){_HTTP_CODE}(?:\1{_HTTP_CODE}){{2,}}(?!\w)")
+_FIRST_HTTP_CODE = r"(?:10[0-3]|20[0-8]|226|30[0-8]|4[0-2]\d|431|451)"  # not 5xx: 501 502 503 is a phone (or two)
+NUMBER_LIST_RE = re.compile(rf"(?<![\w+.-]){_FIRST_HTTP_CODE}([ \t-]){_HTTP_CODE}(?:\1{_HTTP_CODE}){{2,}}(?!\w)")
 BARE_PHONE_RE = re.compile(r"\d{3}[ \t-]\d{3}[ \t-]\d{3}")
 PHONE_LABEL_RE = re.compile(r"(?i)\b(?:tel|telefon\w*|kom|komórk\w*)\.?\s*[:.]?\s*$")
 
