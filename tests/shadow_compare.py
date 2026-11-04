@@ -316,6 +316,7 @@ def main() -> None:
             row = {"name": case.name, "command": case.command, "what": case.what, "old": "allow" if old_reason is None else "deny"}
             real = world.real(case.command)
             real_cc = world.real(case.command, "cc")
+            row["signals"] = {m: r["signal"] for m, r in (("f", real), ("cc", real_cc)) if r.get("signal")}
             row["real_reads"] = bool(real.get("reads"))
             row["real_cc_reads"] = bool(real_cc.get("reads"))
             row["real_runs_code"] = bool(real.get("runs"))
@@ -388,6 +389,8 @@ def main() -> None:
     if out_path:
         Path(out_path).write_text(json.dumps(report, indent=1, ensure_ascii=False, default=str), encoding="utf-8")
     print_report(report, n_examples)
+    if any(r["signals"] for r in report["adversarial"]["rows"]) or any(r.get("signals") for r in report["zsh_cases"]):
+        sys.exit(1)
 
 
 def print_report(report: dict, n_examples: int) -> None:
@@ -411,6 +414,11 @@ def print_report(report: dict, n_examples: int) -> None:
         for r in report["discrepancies"][d][:n_examples]:
             print(f"  [{r[d]['category']}] {r['test']}: {r['command'][:110]!r}")
             print(f"      old: {r['old']} {r['old_reason'][:80]!r} | new: {r[d]['decision']} {(r[d]['parse_error'] or r[d]['adapter_error'] or r[d]['reason'])[:80]!r} | expected {r['expected']}")
+    bad = [r["name"] for r in report["adversarial"]["rows"] if r["signals"]] + [
+        r["name"] for r in report["zsh_cases"] if r.get("signals")
+    ]
+    if bad:
+        print("MEASUREMENT FAILED: a real shell died of a signal in", bad)
     adv = report["adversarial"]
     print(f"\nadversarial corpus: {adv['cases']} cases; categories:", adv["categories"])
     print("  a real shell reads and the OLD gate allows:", adv["real_reads_and_old_allows"])

@@ -13,6 +13,7 @@ one row per case; `python3 -I tests/shell_adversarial.py` prints the table.
 
 from __future__ import annotations
 
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,10 +34,22 @@ class Adv:
     section: str
     command: str
     expect: str | None = None  # "allow" | "deny" when the gate must decide so (piigate lines), else None
+    norun: str = ""  # why the line is NOT run in a real shell (it hangs or crashes one): only the gate's decision is measured
 
 
-def _c(section: str, name: str, command: str, expect: str | None = None) -> Adv:
-    return Adv(name, section, command.replace("{V}", V).replace("{G}", G), expect)
+def _c(section: str, name: str, command: str, expect: str | None = None, norun: str = "") -> Adv:
+    return Adv(name, section, command.replace("{V}", V).replace("{G}", G), expect, norun)
+
+
+# What a line must not do in a real shell: recurse, fork without end, loop forever, expand to a huge list, nest without end.
+# `norun` cases are exempt; every other case is checked against these by the tests (and the shell has FUNCNEST + rlimits too).
+HOSTILE = re.compile(
+    r"(?P<f>\w+)\(\)\s*\{(?:\s*|[^}]*[;&|(]\s*)(?P=f)(?![\w-])"  # a function that calls itself
+    r"|:\(\)\s*\{|\bfork\b"  # the fork bomb
+    r"|\{\d+\.\.\d{4,}\}"  # {1..99999}
+    r"|\bwhile\s+(?:true|:)\s*;\s*do(?![^;]*\bbreak\b)[^;]*;\s*done"  # a loop that never ends
+    r"|(?:\$\(|\(){12,}"  # deep nesting
+)
 
 
 CASES: list[Adv] = [
@@ -125,7 +138,13 @@ CASES: list[Adv] = [
     _c("Z3", "function-in-pipeline", "f() { find ../Sensitive-data -type f; :; }; f | xargs cat"),
     _c("Z3", "function-cd-carries-on", "f() { cd ../Sensitive-data; }; f; cat people.csv"),
     _c("Z3", "function-called-twice", "f() { cat people.csv; }; cd ../Sensitive-data && f && f"),
-    _c("Z3", "function-recursion", "f() { f; }; f"),
+    _c("Z3", "function-recursion", "f() { f; }; f", norun="recursion: bash overflows its stack on it (SIGSEGV) — the gate refuses it by a limit"),
+    _c("Z3", "function-recursion-pipe", "f() { f | f; }; f", norun="recursion with a fork at each level"),
+    _c("Z3", "function-recursion-indirect", "a() { b; }; b() { a; }; a", norun="mutual recursion"),
+    _c("Z3", "deep-substitution", "echo " + "$(echo " * 14 + "x" + ")" * 14, norun="deep nesting: the gate refuses by the limit of the walker"),
+    _c("Z3", "huge-brace-expansion", "echo {1..99999999} | wc -c", norun="expands to a list that exhausts memory"),
+    _c("Z3", "fork-bomb-shape", ":(){ :|:& };:", norun="a fork bomb"),
+    _c("Z3", "endless-loop", "while true; do :; done", norun="never ends"),
     _c("Z3", "function-in-subshell", "f() { cd ../Sensitive-data; }; (f); cat people.csv"),
     _c("Z3", "coproc-named", "coproc C { cat {V}; }; cat <&${C[0]}"),
     _c("Z3", "coproc-lister", "coproc find ../Sensitive-data -type f; cat <&p"),
@@ -151,10 +170,10 @@ CASES: list[Adv] = [
     _c("Z4", "single-quoted-literal", "cat '$x'"),
     # Z5 — zsh: what a qualifier or a flag may run depends on the options
     _c("Z5", "qualifier-no-setopt", "echo *(e:'cat {G} >&2':)"),
-    _c("Z5", "qualifier-options-array", "options[bareglobqual]=on; echo *(e/'cat {G} >\&2'/)"),
+    _c("Z5", "qualifier-options-array", "options[bareglobqual]=on; echo *(e/'cat {G} >\\&2'/)"),
     _c("Z5", "qualifier-setopt", "setopt bareglobqual; echo *(e:'cat {G} >&2':)"),
-    _c("Z5", "qualifier-setopt-comma", "setopt bareglobqual; echo *(e,'cat {G} >\&2',)"),
-    _c("Z5", "qualifier-setopt-bang", "setopt bareglobqual; echo *(e!'cat {G} >\&2'!)"),
+    _c("Z5", "qualifier-setopt-comma", "setopt bareglobqual; echo *(e,'cat {G} >\\&2',)"),
+    _c("Z5", "qualifier-setopt-bang", "setopt bareglobqual; echo *(e!'cat {G} >\\&2'!)"),
     _c("Z5", "qualifier-set-o", "set -o extendedglob; echo *(#qe:'cat {G} >&2':)"),
     _c("Z5", "qualifier-func", "f() { cat {G} >&2; }; setopt bareglobqual; echo *(+f)"),
     _c("Z5", "flag-e", "x='$(cat {G} >&2)'; echo ${(e)x}"),
@@ -323,13 +342,19 @@ def measure(world: zc.World | None = None, cases: list[Adv] | None = None) -> li
                     "OLD-DENY-NEW-ALLOW" if old is not None else "OLD-ALLOW-NEW-DENY")
                 row[d] = {"decision": "allow" if reason is None else "deny", "category": category,
                           "parse_error": g.parse_error, "internal_error": g.internal_error, "reason": (reason or "")[:160]}
-            real = {m: world.real(case.command, m) for m in ("f", "cc", "bash")}
+            if case.norun:
+                real = {m: {"reads": False} for m in ("f", "cc", "bash")}
+                row["norun"] = case.norun
+            else:
+                real = {m: world.real(case.command, m) for m in ("f", "cc", "bash")}
             row["real"] = {m: bool(r.get("reads")) for m, r in real.items()}
+            row["signals"] = {m: r.get("signal", 0) for m, r in real.items() if r.get("signal")}
             row["real_any"] = any(row["real"].values())
             row["old_hole"] = old is None and row["real_any"]
             for d in shell.DIALECTS:
                 row[d]["hole"] = row[d]["decision"] == "allow" and row["real_any"]
             row["known"] = KNOWN.get(case.name)
+            row["norun"] = case.norun
             rows.append(row)
     finally:
         if own:

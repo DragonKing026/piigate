@@ -360,6 +360,39 @@ class TestSealedBinary(Base):
             os.close(fd)
 
 
+class TestRealShellRunner(unittest.TestCase):
+    """The only way the test tools start a real shell: no core dumps, limits, FUNCNEST, a session of its own."""
+
+    def test_limits_are_applied(self):
+        import shell_zsh_cases as zc
+
+        done = zc.run_limited(["/usr/bin/bash", "--noprofile", "--norc", "-c", "ulimit -c; ulimit -t; ulimit -f; echo $FUNCNEST"],
+                              "/", {"PATH": "/usr/bin:/bin"})
+        self.assertEqual(done["out"].split(), ["0", "5", "1024", "64"])
+        self.assertEqual((done["rc"], done["signal"], done["timeout"]), (0, 0, False))
+
+    def test_a_signal_is_reported_and_a_hang_is_killed(self):
+        import shell_zsh_cases as zc
+
+        done = zc.run_limited(["/usr/bin/bash", "--noprofile", "--norc", "-c", "kill -TERM $$"], "/", {"PATH": "/usr/bin:/bin"})
+        self.assertEqual(done["signal"], 15)
+        done = zc.run_limited(["/usr/bin/bash", "--noprofile", "--norc", "-c", "sleep 30"], "/", {"PATH": "/usr/bin:/bin"}, timeout=0.5)
+        self.assertTrue(done["timeout"])
+
+    def test_hostile_lines_are_not_run(self):
+        import shell_adversarial
+
+        run = [c.name for c in shell_adversarial.CASES if not c.norun and shell_adversarial.HOSTILE.search(c.command)]
+        self.assertEqual(run, [])  # a recursion, a fork bomb, a huge expansion, an endless loop, deep nesting: norun with a reason
+        norun = {c.name: c.norun for c in shell_adversarial.CASES if c.norun}
+        self.assertIn("function-recursion", norun)
+        self.assertTrue(all(norun.values()))
+        for case in shell_adversarial.CASES:
+            if case.norun:
+                continue
+            self.assertNotIn("FUNCNEST", case.command)
+
+
 class TestAdversarialCorpus(Base):
     """Every line of tests/shell_adversarial.py that a real shell reads is denied — except the listed limitations."""
 
@@ -371,6 +404,8 @@ class TestAdversarialCorpus(Base):
         if not shutil.which("zsh"):
             self.skipTest("zsh not installed: the corpus is measured against real shells")
         rows = shell_adversarial.measure()
+        killed = {r["name"]: r["signals"] for r in rows if r["signals"]}
+        self.assertEqual(killed, {}, "a real shell died of a signal: the measurement of these cases is void")
         for dialect in shell.DIALECTS:
             self.assertEqual([r["name"] for r in shell_adversarial.unexplained(rows, dialect)], [], dialect)
         for r in rows:

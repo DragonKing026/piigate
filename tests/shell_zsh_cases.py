@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import json
 import os
+import resource
+import signal
 import shutil
 import subprocess
 import sys
@@ -34,6 +36,36 @@ sys.path.insert(0, str(HERE.parent / "lib"))
 CANARY = "CANARY-SENSITIVE-ROW"
 EXEC = "EXEC-42"  # printed only by code that really ran (`$((40+2))` is computed, never in the line itself)
 SENSITIVE_NAME = "Sensitive-data"
+
+
+def run_limited(argv: list[str], cwd, env: dict, timeout: float = 5.0) -> dict:
+    """The ONLY way the test tools start a real shell. The line may be hostile (the corpus is): no core dumps, address space
+    1 GiB, CPU 5 s, a small number of NEW processes, files up to 1 MiB, FUNCNEST (a function that calls itself stops in the
+    shell instead of overflowing its stack), a session of its own (the whole group is killed on timeout), no stdin.
+    Returns {"rc", "signal" (the signal that killed it, else 0), "out", "timeout"}."""
+    full_env = {**env, "FUNCNEST": "64"}
+    processes = sum(1 for d in os.listdir("/proc") if d.isdigit())  # NPROC is per user: leave room above what is running
+
+    def limits() -> None:
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        resource.setrlimit(resource.RLIMIT_AS, (1 << 30, 1 << 30))
+        resource.setrlimit(resource.RLIMIT_CPU, (5, 5))
+        resource.setrlimit(resource.RLIMIT_FSIZE, (1 << 20, 1 << 20))
+        resource.setrlimit(resource.RLIMIT_NPROC, (processes + 60, processes + 60))
+
+    proc = subprocess.Popen(
+        argv, cwd=cwd, env=full_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        start_new_session=True, preexec_fn=limits,
+    )
+    try:
+        out, _ = proc.communicate(timeout=timeout)
+        timed_out = False
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        out, _ = proc.communicate()
+        timed_out = True
+    rc = proc.returncode
+    return {"rc": rc, "signal": -rc if rc is not None and rc < 0 and not timed_out else 0, "out": out or "", "timeout": timed_out}
 
 
 @dataclass(frozen=True)
@@ -129,9 +161,10 @@ class World:
         return (factory or gate.Gate)(cfg, str(self.work))
 
     def real(self, command: str, mode: str = "f") -> dict:
-        """Runs the line in zsh (no rc files) inside the directory; a minimal environment, 5 s.
-        mode "f": `zsh -f -c LINE`. mode "cc": the way Claude Code starts a command — `zsh -c` with
-        `setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL`, then `eval LINE` (glob qualifiers work only after a `setopt`)."""
+        """Runs the line in a real shell inside the directory, through `run_limited` (core dumps off, memory/CPU/process/file
+        limits, FUNCNEST, a session of its own, 5 s). mode "f": `zsh -f -c LINE`. mode "cc": the way Claude Code starts a
+        command — `zsh -c` with `setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL`, then `eval LINE`. mode "bash": `bash -c LINE`.
+        A shell that dies of a signal is a failure of the MEASUREMENT: `signal` is set and the tests fail on it."""
         env = {"HOME": str(self.root), "PATH": "/usr/bin:/bin", "ZDOTDIR": str(self.root / "nozdot")}
         zsh = shutil.which("zsh")
         if not zsh:
@@ -145,24 +178,15 @@ class World:
         if mode == "cc":
             env["PIIGATE_LINE"] = command
             argv = [zsh, "-f", "-c", 'setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL; eval "$PIIGATE_LINE"']
-        try:
-            done = subprocess.run(
-                argv,
-                cwd=self.work,
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-                stdin=subprocess.DEVNULL,
-            )
-        except subprocess.TimeoutExpired:
+        done = run_limited(argv, self.work, env)
+        if done["timeout"]:
             return {"available": True, "timeout": True, "reads": False, "runs": False, "out": ""}
-        out = (done.stdout + done.stderr).strip()
+        out = done["out"].strip()
         first = out.splitlines()[0][:100] if out else ""
         return {
             "available": True,
-            "rc": done.returncode,
+            "rc": done["rc"],
+            "signal": done["signal"],
             "reads": CANARY in out,
             "runs": EXEC in out,
             "out": first,
