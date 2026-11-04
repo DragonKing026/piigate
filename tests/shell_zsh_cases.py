@@ -40,18 +40,26 @@ SENSITIVE_NAME = "Sensitive-data"
 
 def run_limited(argv: list[str], cwd, env: dict, timeout: float = 5.0) -> dict:
     """The ONLY way the test tools start a real shell. The line may be hostile (the corpus is): no core dumps, address space
-    1 GiB, CPU 5 s, a small number of NEW processes, files up to 1 MiB, FUNCNEST (a function that calls itself stops in the
+    1 GiB, CPU 5 s, a bounded number of NEW tasks above the ones running, files up to 1 MiB, FUNCNEST (a function that calls itself stops in the
     shell instead of overflowing its stack), a session of its own (the whole group is killed on timeout), no stdin.
     Returns {"rc", "signal" (the signal that killed it, else 0), "out", "timeout"}."""
     full_env = {**env, "FUNCNEST": "64"}
-    processes = sum(1 for d in os.listdir("/proc") if d.isdigit())  # NPROC is per user: leave room above what is running
+    # RLIMIT_NPROC counts every task (thread) of the user: leave room above what runs now, or the shell cannot fork at all
+    # (it retries forever: "fork: retry: Resource temporarily unavailable")
+    processes = 0
+    for d in os.listdir("/proc"):
+        if d.isdigit():
+            try:
+                processes += len(os.listdir(f"/proc/{d}/task"))
+            except OSError:
+                processes += 1
 
     def limits() -> None:
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
         resource.setrlimit(resource.RLIMIT_AS, (1 << 30, 1 << 30))
         resource.setrlimit(resource.RLIMIT_CPU, (5, 5))
         resource.setrlimit(resource.RLIMIT_FSIZE, (1 << 20, 1 << 20))
-        resource.setrlimit(resource.RLIMIT_NPROC, (processes + 60, processes + 60))
+        resource.setrlimit(resource.RLIMIT_NPROC, (processes + 200, processes + 200))
 
     proc = subprocess.Popen(
         argv, cwd=cwd, env=full_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
