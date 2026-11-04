@@ -82,7 +82,11 @@ class AstGate(gate.Gate):
         for a in c.assigns:
             value = a.value.text if a.value else ("(" + " ".join(x.text for x in a.array) + ")" if a.array else "")
             toks.append(a.name + ("+=" if a.append else "=") + value)
-        toks += [self._word_token(w) for w in c.argv]
+        for w in c.argv:
+            if "zsh" in w.kinds and w.text.startswith("(") and w.text.endswith(")") and w.quoting == "none":
+                toks += w.text[1:-1].split()  # zsh `foreach f (a b c)`: a parenthesised word list — each one is a word
+            else:
+                toks.append(self._word_token(w))
         for r in c.redirects:
             if r.fd:
                 toks.append(r.fd)

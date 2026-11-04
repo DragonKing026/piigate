@@ -315,7 +315,9 @@ def main() -> None:
             old_reason = rec.original(g, case.command, True)
             row = {"name": case.name, "command": case.command, "what": case.what, "old": "allow" if old_reason is None else "deny"}
             real = world.real(case.command)
+            real_cc = world.real(case.command, "cc")
             row["real_reads"] = bool(real.get("reads"))
+            row["real_cc_reads"] = bool(real_cc.get("reads"))
             row["real_runs_code"] = bool(real.get("runs"))
             for d in DIALECTS:
                 n = rec.new_decisions(g.cfg, g.cwd, case.command, True)[d]
@@ -324,9 +326,10 @@ def main() -> None:
                     "category": category(old_reason, n["reason"], n["parse_error"], n["adapter_error"]),
                     "parse_error": n["parse_error"],
                 }
-            row["old_hole"] = old_reason is None and row["real_reads"]
+            reads = row["real_reads"] or row["real_cc_reads"]
+            row["old_hole"] = old_reason is None and reads
             for d in DIALECTS:
-                row[d]["new_hole"] = row[d]["decision"] == "allow" and row["real_reads"]
+                row[d]["new_hole"] = row[d]["decision"] == "allow" and reads
             zsh_rows.append(row)
     finally:
         world.close()
@@ -420,10 +423,12 @@ def print_report(report: dict, n_examples: int) -> None:
         for c in adv["benign_new_denies"][d]:
             print("    ", repr(c))
     print("  OLD-DENY-NEW-ALLOW:", adv["old_deny_new_allow"], "| piigate expectation broken:", adv["piigate_expectation_broken"])
-    print("\nzsh cases: old / bash-AST / zsh-AST / real")
+    print("\nzsh cases: old / bash-AST / zsh-AST / real zsh -f / real Claude Code shell")
     for row in report["zsh_cases"]:
         mark = "  <== OLD ALLOWS A READ" if row["old_hole"] else ""
-        print(f"  {row['name']:32} {row['old']:5} {row['bash']['category']:20} {row['zsh']['category']:20} reads={row['real_reads']}{mark}")
+        mark += "  <== bash-AST allows" if row["bash"]["new_hole"] else ""
+        mark += "  <== zsh-AST allows" if row["zsh"]["new_hole"] else ""
+        print(f"  {row['name']:32} {row['old']:5} {row['bash']['category']:20} {row['zsh']['category']:20} f={row['real_reads']!s:5} cc={row['real_cc_reads']!s:5}{mark}")
 
 
 if __name__ == "__main__":

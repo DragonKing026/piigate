@@ -222,6 +222,10 @@ class TestRules(Base):
         self.assertIsNone(self.ast("zsh").bash("echo +(a|b)"))
         self.assertIsNotNone(self.ast("zsh").bash("setopt BARE_GLOB_QUAL; ls *(.)"))
 
+    def test_zsh_foreach_word_list(self):
+        self.deny("foreach f (../S*/p*.csv)\ncat $f\nend", "zsh")
+        self.assertIsNone(self.ast("zsh").bash("foreach f (a b)\necho $f\nend"))
+
     def test_nul_in_a_word_and_unexpected_errors_deny(self):
         g = self.ast()
         self.assertIsNotNone(g.bash("cat $'\\0'"))
