@@ -361,6 +361,12 @@ def main() -> None:
             r["name"] for r in adv_rows if r["expect"] and any(r[d]["decision"] != r["expect"] for d in DIALECTS)
         ],
         "old_deny_new_allow": [r["name"] for r in adv_rows if any(r[d]["category"] == "OLD-DENY-NEW-ALLOW" for d in DIALECTS)],
+        "old_deny_new_allow_real_read": [
+            r["name"] for r in adv_rows if r["real_any"] and any(r[d]["category"] == "OLD-DENY-NEW-ALLOW" for d in DIALECTS)
+        ],
+        "old_deny_new_allow_no_read": [
+            r["name"] for r in adv_rows if not r["real_any"] and any(r[d]["category"] == "OLD-DENY-NEW-ALLOW" for d in DIALECTS)
+        ],
         "rows": adv_rows,
     }
     report = {
@@ -431,6 +437,10 @@ def print_report(report: dict, n_examples: int) -> None:
         print(f"  benign lines (B) the old gate allows and the AST gate denies [{d}] ({len(adv['benign_new_denies'][d])}/{adv['benign_cases']}):")
         for c in adv["benign_new_denies"][d]:
             print("    ", repr(c))
+    print(
+        f"  OLD-DENY-NEW-ALLOW with a real read: {len(adv['old_deny_new_allow_real_read'])} {adv['old_deny_new_allow_real_read']}; "
+        f"without: {len(adv['old_deny_new_allow_no_read'])} {adv['old_deny_new_allow_no_read']}"
+    )
     print("  OLD-DENY-NEW-ALLOW:", adv["old_deny_new_allow"], "| piigate expectation broken:", adv["piigate_expectation_broken"])
     print("\nzsh cases: old / bash-AST / zsh-AST / real zsh -f / real Claude Code shell")
     for row in report["zsh_cases"]:
