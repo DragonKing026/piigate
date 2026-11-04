@@ -4652,7 +4652,7 @@ class TestChecksumNumbers(unittest.TestCase):
             for value in (f"{n[:6]} {n[6:]}", f"{n[:6]}-{n[6:]}", f"{n[:2]} {n[2:4]} {n[4:6]} {n[6:]}", f"{n[:2]}-{n[2:4]}-{n[4:6]}-{n[6:]}"):
                 self.assertIn("PESEL", self.kinds(f"Pacjent: {value} wizyta"), value)
         # not a number: a wrong checksum, glued to a word, a file name, other groupings
-        for value in ("Pacjent: 44 05 14 01459 wizyta", "x440514-01458", "440514-01458x", "v1.440514-01458", "440514-01458-3",
+        for value in ("Pacjent: 44 05 14 01459 wizyta", "440514-01458-3", "1440514-01458", "440514-014581",
                       "compose.yaml.bak-20261023-046", "backup 20261023 046", "440514 0145", "4405140 1458"):
             with self.subTest(value):
                 self.assertNotIn("PESEL", self.kinds(value))
@@ -4671,7 +4671,7 @@ class TestChecksumNumbers(unittest.TestCase):
                 self.assertEqual(verdict.check_text(f"karta {number}.", CONFIG), {"CARD": 1})
                 self.assertEqual(sensors_mask(f"Karta {number} ok"), ("Karta [CARD hidden by piigate] ok", 1))
         for number in ("4111 1111-1111 1112", "4111  1111  1111  1112", "4111 11111111 1112", "200 302 200 200 200",
-                       "x4111 1111-1111 1111", "4111 1111-1111 1111x", "4111   1111   1111   1111"):
+                       "14111 1111-1111 1111", "4111 1111-1111 11111", "4111   1111   1111   1111"):
             with self.subTest(number):
                 self.assertNotIn("CARD", self.kinds(number), number)
                 self.assertEqual(sensors_mask(number)[1], 0, number)
@@ -4679,6 +4679,57 @@ class TestChecksumNumbers(unittest.TestCase):
             result, _ = text.filter_text("karta 4111 1111-1111 1111 i kody 200 302 200 200 200", CONFIG)
             self.assertNotIn("4111", result)
             self.assertIn("200 302 200 200 200", result)
+
+    def test_a_letter_next_to_a_layout_does_not_hide_it(self):
+        """A letter, a mark or a file extension glued to a number in a printed layout is not a reason to let it through
+        (fail closed); only a neighbouring digit is."""
+        found = {
+            "karta4111 1111 1111 1111": "CARD", "4111 1111 1111 1111zł": "CARD", "4111-1111-1111-1111r.": "CARD",
+            "_4111 1111 1111 1111": "CARD", "3782 822463 10005x": "CARD", "x4111 1111-1111 1111": "CARD",
+            "4111 1111-1111 1111x": "CARD", "ID850314 12347": "PESEL", "850314 12347.pdf": "PESEL",
+            "85-03-14-12347zł": "PESEL", "x440514-01458": "PESEL", "440514-01458x": "PESEL", "v1.440514-01458": "PESEL",
+        }
+        for value, kind in found.items():
+            with self.subTest(value):
+                self.assertIn(kind, self.kinds(value))
+        for value in ("karta4111 1111 1111 1111", "4111 1111 1111 1111zł", "4111-1111-1111-1111r.", "_4111 1111 1111 1111",
+                      "3782 822463 10005x"):
+            self.assertEqual(sensors_mask(value)[1], 1, value)
+        # (the verdict check on the output of a tool leaves a number glued to a letter alone, as on main)
+        # a neighbouring digit still means "not this number"
+        for value in ("14111 1111 1111 1111", "4111 1111 1111 11111", "1850314 12347", "850314 123471"):
+            self.assertEqual(self.kinds(value) & {"CARD", "PESEL"}, set(), value)
+
+    def test_pesel_with_a_label_tolerates_odd_separators(self):
+        for value in ("PESEL: 850314  12347", "PESEL 850314 - 12347", "pesel: 85 03 14  12347", "PESEL 850314 -12347",
+                      "PESEL: 850314\t12347"):
+            with self.subTest(value):
+                self.assertIn("PESEL", self.kinds(value))
+                self.assertEqual(verdict.check_text(value + "\n", CONFIG), {"PESEL": 1}, value)
+        self.assertNotIn("PESEL", self.kinds("PESEL: 850314  12348"))
+
+    def test_longer_card_layouts_are_back(self):
+        """Cards printed 4-4-4-1..3, 5-5-5-1 and 4-4-4-4-3 are found by the checksum, as before the narrowing."""
+        from piigate import rules
+
+        def with_check(prefix: str, length: int) -> str:
+            body = prefix + "0" * (length - 1 - len(prefix))
+            for c in "0123456789":
+                if rules.luhn_valid(body + c):
+                    return body + c
+            raise AssertionError
+
+        for lengths in ((4, 4, 4, 1), (4, 4, 4, 2), (4, 4, 4, 3), (5, 5, 5, 1), (4, 4, 4, 4, 3)):
+            digits = with_check("4111", sum(lengths))
+            for sep in (" ", "-"):
+                parts, k = [], 0
+                for n in lengths:
+                    parts.append(digits[k : k + n])
+                    k += n
+                value = sep.join(parts)
+                with self.subTest(value):
+                    self.assertIn("CARD", self.kinds(f"karta {value} ok"))
+                    self.assertEqual(verdict.check_text(f"karta {value}.", CONFIG), {"CARD": 1})
 
     def test_only_real_http_codes_make_a_list_of_numbers(self):
         """#30 (review): `600 700 800 900` and a phone among other numbers stay phones; a list of status codes is not."""

@@ -30,14 +30,6 @@ def mask(text: str, cfg: dict) -> tuple[str, int]:
             return "[PESEL hidden by piigate]"
         return m.group()
 
-    def card(m: re.Match) -> str:
-        nonlocal counter
-        s = re.sub(r"\D", "", m.group())
-        if c.get("card", True) and rules.luhn_valid(s) and len(s) >= 15 and not s.startswith("0"):
-            counter += 1
-            return "[CARD hidden by piigate]"
-        return m.group()
-
     disjoint, end = [], -1  # project patterns — masked like PESEL; on overlap the first one wins
     for f in sorted(project.fragments(text, cfg), key=lambda f: (f.start, -f.end)):
         if f.start >= end:
@@ -49,5 +41,8 @@ def mask(text: str, cfg: dict) -> tuple[str, int]:
     if c.get("account", True):
         text = ACCOUNT_RE.sub(account, text)
     text = rules.PESEL_RE.sub(pesel, text)
-    text = rules.CARD_RE.sub(card, text)
+    if c.get("card", True):
+        for start, end in reversed(rules.card_spans(text, lambda digits, _: len(digits) >= 15 and not digits.startswith("0"))):
+            text = text[:start] + "[CARD hidden by piigate]" + text[end:]
+            counter += 1
     return text, counter

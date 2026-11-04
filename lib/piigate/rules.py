@@ -280,17 +280,44 @@ IPV6_RE = re.compile(r"(?<![\w:.])(?=[0-9A-Fa-f:]*\d)(?:[0-9A-Fa-f]{0,4}:){2,7}[
 # checksum; other digit groups are not one number (`bak-20261023-046` holds eleven digits split by a hyphen). With a
 # "PESEL" label the usual separators are tolerated anywhere.
 PESEL_RE = re.compile(r"(?<!\d)\d{11}(?!\d)")
-PESEL_LAYOUT_RE = re.compile(r"(?<![\w.-])(?:\d{6}[ -]\d{5}|\d{2}[ -]\d{2}[ -]\d{2}[ -]\d{5})(?![\w-]|\.\w|-\d)")
-PESEL_LABELLED_RE = re.compile(r"(?i)\bpesel\b[^\d\n]{0,15}(\d(?:[ -]?\d){10})(?!\d)")
-# payment card: 13-19 contiguous digits, or the printed layouts 4-4-4-4, 4-6-5 / 4-6-4 (Amex, Diners) and 4-8-4 with a
-# hyphen, a space or two spaces between the groups (they may differ); numbers that merely sit next to each other (HTTP
-# codes `200 302 200 200 200`) are not one card
+PESEL_LAYOUT_RE = re.compile(r"(?<!\d)(?<!\d-)(?:\d{6}[ -]\d{5}|\d{2}[ -]\d{2}[ -]\d{2}[ -]\d{5})(?!\d|-\d)")
+PESEL_LABELLED_RE = re.compile(r"(?i)\bpesel\b[^\d\n]{0,15}(\d(?:[ \t-]{0,3}\d){10})(?!\d)")
+# payment card: 13-19 contiguous digits, or the printed layouts 4-4-4-4, 4-6-5 / 4-6-4 (Amex, Diners), 4-8-4, 4-4-4-1..3,
+# 5-5-5-1 and 4-4-4-4-3 with a hyphen, a space or two spaces between the groups (they may differ); numbers that merely
+# sit next to each other (HTTP codes `200 302 200 200 200`) are not one card. Only a neighbouring digit (or digit and
+# hyphen) ends the match on either side — a letter, a mark or an extension glued to it does not hide a card.
 _CARD_SEP = r"(?: {1,2}|-)"
-CARD_RE = re.compile(
-    r"(?<!\d)\d{13,19}(?!\d)"
-    rf"|(?<!\w)(?<!\w-)(?:\d{{4}}(?:{_CARD_SEP}\d{{4}}){{3}}|\d{{4}}{_CARD_SEP}\d{{6}}{_CARD_SEP}\d{{4,5}}"
-    rf"|\d{{4}}{_CARD_SEP}\d{{8}}{_CARD_SEP}\d{{4}})(?!\w|-\w)"
+_CARD_EDGE = r"(?<!\d)(?<!\d-)"
+_CARD_LAYOUTS = (  # longest first: a longer layout is tried before the one that is its prefix
+    rf"\d{{4}}(?:{_CARD_SEP}\d{{4}}){{3}}{_CARD_SEP}\d{{3}}",
+    rf"\d{{4}}(?:{_CARD_SEP}\d{{4}}){{3}}",
+    rf"\d{{5}}(?:{_CARD_SEP}\d{{5}}){{2}}{_CARD_SEP}\d",
+    rf"\d{{4}}{_CARD_SEP}\d{{6}}{_CARD_SEP}\d{{4,5}}",
+    rf"\d{{4}}{_CARD_SEP}\d{{8}}{_CARD_SEP}\d{{4}}",
+    rf"\d{{4}}(?:{_CARD_SEP}\d{{4}}){{2}}{_CARD_SEP}\d{{1,3}}",
 )
+CARD_RE = re.compile(r"(?<!\d)\d{13,19}(?!\d)")  # contiguous digits
+CARD_LAYOUT_RES = tuple(re.compile(rf"{_CARD_EDGE}{layout}(?!\d|-\d)") for layout in _CARD_LAYOUTS)
+
+
+def card_spans(text: str, accept=lambda digits, matched: True) -> list[tuple[int, int]]:
+    """Spans of card candidates (contiguous digits and the printed layouts) whose digits pass Luhn and `accept`; one
+    regex cannot do it, because a layout that is the prefix of a longer one (4-4-4-4 and 4-4-4-4-3) would hide it.
+    On overlap the earlier (longer layout first) wins."""
+    spans: list[tuple[int, int]] = []
+    for regex in (CARD_RE, *CARD_LAYOUT_RES):
+        for m in regex.finditer(text):
+            digits = re.sub(r"\D", "", m.group())
+            if luhn_valid(digits) and accept(digits, m.group()):
+                spans.append(m.span())
+    spans.sort(key=lambda span: (span[0], -span[1]))
+    result: list[tuple[int, int]] = []
+    for sp in spans:
+        if not result or sp[0] >= result[-1][1]:
+            result.append(sp)
+    return result
+
+
 WORD_RE = re.compile(rf"{NAME}")
 # capital letters glued to a name and not starting another capitalized word (MariaDB, JanSQL — unlike JanKowalski)
 ACRONYM_TAIL = re.compile(rf"[{UPPER}]+(?![{LOWER}])")
@@ -399,9 +426,8 @@ def detect(text: str, *, dates: str = "all", drugs: bool = True) -> list[Fragmen
     for m in PESEL_LABELLED_RE.finditer(text):
         if not PESEL_RE.fullmatch(m.group(1)) and pesel_valid(re.sub(r"\D", "", m.group(1))):
             result.append(Fragment(m.start(1), m.end(1), "PESEL", 3))
-    for m in CARD_RE.finditer(text):
-        if luhn_valid(re.sub(r"\D", "", m.group())):
-            result.append(Fragment(m.start(), m.end(), "CARD", 3))
+    for start, end in card_spans(text):
+        result.append(Fragment(start, end, "CARD", 3))
     for m in NIP_RE.finditer(text):
         if nip_valid(re.sub(r"\D", "", m.group())):
             result.append(Fragment(m.start(), m.end(), "NIP", 3))
