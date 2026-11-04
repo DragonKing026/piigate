@@ -4,6 +4,7 @@ import json
 import os
 import pwd
 import re
+import stat
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]  # plugin directory
@@ -86,13 +87,23 @@ WORKTREE_LIMIT = 64
 
 
 def _read_small(path: Path) -> str | None:
-    """Text of a small pointer file (`.git`, `commondir`, `gitdir`); None when missing, too large or unreadable."""
+    """Text of a small pointer file (`.git`, `commondir`, `gitdir`); None when it is missing, not a regular file (a FIFO
+    or a device would block or never end), too large, not UTF-8 or contains a NUL. Never blocks, never follows a symlink."""
     try:
-        if path.stat().st_size > GITDIR_FILE_LIMIT:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
             return None
-        return path.read_text(encoding="utf-8").strip()
+        data = os.read(fd, GITDIR_FILE_LIMIT + 1)
+        if len(data) > GITDIR_FILE_LIMIT or b"\x00" in data:
+            return None
+        return data.decode("utf-8").strip()
     except (OSError, UnicodeDecodeError):
         return None
+    finally:
+        os.close(fd)
 
 
 def _resolve(value: str, base: Path) -> Path:
@@ -104,7 +115,17 @@ def worktree_roots(root: str) -> list[str]:
     """Top directories of every git worktree of the repository `root` belongs to — the main one and the linked ones —
     read from files only, without running git (the gate runs on every tool call). The given root comes first. Stale
     entries, garbage, oversized files and read errors are skipped; a submodule or a plain directory is just itself.
-    The pointer files can be written by the agent, so the result only ever WIDENS what is protected."""
+    The pointer files can be edited (or the registry broken) by the agent, so this list is a convenience that widens
+    the protected set; it is not the only safeguard — the gate also walks the directory tree on a recursive search.
+    Never raises: on any error only the given root is returned."""
+    try:
+        return _worktree_roots(root)
+    except (OSError, ValueError):
+        start = Path(os.path.realpath(root))
+        return [str(start)] if _outside_home(start) else []
+
+
+def _worktree_roots(root: str) -> list[str]:
     start = Path(os.path.realpath(root))
     result = [start]
     marker = start / ".git"
@@ -122,15 +143,23 @@ def worktree_roots(root: str) -> list[str]:
     if common.name == ".git" and common.parent not in result:
         result.append(common.parent)
     try:
-        entries = sorted(e for e in (common / "worktrees").iterdir() if e.is_dir())[:WORKTREE_LIMIT]
+        entries = sorted(e for e in (common / "worktrees").iterdir() if e.is_dir())
     except OSError:
         entries = []
-    for entry in entries:
+    found = 0
+    for entry in entries[: 8 * WORKTREE_LIMIT]:  # only entries with a valid `gitdir` count towards the limit
         if (pointer := _read_small(entry / "gitdir")) is None:
             continue
-        dot_git = _resolve(pointer, entry)
-        if dot_git.name == ".git" and dot_git.parent.is_dir() and dot_git.parent not in result:
-            result.append(dot_git.parent)
+        try:
+            dot_git = _resolve(pointer, entry)
+        except (OSError, ValueError):
+            continue
+        if dot_git.name == ".git" and dot_git.parent.is_dir():
+            found += 1
+            if dot_git.parent not in result:
+                result.append(dot_git.parent)
+            if found >= WORKTREE_LIMIT:
+                break
     return [str(k) for k in result if _outside_home(k)]
 
 
