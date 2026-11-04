@@ -209,11 +209,16 @@ class AstGate(gate.Gate):
         """Names a heredoc is written to (`cat > f <<EOF`, `tee f <<EOF`) or [] for a commit message (`git commit -F -`);
         None when the heredoc is stdin data of something else."""
         name = c.name
+        use = self._index.get(id(c), 0)
+
+        def said(w: shell.Word) -> str:  # the name as the shell will use it (`$f` of a known value is that value)
+            return " ".join(str(t) for t in self._word_tokens(w, c, use, c.origin))
+
         if name == "cat":
-            dest = [r.target.text for r in c.redirects if r.op in (">", ">>") and r.target is not None]
+            dest = [said(r.target) for r in c.redirects if r.op in (">", ">>") and r.target is not None]
             return dest or None
         if name == "tee":
-            dest = [w.text for w in c.argv[1:] if not w.text.startswith("-")]
+            dest = [said(w) for w in c.argv[1:] if not w.text.startswith("-")]
             return dest or None
         if name == "git":
             args = [w.text for w in c.argv[1:]]
