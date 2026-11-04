@@ -541,6 +541,7 @@ def _redirect(r: dict, inherited: bool = False) -> Redirect:
 # assignment `x=1 cmd` — makes the value unknown. A `for` / `select` variable takes each of its static items: a SET.
 
 DECLARATIONS = {"declare", "typeset", "local", "readonly", "export"}
+CODE_ARRAYS = {"functions", "aliases", "galiases", "saliases"}  # zsh: assigning to an element defines code
 # builtins that assign to the variables named in their arguments: every identifier among the arguments is unknown after
 ASSIGNING = {"read", "mapfile", "readarray", "getopts", "unset", "coproc"}
 
@@ -763,6 +764,7 @@ class _Walker:
         self.model = model  # values of variables (second pass only): `cd "$D"` is followed when D is known
         self.positional: tuple | None = None
         self.declaring = 0
+        self.func_dirs: frozenset[str] = frozenset()
         self.lastpipe = False  # `shopt -s lastpipe`: the last stage of a pipeline runs in this shell (bash; zsh always)
         self.loops = 0  # loops open around the statement being walked
         self.functions: dict[str, dict] = {}  # name -> body of the functions declared so far: analysed again at each call
@@ -875,9 +877,10 @@ class _Walker:
             # effect on the directory and the pipeline is analysed where it is CALLED (`call`)
             self.declaring += 1
             try:
-                self.stmt(body, st, sub, inherited, "function")
+                declared = self.stmt(body, st, sub, inherited, "function")
             finally:
                 self.declaring -= 1
+            self.func_dirs |= declared.seen  # where the body can go: an unknown call (`eval $x`, `$f`) may run it
             return st
         if t == "CoprocClause":
             # a coprocess runs beside the rest of the line and its output comes back through `$COPROC`: nobody follows it
@@ -982,6 +985,11 @@ class _Walker:
         call.stdin_interpreter = _stdin_interpreter(argv)
         for part in (c.get("Assigns"), c.get("Args"), stmt.get("Redirs")):
             self.substs(part, st, call)
+        for node in c.get("Assigns") or []:  # `functions[f]='code'`, `aliases[x]='code'`: the value IS code
+            if node.get("Index") is not None and _text(_need(node, "Name")) in CODE_ARRAYS and node.get("Value"):
+                value = _word(node["Value"])
+                if value.static:
+                    self.run_text(call, st, value.text, "eval")
         after = self.nested_script(call, st)  # `eval cd ..` runs in this shell: its directory carries on
         self.chdir_wrapper(call, st)
         name = argv[0].text if argv and argv[0].static else ""
@@ -1259,7 +1267,7 @@ class _Walker:
         return sorted(found)
 
     def unknown_dir(self, st: _State) -> _State:
-        wide = frozenset({*st.seen, self.session})
+        wide = frozenset({*st.seen, self.session, *self.func_dirs})
         return _State(wide, wide, False, False)
 
 
@@ -1337,7 +1345,8 @@ def parse(command: str, *, cwd: str, dialect: str = DEFAULT_DIALECT) -> list[Cal
         walker.stmts(tree.get("Stmts") or [], _State(start, start), False, (), "top")
         result.assigned_in_expansions = frozenset(_expansion_assignments(tree))
         model = build_model(walker.calls, result.assigned_in_expansions, walker.session)
-        if model.sites:  # a second walk that follows `cd "$D"` and function arguments by the values of the variables
+        reads = any(k.startswith("$") for c in walker.calls for w in c.argv for k in w.kinds)
+        if model.sites or reads:  # a second walk that follows `cd "$D"` and function arguments by the values of the variables
             walker = _Walker(cwd, dialect=dialect, model=model)
             walker.stmts(tree.get("Stmts") or [], _State(start, start), False, (), "top")
             model = build_model(walker.calls, result.assigned_in_expansions, walker.session)

@@ -136,6 +136,10 @@ class AstGate(gate.Gate):
                 if m and m.group(1) in self._named_dirs:  # zsh `hash -d name=path`, then `~name/x`
                     variants = [[self._named_dirs[m.group(1)] + text0[m.end() :]]]
         words = variants[0] if len(variants) == 1 or all(len(v) == 1 for v in variants) else [w.text]
+        if "cmd" in w.kinds and w.quoting == "none" and len(words) == 1 and re.search(r"\s", words[0]):
+            # an unquoted `$(echo cat P)` / `` `echo cat P` ``: the shell runs it, and the old tokenizer cut its text at
+            # the blanks, so each piece was judged as a word of its own (the path `P` among them) — as here
+            words = words[0].split()
         out: list[str] = []
         for text in words:
             tok = QuotedToken(text, w.quote) if w.quote else text

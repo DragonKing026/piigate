@@ -36,6 +36,42 @@ sys.path.insert(0, str(HERE.parent / "lib"))
 CANARY = "CANARY-SENSITIVE-ROW"
 EXEC = "EXEC-42"  # printed only by code that really ran (`$((40+2))` is computed, never in the line itself)
 SENSITIVE_NAME = "Sensitive-data"
+USER_NAME = "piigate-user"  # `$USER` in the real runs
+
+
+# Programs that must never run for real in the measurement: they talk to the network or a service, or crash under the
+# address-space limit and leave core dumps (gh, node, … each did).
+RISKY_PROGRAMS = {
+    "gh", "ssh", "scp", "sftp", "rsync", "curl", "wget", "http", "https", "xh", "nc", "ncat", "telnet", "ftp",
+    "node", "nodejs", "deno", "bun", "java", "dotnet", "npm", "npx", "yarn", "pnpm", "docker", "podman", "kubectl",
+}
+
+
+def refusal(line: str, cwd) -> str:
+    """Why this line must not be run for real ("" when it may): the FIRST WORD of every command the parser finds — also in
+    `$( )`, `-c` scripts, heredocs, functions — is resolved the way the shell will and looked up by its value, not by a
+    regex over the text: `'gh' …`, `c=gh; $c …`, `/usr/bin/gh`, `command gh`. A first word nobody can resolve is refused too."""
+    from piigate import shell
+
+    for dialect in shell.DIALECTS:
+        try:
+            calls = shell.parse(line, cwd=str(cwd), dialect=dialect)
+        except shell.ParseError:
+            continue  # not a line this dialect runs
+        model = calls.model
+        for i, c in enumerate(calls):
+            words = shell._effective(c.argv) if c.argv else []
+            for w in c.argv[:1] + words[:1]:
+                variants, unresolved = shell.subst_word(
+                    w, lambda n, i=i, c=c: model.value(n, i, c.origin, c.positional) if model else ("unknown", None), dialect
+                )
+                if unresolved:
+                    return f"the command word `{w.text}` has a value the line does not hold"
+                for v in variants:
+                    for t in v[:1]:
+                        if os.path.basename(t) in RISKY_PROGRAMS:
+                            return f"runs `{os.path.basename(t)}` (network, a service, or it crashes under the memory limit)"
+    return ""
 
 
 def run_limited(argv: list[str], cwd, env: dict, timeout: float = 5.0) -> dict:
@@ -156,6 +192,12 @@ class World:
             (self.work / name).write_text("plain\n", encoding="utf-8")
         (self.work / "hook").write_text(f"cat {HIDDEN}\n", encoding="utf-8")
         (self.work / "ln").symlink_to("../" + SENSITIVE_NAME)  # a symlink into the dummy sensitive directory
+        # a second dummy sensitive directory with a SHORT name, under a directory named like the user (`$USER`)
+        (self.root / USER_NAME / "zeta").mkdir(parents=True)
+        (self.root / USER_NAME / "zeta" / "people.csv").write_text(CANARY + "\n", encoding="utf-8")
+        planted = self.work / "whoami"  # a program found first through `PATH=$PWD:$PATH`
+        planted.write_text("#!/bin/sh\necho ..\n", encoding="utf-8")
+        planted.chmod(0o755)
 
     def gate(self, factory=None):
         from piigate import config, gate
@@ -163,7 +205,7 @@ class World:
         os.environ.setdefault("PIIGATE_CONFIG_DIR", str(self.root / "cfg"))
         os.environ.setdefault("PIIGATE_DATA_DIR", str(self.root / "data"))
         cfg = config.load(str(self.work))
-        cfg["sources"]["directories"] = [str(self.root / SENSITIVE_NAME)]
+        cfg["sources"]["directories"] = [str(self.root / SENSITIVE_NAME), str(self.root / USER_NAME / "zeta")]
         cfg["sources"]["only_phi_projects"] = False
         cfg["in_project"] = {"sensitive": [], "anonymized": []}
         return (factory or gate.Gate)(cfg, str(self.work))
@@ -173,10 +215,17 @@ class World:
         limits, FUNCNEST, a session of its own, 5 s). mode "f": `zsh -f -c LINE`. mode "cc": the way Claude Code starts a
         command — `zsh -c` with `setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL`, then `eval LINE`. mode "bash": `bash -c LINE`.
         A shell that dies of a signal is a failure of the MEASUREMENT: `signal` is set and the tests fail on it."""
-        env = {"HOME": str(self.root), "PATH": "/usr/bin:/bin", "ZDOTDIR": str(self.root / "nozdot")}
+        env = {
+            "HOME": str(self.root), "PATH": "/usr/bin:/bin", "ZDOTDIR": str(self.root / "nozdot"), "USER": USER_NAME,
+            "SHELL": os.environ.get("SHELL", "/bin/bash"),
+        }
+        command = command.replace("{ROOT}", str(self.root))
         zsh = shutil.which("zsh")
         if not zsh:
             return {"available": False}
+        why = refusal(command, self.work)
+        if why:
+            return {"available": True, "refused": why, "reads": False, "runs": False, "out": ""}
         argv = [zsh, "-f", "-c", command]
         if mode == "bash":
             bash = shutil.which("bash")
