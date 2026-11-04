@@ -4994,12 +4994,12 @@ class TestSqlScripts(unittest.TestCase):
     def test_tools_read_a_script_but_not_a_dump(self):
         script = FILES["eml"].parent / "anonymization.sql"
         script.write_text(self.SCRIPT, encoding="utf-8")
-        result = files.describe_file(script, CONFIG, source="files")
-        self.assertIn("wp_users", result)
-        self.assertIn("user_email", result)
-        self.assertNotIn("PERSON_", result)
         self.assertIn("wp_users", anonymization.document_text("anonymization.sql", script.read_bytes()))
-        if PRESIDIO:  # anonymize() runs the text filter, which needs the NER engine; the directory as in TestAnonymization
+        if PRESIDIO:  # describe_file() and anonymize() run the text filter, which needs the NER engine; the directory as in TestAnonymization
+            result = files.describe_file(script, CONFIG, source="files")
+            self.assertIn("wp_users", result)
+            self.assertIn("user_email", result)
+            self.assertNotIn("PERSON_", result)
             cfg = json.loads(json.dumps(CONFIG))
             cfg["anonymization"]["directory"] = str(TMP / "anonymized")
             w = anonymization.anonymize("anonymization.sql", script.read_bytes(), cfg)
