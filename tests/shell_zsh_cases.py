@@ -62,7 +62,7 @@ def refusal(line: str, cwd) -> str:
         for i, c in enumerate(calls):
             words = shell._effective(c.argv) if c.argv else []
             for w in c.argv[:1] + words[:1]:
-                variants, unresolved = shell.subst_word(
+                variants, unresolved, _ = shell.subst_word(
                     w, lambda n, i=i, c=c: model.value(n, i, c.origin, c.positional) if model else ("unknown", None), dialect
                 )
                 if unresolved:
@@ -99,7 +99,7 @@ def run_limited(argv: list[str], cwd, env: dict, timeout: float = 5.0) -> dict:
 
     proc = subprocess.Popen(
         argv, cwd=cwd, env=full_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        start_new_session=True, preexec_fn=limits,
+        start_new_session=True, preexec_fn=limits, errors="replace",
     )
     try:
         out, _ = proc.communicate(timeout=timeout)

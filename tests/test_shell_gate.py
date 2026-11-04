@@ -71,6 +71,7 @@ class Base(unittest.TestCase):
         (self.root / "Sensitive-data").mkdir()
         (self.root / "Sensitive-data" / "people.csv").write_text("dummy\n", encoding="utf-8")
         (self.work / "x.csv").write_text("a,b\n", encoding="utf-8")
+        (self.work / "ln").symlink_to("../Sensitive-data")  # a symlink into the dummy sensitive directory
         cfg = config.load(str(self.work))
         cfg["sources"]["directories"] = [str(self.root / "Sensitive-data")]
         cfg["sources"]["only_phi_projects"] = False
@@ -428,6 +429,61 @@ class TestRound5(Base):
             self.assertEqual(zc.refusal(line, self.work), "", line)
 
 
+class TestRound6(Base):
+    def deny(self, command: str, dialect: str = "zsh") -> None:
+        self.assertIsNotNone(self.ast(dialect).bash(command), (command, dialect))
+
+    def test_an_array_is_a_set_like_the_items_of_a_for(self):
+        for command in (
+            'files=(../S*/*.csv); for f in "${files[@]}"; do cat "$f"; done', "a=(../S*/p*); cat ${a[@]}", 'a=(../S*/p*); cat "$a"',
+            'a=(../Sens*); for d in "${a[@]}"; do cat $d/people.csv; done', "a=(../Sens*); cd ${a[0]}; cat people.csv",
+            "a=(cat ../S*/p*); ${a[@]}", "declare -a a=(../S*/p*); cat ${a[@]}", "a=(x); a+=(../S*/p*); cat ${a[@]}",
+            "a[3]=../S*/p*; cat ${a[3]}", "a=(x ../Sens); cat ${a[1]}itive-data/people.csv",
+            "a=(x ../Sens); cat ${a[0]}itive-data/people.csv", "x=../Sens; a=(); a+=(x $x); cat ${a[1]}itive-data/people.csv",
+        ):
+            for dialect in shell.DIALECTS:
+                with self.subTest(command=command, dialect=dialect):
+                    self.deny(command, dialect)
+
+    def test_a_quoted_glob_in_an_array_is_a_name_until_bash_expands_it_unquoted(self):
+        for command in ("a=('../S*/p*'); cat ${a[@]}", "a=('../S*/p*'); cat ${a[0]}", "a=('../S*/p*'); for f in ${a[@]}; do cat $f; done"):
+            self.deny(command, "bash")  # bash globs the unquoted expansion again
+        self.deny("a=('../S*/p*'); cat ${~a}", "zsh")  # zsh only when asked
+        g = self.ast("zsh")
+        self.assertIsNone(g.bash("a=('./No*'); cat ${a[@]}"))
+        self.assertTrue(getattr(g._current.tokens[-1], "quoted", False))  # a plain name in zsh
+
+    def test_pwd_is_every_directory_it_may_be_and_a_symlink_is_judged_as_what_it_is(self):
+        for command in (
+            "cd ln; cat $PWD/people.csv", "cd -P ln; cat $PWD/people.csv", "cd ln; cat ${PWD}/people.csv", 'cd ln; cat "$PWD"/people.csv',
+            "cd ln; cat $PWD/p*", "f() { cd ln; cat $PWD/people.csv; }; f", "cd ./l[n]; cat people.csv", "cd ln; cat ~+/people.csv",
+        ):
+            with self.subTest(command):
+                self.deny(command)
+
+    def test_append_and_operators_on_known_values(self):
+        for command in (
+            "x=../Sens; x+=itive-data/people.csv; cat $x", "x=xx; cat ../Sensitive-data/${x/x/p}eople.csv",
+            "x=XXpeople.csv; cat ../Sensitive-data/${x:2}", "x=XXpeople.csv; cat ../Sensitive-data/${x#XX}",
+            "x=people.csv/; cat ../Sensitive-data/${x%/}", "x=../Sensitive-data/people.csv; cat ${x:-nothing}",
+        ):
+            with self.subTest(command):
+                for dialect in shell.DIALECTS:
+                    self.deny(command, dialect)
+        g = self.ast()
+        g.bash("x=abc; cat ${x/*/Z} ${x:1}")  # a pattern operator is not certain: the written text stays
+        self.assertEqual([str(t) for t in g._current.tokens[-2:]], ["${x/*/Z}", "bc"])
+
+    def test_what_a_command_prints_into_a_shell_is_its_program(self):
+        for command in ("echo 'cat ../S*/p*' | bash", "printf 'cat ../S*/p*\\n' | bash", "echo 'cat ../S*/p*' | zsh"):
+            self.deny(command)
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {"SHELL": "/usr/bin/zsh"}):
+            self.deny("echo 'cat ../S*/p*' | $SHELL")
+        self.assertIsNone(self.ast().bash("echo hello | cat"))
+
+
 class TestWordValuesAgainstARealShell(Base):
     """B1: the value of a word is computed from the pieces of the tree. For a corpus of static variables and every way to
     glue them to quotes, the words `AstGate` makes of `cat WORD` are what a real zsh / bash makes of `printf [%s] WORD`."""
@@ -553,8 +609,12 @@ class TestAdversarialCorpus(Base):
         self.assertEqual(killed, {}, "a real shell died of a signal: the measurement of these cases is void")
         for dialect in shell.DIALECTS:
             self.assertEqual([r["name"] for r in shell_adversarial.unexplained(rows, dialect)], [], dialect)
-        holes = {r["name"] for dialect in shell.DIALECTS for r in shell_adversarial.holes(rows, dialect)}
-        self.assertEqual(sorted(set(shell_adversarial.KNOWN) - holes), [], "KNOWN lists a case that is not a hole any more")
+        for r in rows:  # a case that is not run for real and is allowed must say why: a known gap or "reads nothing"
+            if r["norun"] and any(r[d]["decision"] == "allow" for d in shell.DIALECTS):
+                self.assertTrue(r["name"] in shell_adversarial.KNOWN or r["name"] in shell_adversarial.NOREAD, r["name"])
+                holes = {r["name"] for dialect in shell.DIALECTS for r in shell_adversarial.holes(rows, dialect)}
+        not_run = {r["name"] for r in rows if r["norun"] and any(r[d]["decision"] == "allow" for d in shell.DIALECTS)}
+        self.assertEqual(sorted(set(shell_adversarial.KNOWN) - holes - not_run), [], "KNOWN lists a case that is not a gap any more")
         for r in rows:
             if r["expect"]:
                 for dialect in shell.DIALECTS:

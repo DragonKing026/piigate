@@ -95,21 +95,13 @@ class AstGate(gate.Gate):
     # ------------------------------------------------------------------------------------------------ building
 
     # -- words: the value is computed from the PIECES the tree gives (`shell.subst_word`), never by reading the text
-    def _pwd(self, c: shell.Call | None) -> str | None:
-        """`$PWD` / `~+` at this command: its directory when that is exactly one known directory."""
+    def _pwd(self, c: shell.Call | None) -> list[str] | None:
+        """`$PWD` / `~+` at this command: every directory it may run in (a `cd` that may have failed leaves two), else None.
+        Each of them is a possible value, and each is judged — so a symlink reached through `cd ln` is judged as the
+        directory it really is (the gate resolves real paths)."""
         if c is None:
-            return self.cwd
-        return next(iter(c.cwds)) if c.cwd_known and len(c.cwds) == 1 else None
-
-    # `$(command)` whose output the gate knows without running it. Deliberately short and explicit:
-    #  - `pwd`: the directory of the command (an exactly known one);
-    #  - `git rev-parse --show-toplevel`: the root of the repository of that directory, computed from the files;
-    #  - `dirname P` / `basename P` of a static path;
-    #  - date, whoami, hostname, uname, id, nproc, arch with static arguments free of `/`, `*`, `?`, `[`: their output has no
-    #    path separator or glob, so it can only stand for a piece of a name — it is replaced by the plain letter X.
-    # Anything else (mktemp, ls, find, cat …) is unknown. The value is a path the line does not control only in the second
-    # case, and there it is a real directory that is then judged like any path in the line.
-    SAFE_OUTPUT = {"date", "whoami", "hostname", "uname", "id", "nproc", "arch"}
+            return [self.cwd]
+        return sorted(c.cwds) if c.cwd_known else None
 
     def _word_tokens(self, w: shell.Word, c: shell.Call | None, use: int, origin: str) -> list[str]:
         """The words of the flat list for one word of the tree. Only what is CERTAIN is replaced (a variable with one static
@@ -126,18 +118,19 @@ class AstGate(gate.Gate):
         def lookup(name: str):
             return model.value(name, use, origin, positional, pwd) if model is not None else ("unknown", None)
 
-        variants, unresolved = shell.subst_word(w, lookup, self.dialect)
+        variants, unresolved, noglob = shell.subst_word(w, lookup, self.dialect)
         text0 = variants[0][0] if len(variants) == 1 and len(variants[0]) == 1 else None
-        if text0 is not None and text0.startswith("/proc/"):
+        if text0 is not None and text0.startswith("/proc/") and "tilde" not in w.kinds:
             # `/proc/self/cwd/..`, `/proc/$$/cwd/..`, `/proc/self/root/…`: the directory of the shell itself, said in another way
             m = re.match(r"/proc/(?:self|thread-self|\$\$|\$\{\$\})/(cwd|root)(?:/(.*))?$", text0)
             if m and (m.group(1) == "root" or pwd is not None):
-                base = pwd if m.group(1) == "cwd" else ""
-                variants = [[(base + "/" + (m.group(2) or "")) if m.group(2) is not None else (base or "/")]]
-                text0 = variants[0][0]
+                bases = pwd if m.group(1) == "cwd" else [""]
+                variants = [[(b + "/" + (m.group(2) or "")) if m.group(2) is not None else (b or "/")] for b in bases]
+                text0 = variants[0][0] if len(variants) == 1 else None
         if text0 is not None and "tilde" in w.kinds:
-            if w.text.startswith("~+") and pwd is not None:  # `~+/x` is $PWD/x
-                variants = [[pwd + text0[2:]]]
+            if w.text.startswith("~+") and pwd is not None:  # `~+/x` is $PWD/x, for each directory it may be
+                variants = [[b + text0[2:]] for b in pwd]
+                text0 = None
             else:
                 m = re.match(r"~([A-Za-z_]\w*)", text0)
                 if m and m.group(1) in self._named_dirs:  # zsh `hash -d name=path`, then `~name/x`
@@ -150,7 +143,7 @@ class AstGate(gate.Gate):
             words = [str(t) for t in gate.Gate._tokens(words[0]) or words[0].split()]
         out: list[str] = []
         for text in words:
-            tok = QuotedToken(text, w.quote) if w.quote else text
+            tok = QuotedToken(text, w.quote) if w.quote else (QuotedToken(text, '"') if noglob and len(words) == 1 else text)
             if len(variants) > 1 and len(words) == 1 and all(len(v) == 1 for v in variants):
                 tok = _Set(text, w.quote)
                 tok.alts = tuple(v[0] for v in variants[1:])  # a SET: the first is the token, every value is judged
@@ -248,6 +241,21 @@ class AstGate(gate.Gate):
                     if w.static and "=" in w.text and not w.text.startswith("-"):
                         name, _, path = w.text.partition("=")
                         self._named_dirs[name] = path
+            if c.pipe_to_shell and c.name in ("echo", "printf") and all(w.static for w in c.argv):
+                # `echo 'cat ../S*/p*' | bash`: what a command prints into a shell is that shell's program
+                args = [w.text for w in c.argv[1:] if not (w.text.startswith("-") and re.fullmatch(r"-[neE]+", w.text))]
+                if c.name == "printf" and args:
+                    rest = iter(args[1:])
+                    text = re.sub(r"%[sb]", lambda m: next(rest, ""), shell._ansi_c(args[0]))
+                else:
+                    text = " ".join(args)
+                receivers = [r for r in calls if r.piped_in and r.stdin_interpreter]
+                if any(r.stdin_interpreter in SHELLS for r in receivers):
+                    extra = shell.parse(text, cwd=self.cwd, dialect=self.dialect)
+                    c.substitutions.extend(shell._toplevel(extra))
+                    calls.extend(extra)
+                elif receivers:
+                    text_bodies.append(text)
             if c.name == "gh" and [w.text for w in c.argv[1:3] if w.static] == ["alias", "set"]:
                 for w in c.argv[3:]:  # `gh alias set x '!cmd …'`: an alias that starts with `!` is shell code
                     if w.static and w.text.startswith("!"):

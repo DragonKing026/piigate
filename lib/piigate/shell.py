@@ -95,6 +95,8 @@ class Assign:
     value: Word | None  # None for `a=(…)` arrays and a bare `name`
     array: tuple[Word, ...] = ()
     append: bool = False
+    elements: tuple[Word, ...] = ()  # the VALUES of `a=(x y)` / `a+=(…)` / `a[k]=v` (the subscripts are in `array`)
+    is_array: bool = False  # `a=(…)`, `a+=(…)`, `a[k]=v`
 
 
 @dataclass
@@ -401,6 +403,73 @@ def _slice(node: dict) -> str | None:
         return None
 
 
+_OTHER_PARAM_KEYS = {"Flags", "GlobSubst", "Modifiers", "NestedParam", "Length", "Excl", "Names", "Width"}
+
+
+def _lit_text(node) -> str | None:
+    """The text of a word / expression made of literals only (no expansion), else None."""
+    if node is None:
+        return None
+    w = _word(node) if isinstance(node, dict) and "Parts" in node else None
+    if w is not None:
+        return w.text if all(g[0] == "lit" for g in w.segs) else None
+    lits = _lits(node)
+    return "".join(lits) if lits and "$(…)" not in lits else None
+
+
+def _param_spec(p: dict):
+    """What `${x OP …}` does, when the operands are literal: ("sub", pat, rep, all, anchor) | ("cut", "#"|"##"|"%"|"%%", pat) |
+    ("default", ":-"|"-"|":+"|"+", word) | ("slice", off, len); None when it is anything else."""
+    exp, repl, sl = p.get("Exp") or {}, p.get("Repl") or {}, p.get("Slice")
+    if repl:
+        pat, rep = _lit_text(repl.get("Orig")), _lit_text(repl.get("With")) if repl.get("With") is not None else ""
+        if pat is None or rep is None:
+            return None
+        return ("sub", pat, rep, bool(repl.get("All")), "")
+    if sl:
+        off = _lit_text(sl.get("Offset"))
+        ln = _lit_text(sl.get("Length")) if sl.get("Length") is not None else None
+        if off is None or not re.fullmatch(r"\d+", off) or (ln is not None and not re.fullmatch(r"\d+", ln)):
+            return None
+        return ("slice", int(off), None if ln is None else int(ln))
+    op = exp.get("Op")
+    word = _lit_text(exp.get("Word")) if exp.get("Word") is not None else ""
+    if op in ("#", "##", "%", "%%") and word is not None:
+        return ("cut", op, word)
+    if op in (":-", "-", ":+", "+") and word is not None:
+        return ("default", op, word)
+    return None
+
+
+def _apply_spec(spec, value: str) -> str | None:
+    """The value after the operator, when the result is the same in bash and zsh; None when it is not certain."""
+    if spec is None:
+        return None
+    glob = _GLOB_CHARS
+    kind = spec[0]
+    if kind == "sub":
+        _, pat, rep, every, _ = spec
+        if not pat or glob.search(pat) or "\\" in pat or glob.search(rep):
+            return None
+        return value.replace(pat, rep) if every else value.replace(pat, rep, 1)
+    if kind == "slice":
+        _, off, ln = spec
+        return value[off:] if ln is None else value[off : off + ln]
+    if kind == "cut":
+        _, op, pat = spec
+        if glob.search(pat) or "\\" in pat:
+            return None
+        if op.startswith("#"):
+            return value[len(pat) :] if pat and value.startswith(pat) else value
+        return value[: len(value) - len(pat)] if pat and value.endswith(pat) else value
+    if kind == "default":
+        _, op, word = spec
+        if op in (":-", "-"):
+            return value if (value != "" or op == "-") else word
+        return word if (value != "" or op == "+") else ""
+    return None
+
+
 _PLAIN_PARAM_KEYS = {"Type", "Short", "Param", "Pos", "End", "Dollar", "Rbrace", "Position", "ValuePos", "ValueEnd"}
 
 
@@ -410,6 +479,16 @@ def _expansion_seg(p: dict, kinds: set[str], quoted: bool) -> tuple[str, tuple]:
         name = _text(p.get("Param") or {})
         text = _expansion_text(p, kinds)
         return text, ("var", name, quoted, text)
+    if _need(p, "Type") == "ParamExp" and "GlobSubst" in p and p.keys() <= _PLAIN_PARAM_KEYS | {"GlobSubst"}:
+        name = _text(p.get("Param") or {})
+        return _expansion_text(p, kinds), ("var", name, quoted, _slice(p) or "${~" + name + "}", "~")  # zsh `${~x}`: globbed
+    if _need(p, "Type") == "ParamExp" and not (p.keys() & _OTHER_PARAM_KEYS):
+        name = _text(p.get("Param") or {})
+        text = _expansion_text(p, kinds)
+        if p.get("Index") is not None and p.keys() <= _PLAIN_PARAM_KEYS | {"Index"}:
+            return text, ("arr", name, quoted, text)  # `${a[@]}`, `${a[0]}`: any element, the index is not trusted (zsh counts from 1)
+        if p.get("Index") is None:
+            return text, ("op", name, quoted, text, _param_spec(p))  # `${x/a/b}`, `${x:2}`, `${x%/}`, `${x:-d}`
     own: set[str] = set()
     text = _expansion_text(p, own)
     kinds |= own
@@ -546,14 +625,45 @@ CODE_ARRAYS = {"functions", "aliases", "galiases", "saliases"}  # zsh: assigning
 ASSIGNING = {"read", "mapfile", "readarray", "getopts", "unset", "coproc"}
 
 
+class _Plain(str):
+    """An element whose glob characters were QUOTED where it was written (`a=('../S*')`): a name, until bash expands it
+    unquoted; an element written with an unquoted glob (`a=(../S*)`) is the pattern (the shell searched the disk)."""
+
+
 @dataclass
 class VarModel:
-    sites: dict  # name -> [(call index, "static" | "set" | "dynamic", payload)]
+    sites: dict  # name -> [(call index, op, payload)]; op: set | append | elem | loop | dynamic
     unknown: set
     env: dict  # the environment the line may rely on, said explicitly
+    dialect: str = DEFAULT_DIALECT
+    depth: int = 0
+
+    def elements(self, words, use: int, origin: str, positional, pwd) -> list[str] | None:
+        """The values of a list of words (an array literal, the items of a `for`): each word's variants, flattened. A glob
+        outside quotes stays the text of the pattern (it is judged as the search it is). None when a word is not certain."""
+        if self.depth > 6:
+            return None
+        self.depth += 1
+        try:
+            out: list[str] = []
+            for w in words:
+                variants, unresolved, _ = subst_word(
+                    w, lambda n: self.value(n, use, origin, positional, pwd), self.dialect
+                )
+                if unresolved:
+                    return None
+                quoted_glob = any(g[0] == "lit" and g[2] and _GLOB_CHARS.search(g[1]) for g in w.segs) and not any(
+                    g[0] == "lit" and not g[2] and _GLOB_CHARS.search(g[1]) for g in w.segs
+                )
+                for v in variants:
+                    out += [_Plain(t) if quoted_glob else t for t in v]
+            return out
+        finally:
+            self.depth -= 1
 
     def value(self, name: str, use: int, origin: str = "top", positional=None, pwd=None):
-        """("static", text) | ("set", [texts]) | ("list", [texts]) (`$@`) | ("unknown", None)."""
+        """("static", text) | ("set", [texts]) | ("list", [texts]) (`$@`) | ("unknown", None). An array or a `for` variable
+        is a SET: every element is a possible value (the index of `${a[1]}` is not trusted)."""
         if name.isdigit() and name != "0":
             if positional is None:
                 return "unknown", None
@@ -567,33 +677,69 @@ class VarModel:
             return "unknown", None
         found = self.sites.get(name)
         if found:
-            if len(found) != 1:
+            mine = [x for x in found if x[0] < use or origin == "function"]
+            if not mine or any(op == "dynamic" for _, op, _ in found) or len(mine) != len(found):
                 return "unknown", None
-            i, kind, payload = found[0]
-            if kind == "static" and (i < use or origin == "function"):
-                return "static", payload
-            if kind == "set" and (i < use or origin == "function"):
-                return "set", payload
-            return "unknown", None
+            first = mine[0][1]
+            if first not in ("set", "loop") or any(op not in ("append", "elem") for _, op, _ in mine[1:]):
+                return "unknown", None  # one base assignment, then only `+=` / `a[k]=v`
+            scalar: str | None = None
+            items: list[str] = []
+            is_array = False
+            for _, op, (words, array) in mine:
+                got = self.elements(words, use, origin, positional, pwd)
+                if got is None:
+                    return "unknown", None
+                if op == "loop":
+                    items, is_array = list(got), True
+                elif op == "set":
+                    if array:
+                        items, is_array, scalar = list(got), True, None
+                    else:
+                        if len(got) != 1:
+                            return "unknown", None
+                        scalar, is_array, items = got[0], False, []
+                elif array:  # `a+=(…)` / `a[k]=v`
+                    if not is_array and scalar is not None:
+                        items, is_array = [scalar], True
+                    items += got
+                else:  # `x+=text`
+                    if len(got) != 1:
+                        return "unknown", None
+                    if is_array:
+                        items.append(got[0])
+                    else:
+                        scalar = (scalar or "") + got[0]
+            if is_array:
+                return "set", list(dict.fromkeys(items))
+            return "static", scalar if scalar is not None else ""
         if name == "PWD" and pwd is not None:
-            return "static", pwd
+            if isinstance(pwd, str):
+                return "static", pwd
+            return ("static", pwd[0]) if len(pwd) == 1 else ("set", list(pwd))
         if name in self.env:
             return "static", self.env[name]
         return "unknown", None
 
 
-def build_model(calls: list, assigned_in_expansions=(), session: str = "/") -> VarModel:
+def build_model(calls: list, assigned_in_expansions=(), session: str = "/", dialect: str = DEFAULT_DIALECT) -> VarModel:
     sites: dict[str, list] = {}
     unknown: set[str] = set(assigned_in_expansions)
     for i, c in enumerate(calls):
         persistent = not c.argv or c.name in DECLARATIONS  # `x=1` alone / `declare x=1`; `x=1 cmd` is only for cmd
         for a in c.assigns:
-            static = persistent and a.value is not None and not a.array and not a.append and a.value.static
-            sites.setdefault(a.name, []).append((i, "static" if static else "dynamic", a.value.text if static else None))
+            if not persistent or (a.value is None and not a.is_array) or any(w.expands and not w.segs for w in a.elements):
+                sites.setdefault(a.name, []).append((i, "dynamic", None))
+            elif a.is_array:
+                op = "elem" if a.array and not a.elements or (a.array and a.value is not None) else ("append" if a.append else "set")
+                if a.value is not None and a.array:  # `a[k]=v`
+                    op = "elem"
+                sites.setdefault(a.name, []).append((i, op, (list(a.elements), True)))
+            else:
+                sites.setdefault(a.name, []).append((i, "append" if a.append else "set", ([a.value], False)))
         if c.loop_var:
             items = c.argv[1:]
-            ok = bool(items) and all(w.static or (w.kinds - {"glob", "brace"} == set() and w.segs) for w in items)
-            sites.setdefault(c.loop_var, []).append((i, "set" if ok else "dynamic", [w.text for w in items] if ok else None))
+            sites.setdefault(c.loop_var, []).append((i, "loop", (list(items), True)) if items else (i, "dynamic", None))
         words = [w.text for w in c.argv[1:] if w.static]
         if c.name in ASSIGNING:
             unknown |= {t for t in words if re.fullmatch(r"[A-Za-z_]\w*", t)}
@@ -605,60 +751,73 @@ def build_model(calls: list, assigned_in_expansions=(), session: str = "/") -> V
     env = {"HOME": os.path.expanduser("~"), "TMPDIR": os.environ.get("TMPDIR") or "/tmp"}
     if os.environ.get("SHELL"):
         env["SHELL"] = os.environ["SHELL"]
-    return VarModel(sites, unknown, env)
+    return VarModel(sites, unknown, env, dialect)
 
 
 MAX_VARIANTS = 64
 _GLOB_CHARS = re.compile(r"[*?\[]")
 
 
-def subst_word(w: Word, lookup, dialect: str = DEFAULT_DIALECT) -> tuple[list[list[str]], list[str]]:
-    """The words a shell makes of `w` when the variables in it are KNOWN (one static assignment, a `for` over static words,
-    a function argument, $PWD/$HOME/$TMPDIR/$SHELL): (variants, unresolved). Each variant is the list of words (usually
-    one); a SET variable gives one variant per value. A piece whose value is not certain stays exactly as written (`$x`,
-    `${x:-…}`, `$(…)` with all its text) and its variables are listed as unresolved. Word splitting follows the dialect:
-    bash splits an unquoted value at whitespace (only when the variable is the whole word, else unresolved) and globs it
-    (unresolved), zsh does neither."""
+def subst_word(w: Word, lookup, dialect: str = DEFAULT_DIALECT) -> tuple[list[list[str]], list[str], bool]:
+    """The words a shell makes of `w` when the variables in it are KNOWN (variables with one base assignment and `+=`, an
+    array or a `for` over words — a SET, a function argument, $PWD/$HOME/$TMPDIR/$SHELL): (variants, unresolved, noglob).
+    Each variant is the list of words (usually one); a SET gives one variant per element. A piece whose value is not certain
+    stays exactly as written (`$x`, `${x:-…}`, `$(…)` with all its text) and its variables are listed as unresolved.
+    Word splitting follows the dialect: bash splits an unquoted value at whitespace (only when the variable is the whole
+    word, else unresolved), zsh does not. A glob in a VALUE is a pattern again when bash expands it unquoted; in zsh, or
+    quoted, it is a plain name: `noglob` is True then (no pattern in the word comes from anywhere else)."""
     if not w.segs:
-        return [[w.text]], []
+        return [[w.text]], [], False
     unresolved: list[str] = []
     options: list[list[str]] = []
     single = len(w.segs) == 1
+    literal_glob = any(g[0] == "lit" and not g[2] and _GLOB_CHARS.search(g[1]) for g in w.segs)
+    value_glob = pattern_value = False
     for seg in w.segs:
         if seg[0] == "lit":
             options.append([seg[1]])
-        elif seg[0] == "opaque":
+            continue
+        if seg[0] == "opaque":
             options.append([seg[1]])
             unresolved.extend(seg[2] or ("(expansion)",))
-        else:
-            _, name, quoted, text = seg
-            kind, val = lookup(name)
-            if kind == "list":
-                if single and name == "@":
-                    return [list(val)], []  # `"$@"`: one word per argument
-                if single and name == "*":
-                    return [[" ".join(val)] if quoted else list(val)], []
-                options.append([text])
+            continue
+        name, quoted, text = seg[1], seg[2], seg[3]
+        kind, val = lookup(name)
+        if seg[0] == "var" and kind == "list":
+            if single and name == "@":
+                return [list(val)], [], False  # `"$@"`: one word per argument
+            if single and name == "*":
+                return [[" ".join(val)] if quoted else list(val)], [], False
+        if kind not in ("static", "set"):
+            options.append([text])
+            unresolved.append(name)
+            continue
+        values = [val] if kind == "static" else list(val)
+        if seg[0] == "op":
+            applied = [_apply_spec(seg[4], v) for v in values]
+            if any(a is None for a in applied):
+                options.append([text])  # not certain in both shells: the written text is judged
                 unresolved.append(name)
                 continue
-            if kind not in ("static", "set"):
-                options.append([text])
-                unresolved.append(name)
-                continue
-            values = [val] if kind == "static" else list(val)
-            for v in values:
-                # a glob among the items of a `for` is judged as the pattern it is; the names it gives are not globbed again
-                if not quoted and dialect == "bash" and (re.search(r"\s", v) and not single or (kind == "static" and _GLOB_CHARS.search(v))):
-                    options.append([text])
-                    unresolved.append(name)
-                    break
-            else:
-                options.append(values)
+            values, kind = applied, "static" if kind == "static" else "set"
+        if not quoted and dialect == "bash" and any(re.search(r"\s", v) for v in values) and not single:
+            options.append([text])
+            unresolved.append(name)
+            continue
+        options.append(values)
+        for v in values:
+            if _GLOB_CHARS.search(v):
+                if len(seg) > 4 and seg[4] == "~":
+                    pattern_value = True  # `${~x}`: zsh globs the value
+                elif (kind == "static" or isinstance(v, _Plain)) and (quoted or dialect == "zsh"):
+                    value_glob = True  # a name with a star in it, not a pattern
+                else:
+                    pattern_value = True  # an element / an item / an unquoted value in bash: a pattern
     total = 1
     for o in options:
         total *= len(o)
     if total > MAX_VARIANTS:
-        return [[w.text]], [s[1] for s in w.segs if s[0] == "var"] or ["(set)"]
+        return [[w.text]], [g[1] for g in w.segs if g[0] in ("var", "op", "arr")] or ["(set)"], False
     variants: list[list[str]] = [[""]]
     for o in options:
         variants = [[v[0] + t] for v in variants for t in o]
@@ -671,7 +830,7 @@ def subst_word(w: Word, lookup, dialect: str = DEFAULT_DIALECT) -> tuple[list[li
                 out.append([v] if v else [])
         else:
             out.append([v])
-    return out, unresolved
+    return out, unresolved, bool(value_glob and not pattern_value and not literal_glob)
 
 
 # ------------------------------------------------------------------------------------------------ walking
@@ -789,7 +948,7 @@ class _Walker:
 
     def words_of(self, w: Word) -> list[list[str]] | None:
         """The word lists a word makes when everything in it is known (see `subst_word`), else None."""
-        variants, unresolved = subst_word(w, self.lookup, self.dialect)
+        variants, unresolved, _ = subst_word(w, self.lookup, self.dialect)
         return None if unresolved else variants
 
     # -- substitutions found in some JSON (words, redirects, heredocs…)
@@ -982,7 +1141,7 @@ class _Walker:
         assigns = [self.assign(a) for a in c.get("Assigns") or []]
         call = self.emit(Call(argv, list(redirs), st.sure, sub, assigns=assigns, origin=origin, cwd_known=st.known))
         call.background = bool(stmt.get("Background"))
-        call.stdin_interpreter = _stdin_interpreter(argv)
+        call.stdin_interpreter = _stdin_interpreter(self.resolved_argv(call) if self.model is not None else argv)
         for part in (c.get("Assigns"), c.get("Args"), stmt.get("Redirs")):
             self.substs(part, st, call)
         for node in c.get("Assigns") or []:  # `functions[f]='code'`, `aliases[x]='code'`: the value IS code
@@ -1038,7 +1197,13 @@ class _Walker:
             if e.get("Value"):
                 array.append(_word(e["Value"]))
         value = _word(a["Value"]) if a.get("Value") else None  # `a=` has no "Value": the empty string
-        return Assign(_text(_need(a, "Name")), value, tuple(array), bool(a.get("Append")))
+        elements = [_word(e["Value"]) for e in (a.get("Array") or {}).get("Elems") or [] if e.get("Value")]
+        indexed = a.get("Index") is not None
+        if indexed and value is not None:
+            elements = [value]
+        return Assign(
+            _text(_need(a, "Name")), value, tuple(array), bool(a.get("Append")), tuple(elements), bool(a.get("Array")) or indexed
+        )
 
     def builtin_like(self, c, t, st, sub, redirs, origin, stmt) -> _State:
         words: list[Word] = []
@@ -1189,8 +1354,18 @@ class _Walker:
             if variants and all(len(v) == 1 for v in variants):
                 resolved = [v[0] for v in variants]
         if resolved is not None:
-            moved = frozenset(_resolve(t, d, False) for t in resolved for d in st.sure)
-            absolute = all(os.path.isabs(t) for t in resolved)
+            plain = [t for t in resolved if not _GLOB_CHARS.search(t)]
+            globbed = [t for t in resolved if _GLOB_CHARS.search(t)]  # an element of an array / a `for` that is a pattern
+            found = set()
+            for t in globbed:
+                got = self.expand_dirs(t, st.sure)
+                if got is None:
+                    return self.unknown_dir(st)
+                found |= set(got)
+            moved = frozenset({_resolve(t, d, False) for t in plain for d in st.sure} | found)
+            if not moved:  # nothing matched: the `cd` fails
+                return st
+            absolute = all(os.path.isabs(t) for t in plain) and not globbed
             return _State(moved, st.seen | moved, st.known or absolute, st.any_known)
         if (
             args
@@ -1344,12 +1519,12 @@ def parse(command: str, *, cwd: str, dialect: str = DEFAULT_DIALECT) -> list[Cal
         tree = ast(command, dialect)
         walker.stmts(tree.get("Stmts") or [], _State(start, start), False, (), "top")
         result.assigned_in_expansions = frozenset(_expansion_assignments(tree))
-        model = build_model(walker.calls, result.assigned_in_expansions, walker.session)
+        model = build_model(walker.calls, result.assigned_in_expansions, walker.session, dialect)
         reads = any(k.startswith("$") for c in walker.calls for w in c.argv for k in w.kinds)
         if model.sites or reads:  # a second walk that follows `cd "$D"` and function arguments by the values of the variables
             walker = _Walker(cwd, dialect=dialect, model=model)
             walker.stmts(tree.get("Stmts") or [], _State(start, start), False, (), "top")
-            model = build_model(walker.calls, result.assigned_in_expansions, walker.session)
+            model = build_model(walker.calls, result.assigned_in_expansions, walker.session, dialect)
         result.model = model
     except ParseError:
         raise
