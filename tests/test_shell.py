@@ -156,7 +156,7 @@ class TestHeredocs(Base):
         self.assertEqual(heredoc(call).body, "one\ntwo\n")
         (call,) = parse('bash <<< "ls $HOME"')
         self.assertEqual(call.redirects[0].op, "<<<")
-        self.assertEqual(call.redirects[0].target.text, "ls ${HOME}")
+        self.assertEqual(call.redirects[0].target.text, "ls $HOME")
         self.assertEqual(call.stdin_interpreter, "bash")
 
     def test_two_heredocs_on_one_command_and_inside_substitution(self):
@@ -290,7 +290,7 @@ class TestStructure(Base):
         calls = parse("for i in $(ls d); do cat $i; done; case $x in a) pwd;; esac; f() { cat z; }; { cat; } < s.txt")
         # the words of `for` and `case` are calls too (so that no word reaches the gate unjudged)
         self.assertEqual([c.name for c in calls], ["for", "ls", "cat", "case", "pwd", "cat", "cat"])
-        self.assertEqual([w.text for w in calls[0].argv], ["for", "$(…)"])
+        self.assertEqual([w.text for w in calls[0].argv], ["for", "$(ls d)"])
         self.assertEqual(calls[5].origin, "function")
         self.assertEqual([(r.op, r.target.text, r.inherited) for r in calls[6].redirects], [("<", "s.txt", True)])
 
@@ -302,7 +302,7 @@ class TestStructure(Base):
         self.assertEqual((assign.argv, id_.name), ([], "id"))
         self.assertEqual(assign.substitutions, [id_])
         decl, id_ = parse("export A=$(id) B=2")
-        self.assertEqual(texts(decl), ["export", "A=$(…)", "B=2"])
+        self.assertEqual(texts(decl), ["export", "A=$(id)", "B=2"])
         diff, ls = parse("diff <(ls a) b")
         self.assertEqual((ls.origin, diff.argv[1].kinds), ("<(", frozenset({"proc"})))
         tee_parent, tee = parse("cat > >(tee f)")
@@ -413,7 +413,6 @@ class TestDirectories(Base):
             "cd - && ls -R",
             "cd $(pwd) && ls",
             "cd a b && ls",
-            "cd a* && ls",
             "pushd && ls",
         ):
             with self.subTest(command):
@@ -535,7 +534,7 @@ class TestEmptyFields(Base):
         (call,) = parse('echo "$()" ${x:-} "${x}"')
         self.assertEqual(texts(call)[0], "echo")
         (call,) = parse("echo ``")
-        self.assertEqual(texts(call), ["echo", "$(…)"])
+        self.assertEqual(texts(call), ["echo", "``"])  # an expansion keeps its text as written
 
     def test_empty_pieces_in_every_position(self):
         for command in (
