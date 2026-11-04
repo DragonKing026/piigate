@@ -4923,6 +4923,50 @@ class TestSqlScripts(unittest.TestCase):
         f2 = [Fragment(tricky.index(p["surname"]), tricky.index(p["surname"]) + len(p["surname"]), "PERSON", 2)]
         self.assertEqual(sql.drop_identifiers(tricky, f2), f2)
 
+    def test_drop_identifiers_is_not_quadratic(self):
+        """#28 (review): 20000 statements (1.4 MB) took 45 s — a list lookup and a scan of all literals per fragment."""
+        import time
+
+        from piigate import sql
+        from piigate.rules import Fragment
+
+        statement = "UPDATE wp_users SET user_login = 'a' WHERE user_email = 'b';\n"
+        text = statement * 20000
+        fragments = []
+        for i in range(20000):
+            base = i * len(statement)
+            fragments.append(Fragment(base + statement.index("wp_users"), base + statement.index("wp_users") + 8, "PERSON", 2))
+            fragments.append(Fragment(base + statement.index("'a'") + 1, base + statement.index("'a'") + 2, "PERSON", 2))
+        started = time.monotonic()
+        kept = sql.drop_identifiers(text, fragments)
+        seconds = time.monotonic() - started
+        self.assertLess(seconds, 5, seconds)
+        self.assertEqual(len(kept), 20000)  # the literals stay, the table names go
+        self.assertTrue(all(text[f.start : f.end] == "a" for f in kept))
+
+    def test_only_an_identifier_outside_a_literal_is_dropped(self):
+        """#28 (review): text outside a literal that is not shaped like an identifier (a name after `=`) keeps its hit,
+        although every statement starts with a keyword; a table or column name is still dropped."""
+        from piigate import rules, sql
+        from piigate.rules import Fragment
+
+        for script in (
+            "UPDATE t SET name = Jan Kowalski;\n",
+            "UPDATE t SET name = Jan Kowalski WHERE id = 1;\nSET @a = 1;\n",
+            "SET @a = 1;\nUPDATE t SET name = Anna Nowak;\n",
+        ):
+            with self.subTest(script):
+                person = re.search(r"(?:Jan Kowalski|Anna Nowak)", script)
+                hit = [Fragment(person.start(), person.end(), "PERSON", 2)]
+                self.assertTrue(sql.looks_like_script(script))
+                self.assertEqual(sql.drop_identifiers(script, hit), hit)
+                self.assertIn(person.group(), [script[f.start : f.end] for f in rules.detect(script) if f.type_ == "PERSON"])
+        script = "UPDATE `wp_users` SET user_login = 'a' WHERE wp_users.user_email = 'b';\n"
+        for name in ("`wp_users`", "user_login", "wp_users.user_email"):
+            hit = [Fragment(script.index(name), script.index(name) + len(name), "ORG", 2)]
+            with self.subTest(name):
+                self.assertEqual(sql.drop_identifiers(script, hit), [])
+
     @unittest.skipUnless(PRESIDIO, PRESIDIO_SKIP)
     def test_text_filter_on_a_script(self):
         result, counter = text.filter_text(self.SCRIPT, CONFIG)

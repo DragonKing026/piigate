@@ -12,6 +12,7 @@ Two questions, both answered from the content, never from the file name:
 Standard library only; no import of the rules (fragments are rebuilt with `dataclasses.replace`).
 """
 
+import bisect
 import dataclasses
 import re
 
@@ -143,21 +144,42 @@ def looks_like_script(text: str) -> bool:
     return bool(statements) and all(any(r.match(s if len(s) <= 2000 else s[:2000] + "\0") for r in _STATEMENTS) for s in statements)
 
 
+_IDENTIFIER = re.compile(r"[\w.$`]+")
+_EDGE = " \t\r\n=,()<>;"  # whitespace and operators around an identifier
+
+
 def drop_identifiers(text: str, fragments: list) -> list:
     """Fragments of type PERSON / ADDRESS / ORG (Fragment objects) cut to the parts that lie in literals and comments,
-    when `text` is a SQL script; otherwise unchanged. What is outside them is code: keywords, table and column names."""
+    when `text` is a SQL script; otherwise unchanged. What is outside them is code: keywords, table and column names —
+    but only text shaped like an identifier (`wp_users`, `t.col`, `` `col` ``, no spaces) is dropped: a name written
+    outside a literal (`SET name = Jan Kowalski`) keeps its hit, because "every statement starts with a keyword" is
+    something a prepared text can imitate."""
     candidates = [f for f in fragments if f.type_ in ("PERSON", "ADDRESS", "ORG") and f.weight < 4]
     if not candidates or not looks_like_script(text):
         return fragments
     spans = data_spans(text)
-    result = [f for f in fragments if f not in candidates]
+    ends = [k for _, k in spans]
+    chosen = {id(f) for f in candidates}
+    result = [f for f in fragments if id(f) not in chosen]
     for f in candidates:
-        for s, k in spans:
-            if k <= f.start:
-                continue
+        inside: list[tuple[int, int]] = []
+        outside: list[tuple[int, int]] = []
+        position = f.start
+        for i in range(bisect.bisect_right(ends, f.start), len(spans)):
+            s, k = spans[i]
             if s >= f.end:
                 break
             lo, hi = max(s, f.start), min(k, f.end)
+            if lo > position:
+                outside.append((position, lo))
+            inside.append((lo, hi))
+            position = hi
+        if position < f.end:
+            outside.append((position, f.end))
+        if any((piece := text[lo:hi].strip(_EDGE)) and not _IDENTIFIER.fullmatch(piece) for lo, hi in outside):
+            result.append(f)  # not an identifier outside a literal: the hit stays whole
+            continue
+        for lo, hi in inside:
             result.append(f if (lo, hi) == (f.start, f.end) else dataclasses.replace(f, start=lo, end=hi))
     return sorted(result, key=lambda f: (f.start, f.end))
 
