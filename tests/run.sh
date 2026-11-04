@@ -14,6 +14,7 @@ if ! curl -sf -m 10 -L "$presidio/health" >/dev/null 2>&1; then
 fi
 python3 -I "$dir/test_filter.py"
 python3 -I "$dir/test_properties.py"  # Hypothesis (tests/requirements.txt); skips itself when not installed
+python3 -I "$dir/test_engine.py"  # unix socket, engine modes, pins of the container image
 if command -v uv >/dev/null; then
     uv run --quiet --script "$dir/test_mcp.py"
 else

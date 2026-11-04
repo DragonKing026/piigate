@@ -5,11 +5,14 @@ come from the configuration. The rules always run — also when Presidio is down
 headers and file names are still filtered by the rules alone).
 """
 
+import bisect
 import ipaddress
 import re
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+
+from . import sql
 
 UPPER = "A-ZĄĆĘŁŃÓŚŹŻ"
 LOWER = "a-ząćęłńóśźż"
@@ -255,8 +258,8 @@ PATTERNS: list[tuple[str, re.Pattern, int]] = [
     (
         "PHONE",
         re.compile(
-            r"(?<![\w+-])(?:(?:\+|00)48[\s-]?\d{3}[\s-]?\d{3}[\s-]?\d{3}|\d{3}[\s-]\d{3}[\s-]\d{3}"
-            r"|\(?\d{2}\)?[\s-]\d{3}[\s-]\d{2}[\s-]\d{2})(?![\w]|-\d)"
+            r"(?<![\w+-])(?:(?:\+|00)48[\s-]?\d{3}[\s-]?\d{3}[\s-]?\d{3}|\d{3}[ \t-]\d{3}[ \t-]\d{3}"
+            r"|\(?\d{2}\)?[ \t-]\d{3}[ \t-]\d{2}[ \t-]\d{2})(?![\w]|-\d)"
         ),
         2,
     ),
@@ -274,18 +277,157 @@ REGON_RE = re.compile(r"(?i)\bREGON\s*[:.]?\s*(\d{9}(?:\d{5})?)\b")
 KRS_RE = re.compile(r"(?i)\bKRS\s*[:.]?\s*(?:nr\.?\s*)?(\d{10})\b")
 # IPv6: candidate with ≥ 2 colons and a digit, then validation (time 12:45:30, MAC, `std::x` are rejected)
 IPV6_RE = re.compile(r"(?<![\w:.])(?=[0-9A-Fa-f:]*\d)(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?![\w:])")
-DIGITS_RE = re.compile(r"(?<![\d])\d[\d -]{9,22}\d(?![\d])")
+# PESEL: eleven contiguous digits, or the printed layouts 6+5 and 2-2-2-5 (a space or a hyphen) with a valid
+# checksum; other digit groups are not one number (`bak-20261023-046` holds eleven digits split by a hyphen). With a
+# "PESEL" label the usual separators are tolerated anywhere.
+PESEL_RE = re.compile(r"(?<!\d)\d{11}(?!\d)")
+PESEL_LAYOUT_RE = re.compile(r"(?<!\d)(?<!\d-)(?:\d{6}[ -]\d{5}|\d{2}[ -]\d{2}[ -]\d{2}[ -]\d{5})(?!\d|-\d)")
+PESEL_LABELLED_RE = re.compile(r"(?i)\bpesel\b[^\d\n]{0,15}(\d(?:[ \t-]{0,3}\d){10})(?!\d)")
+# payment card: 13-19 contiguous digits, or the printed layouts 4-4-4-4, 4-6-5 / 4-6-4 (Amex, Diners), 4-8-4, 4-4-4-1..3,
+# 5-5-5-1 and 4-4-4-4-3 with a hyphen, a space or two spaces between the groups (they may differ); numbers that merely
+# sit next to each other (HTTP codes `200 302 200 200 200`) are not one card. Only a neighbouring digit (or digit and
+# hyphen) ends the match on either side — a letter, a mark or an extension glued to it does not hide a card.
+_CARD_SEP = r"(?: {1,2}|-)"
+_CARD_EDGE = r"(?<!\d)(?<!\d-)"
+_CARD_LAYOUTS = (  # longest first: a longer layout is tried before the one that is its prefix
+    rf"\d{{4}}(?:{_CARD_SEP}\d{{4}}){{3}}{_CARD_SEP}\d{{3}}",
+    rf"\d{{4}}(?:{_CARD_SEP}\d{{4}}){{3}}",
+    rf"\d{{5}}(?:{_CARD_SEP}\d{{5}}){{2}}{_CARD_SEP}\d",
+    rf"\d{{4}}{_CARD_SEP}\d{{6}}{_CARD_SEP}\d{{4,5}}",
+    rf"\d{{4}}{_CARD_SEP}\d{{8}}{_CARD_SEP}\d{{4}}",
+    rf"\d{{4}}(?:{_CARD_SEP}\d{{4}}){{2}}{_CARD_SEP}\d{{1,3}}",
+)
+CARD_RE = re.compile(r"(?<!\d)\d{13,19}(?!\d)")  # contiguous digits
+CARD_LAYOUT_RES = tuple(re.compile(rf"{_CARD_EDGE}{layout}(?!\d|-\d)") for layout in _CARD_LAYOUTS)
+
+
+def card_spans(text: str, accept=lambda digits, matched: True) -> list[tuple[int, int]]:
+    """Spans of card candidates (contiguous digits and the printed layouts) whose digits pass Luhn and `accept`; one
+    regex cannot do it, because a layout that is the prefix of a longer one (4-4-4-4 and 4-4-4-4-3) would hide it.
+    On overlap the earlier (longer layout first) wins."""
+    spans: list[tuple[int, int]] = []
+    for regex in (CARD_RE, *CARD_LAYOUT_RES):
+        for m in regex.finditer(text):
+            digits = re.sub(r"\D", "", m.group())
+            if luhn_valid(digits) and accept(digits, m.group()):
+                spans.append(m.span())
+    spans.sort(key=lambda span: (span[0], -span[1]))
+    result: list[tuple[int, int]] = []
+    for sp in spans:
+        if not result or sp[0] >= result[-1][1]:
+            result.append(sp)
+    return result
+
+
 WORD_RE = re.compile(rf"{NAME}")
 # capital letters glued to a name and not starting another capitalized word (MariaDB, JanSQL — unlike JanKowalski)
 ACRONYM_TAIL = re.compile(rf"[{UPPER}]+(?![{LOWER}])")
+
+
+_TLD_RE = re.compile(r"[^\W\d_]{2,}|xn--[A-Za-z0-9-]+")
+
+
+# a version written as a domain: `1.2.3`, `v7.13.1`, `1.2.3-next.4`, `1.2.3.beta`, `1.0.0-rc.1` — the whole domain, so
+# that `1.2.pl` is not one (`dev` is a real TLD, so `2.0.dev` is not on the list: when in doubt it is masked)
+_VERSION_DOMAIN_RE = re.compile(
+    r"v?\d+(?:\.\d+)+(?:[-.](?:alpha|beta|rc|next|pre|canary|snapshot|final)(?:[.-]?\d+)*)?", re.IGNORECASE
+)
+
+
+def email_valid(address: str) -> bool:
+    """Whether what follows the last `@` starts with a domain: a label after the first one begins with letters (a TLD),
+    and the domain up to there is not wholly a version (`pkg@1.2.3`, `module/v7@v7.13.1`, `pkg@1.2.3-next.4`,
+    `pkg@1.2.3.beta`). `jan@1.2.pl` is an address, and so is `jan@kowalski.pl1` or `jan@kowalski.pl.501502503`: what is
+    glued behind the TLD does not make the address something else."""
+    labels = address.rsplit("@", 1)[-1].strip(".").split(".")
+    for i in range(1, len(labels)):
+        if m := _TLD_RE.match(labels[i]):
+            if not _VERSION_DOMAIN_RE.fullmatch(".".join([*labels[:i], m.group()])):
+                return True
+    return False
+
+
+# ISO 8601 / RFC 3339 timestamps (2026-11-02T20:11:01Z, 2026-11-02 20:11:01+01:00): a technical value (release time,
+# log line), not a birth date. A date with the time 00:00 is how databases export a plain date — that stays a date.
+TIMESTAMP_RE = re.compile(
+    r"(?<![\w.-])(?:19|20)\d{2}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2}(?:[.,]\d+)?)?|\s\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)"
+    r"(?:Z|[+-]\d{2}(?::?\d{2})?)?(?![\w:])"
+)
+
+
+BIRTH_MARKER_RE = re.compile(r"ur\.|urodz|dob|birth")  # in the 30 characters before a date: a birth date
+
+
+def timestamp_spans(text: str) -> list[tuple[int, int]]:
+    """Spans of timestamps with a real time of day (see TIMESTAMP_RE), except those right after a birth marker
+    (`ur. 1985-03-14 08:15:00` is a birth date written with a time)."""
+    return [
+        (m.start(), m.end())
+        for m in TIMESTAMP_RE.finditer(text)
+        if re.search(r"[1-9]", re.sub(r"[Z+-]\d{2}(?::?\d{2})?$|^.{10}", "", m.group()))
+        and not BIRTH_MARKER_RE.search(text[max(0, m.start() - 30) : m.start()].casefold())
+    ]
+
+
+# a dotted number (`v0.5.1`, `1.80.0`, `14.03.1985r`, `12.345.678`): NER sometimes tags a piece of it ("v0", "80.",
+# "1985r") and a pseudonym would cut the token (`ORG_5.5.1`, `14.03.DATE_1.`)
+DOTTED_TOKEN_RE = re.compile(r"(?<![\w.])([vV]?)(\d+(?:\.\d+)+)(?:[-+][\w.]*\w)?\w*")
+
+
+def _date_or_number_like(parts: list[str]) -> bool:
+    """Whether dotted digit groups can be a date (dd.mm.yy, dd.mm.yyyy, yy.mm.dd, yyyy.mm.dd) or a number written with
+    dots (12.345.678); a pair of short numbers (14.03) too."""
+    if len(parts) == 2:
+        return True  # anything of two parts is kept whole (14.03, 2.60): not a version by itself
+    if len(parts) != 3:
+        return False
+    a, b, c = parts
+    if len(a) <= 2 and len(b) <= 2 and len(c) in (2, 4) and 1 <= int(a) <= 31 and 1 <= int(b) <= 12:
+        return True  # dd.mm.yy(yy)
+    if len(a) in (2, 4) and len(b) <= 2 and len(c) <= 2 and 1 <= int(b) <= 12 and 1 <= int(c) <= 31:
+        return True  # yy(yy).mm.dd
+    return bool(re.fullmatch(r"\d{2,3}", a) and len(b) == 3 and len(c) == 3)  # 12.345.678
+
+
+def fit_to_tokens(text: str, start: int, end: int) -> tuple[int, int] | None:
+    """A NER hit that begins or ends inside a dotted token. Fail closed: the whole token is the hit, unless it is a
+    version — it begins with `v`, or has three or more parts and cannot be a date or a number like 12.345.678 — then
+    None, the hit is dropped. A hit that does not cut a token: unchanged."""
+    for m in DOTTED_TOKEN_RE.finditer(text, max(0, start - 128)):
+        if m.start() >= end:
+            break
+        if m.end() <= start or (start <= m.start() and m.end() <= end):
+            continue
+        if m.group(1) or not _date_or_number_like(m.group(2).split(".")):
+            return None
+        return min(start, m.start()), max(end, m.end())
+    return start, end
 
 
 def _group(m: re.Match) -> tuple[int, int]:
     return (m.start(1), m.end(1)) if m.re.groups and m.group(1) else (m.start(), m.end())
 
 
+# four or more HTTP status codes in one line, with one kind of separator, are a list of numbers (`200 302 404 500`),
+# not a phone — groups that are not all status codes (`600 700 800 900`) stay phones, and so does a start with a 5xx
+# number (`501 502 503 200 200 200`); a line break never joins them (a column of phones), nor does a phone label
+_HTTP_CODE = r"(?:10[0-3]|20[0-8]|226|30[0-8]|4[0-2]\d|431|451|50\d|51[01])"
+_FIRST_HTTP_CODE = r"(?:10[0-3]|20[0-8]|226|30[0-8]|4[0-2]\d|431|451)"  # not 5xx: 501 502 503 is a phone (or two)
+NUMBER_LIST_RE = re.compile(rf"(?<![\w+.-]){_FIRST_HTTP_CODE}([ \t-]){_HTTP_CODE}(?:\1{_HTTP_CODE}){{2,}}(?!\w)")
+BARE_PHONE_RE = re.compile(r"\d{3}[ \t-]\d{3}[ \t-]\d{3}")
+PHONE_LABEL_RE = re.compile(r"(?i)\b(?:tel|telefon\w*|kom|komórk\w*)\.?\s*[:.]?\s*$")
+
+
+def _inside(spans: list[tuple[int, int]], starts: list[int], s: int, k: int) -> bool:
+    """Whether [s, k) lies within one of the sorted, disjoint `spans` (`starts` are their beginnings)."""
+    i = bisect.bisect_right(starts, s) - 1
+    return i >= 0 and k <= spans[i][1]
+
+
 def detect(text: str, *, dates: str = "all", drugs: bool = True) -> list[Fragment]:
     result: list[Fragment] = []
+    lists = [m.span() for m in NUMBER_LIST_RE.finditer(text) if not PHONE_LABEL_RE.search(text, max(0, m.start() - 24), m.start())]
+    list_starts = [a for a, _ in lists]  # the spans are sorted and do not overlap
     for type_, regex, weight in PATTERNS:
         if type_ == "DATE" and dates == "none":
             continue
@@ -293,19 +435,27 @@ def detect(text: str, *, dates: str = "all", drugs: bool = True) -> list[Fragmen
             s, k = _group(m)
             if type_ == "DATE" and dates == "birth":
                 before = text[max(0, s - 30) : s].casefold()
-                if not re.search(r"ur\.|urodz|dob|birth", before):
+                if not BIRTH_MARKER_RE.search(before):
                     continue
+            if type_ == "EMAIL" and not email_valid(m.group()):
+                continue
+            if type_ == "PHONE" and BARE_PHONE_RE.fullmatch(m.group()) and _inside(lists, list_starts, s, k):
+                continue
             result.append(Fragment(s, k, type_, weight))
 
-    for m in DIGITS_RE.finditer(text):  # PESEL, NIP, cards — by checksum
-        digits = re.sub(r"\D", "", m.group())
-        if pesel_valid(digits):
+    for m in PESEL_RE.finditer(text):  # PESEL, cards — by checksum
+        if pesel_valid(m.group()):
             result.append(Fragment(m.start(), m.end(), "PESEL", 3))
-        elif luhn_valid(digits):
-            result.append(Fragment(m.start(), m.end(), "CARD", 3))
-    for m in re.finditer(r"(?<!\d)\d{11}(?!\d)", text):
-        if not pesel_valid(m.group()):  # 11 digits without a valid checksum — still a personal number
+        else:  # 11 digits without a valid checksum — still a personal number
             result.append(Fragment(m.start(), m.end(), "NUMBER", 2))
+    for m in PESEL_LAYOUT_RE.finditer(text):
+        if pesel_valid(re.sub(r"\D", "", m.group())):
+            result.append(Fragment(m.start(), m.end(), "PESEL", 3))
+    for m in PESEL_LABELLED_RE.finditer(text):
+        if not PESEL_RE.fullmatch(m.group(1)) and pesel_valid(re.sub(r"\D", "", m.group(1))):
+            result.append(Fragment(m.start(1), m.end(1), "PESEL", 3))
+    for start, end in card_spans(text):
+        result.append(Fragment(start, end, "CARD", 3))
     for m in NIP_RE.finditer(text):
         if nip_valid(re.sub(r"\D", "", m.group())):
             result.append(Fragment(m.start(), m.end(), "NIP", 3))
@@ -325,7 +475,7 @@ def detect(text: str, *, dates: str = "all", drugs: bool = True) -> list[Fragmen
                 result.append(Fragment(m.start(1), m.end(1), "DRUG", 2))
 
     result += find_persons(text)
-    return result
+    return sql.drop_identifiers(text, result)  # table and column names of a SQL script are not people or places
 
 
 def find_persons(text: str) -> list[Fragment]:

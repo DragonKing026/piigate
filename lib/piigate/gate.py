@@ -2537,7 +2537,11 @@ class Gate:
                     k += 1
                 if len(positional) != 2 or positional[1] != "-":
                     return "pdftotext in a pipeline only to stdout (`pdftotext FILE -`)"
-            if cmd != "ssh" and any(OUTPUT_OPTIONS.match(t) for t in stage[1:]):  # ssh -o: key list above
+            # ssh -o: key list above; grep -o is "only matching" (grep has no option that writes a file), not a write
+            if cmd != "ssh" and any(
+                OUTPUT_OPTIONS.match(t) and not (cmd == "grep" and re.fullmatch(r"-[A-Za-z]*o[A-Za-z]*", t))
+                for t in stage[1:]
+            ):
                 return "an option writing to a file (-o/--output) in an earlier stage — raw data outside the filter"
             rest = list(stage)
             for k in range(len(rest) - 2):

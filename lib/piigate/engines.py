@@ -16,7 +16,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from . import FilterError, engine_socket, rules
+from . import FilterError, engine_socket, rules, sql
 from .rules import Fragment
 
 PRESIDIO_TYPES = {
@@ -196,10 +196,17 @@ def presidio(text: str, cfg: dict) -> list[Fragment]:
                     continue  # "przyszła z Babcią" — a capitalized common noun, not a person
                 if type_ in ("PERSON", "ORG", "ADDRESS") and rules.technical_term(text, start, end, type_):
                     continue  # Vite, cypress-axe, ps_customersignin, vendor/package — technology, not data
+                if type_ == "EMAIL" and not rules.email_valid(value):
+                    continue  # tool@v1.2.3, pkg@1.2.3-next.4 — a version after the @, not a domain
+                if type_ in ("DATE", "ORG", "NUMBER"):
+                    fitted = rules.fit_to_tokens(text, start, end)
+                    if fitted is None:
+                        continue  # a piece of a version (v0.5.1 → "v0"): a pseudonym would cut the token
+                    start, end = fitted
                 if type_ == "PHONE" and re.search(r"[/A-Za-z]", value):
                     type_ = "NUMBER"  # FV/2026/10/123 is a document number, not a phone — still masked
                 result.append(Fragment(start, end, type_, weight))
-    return result
+    return sql.drop_identifiers(text, result)  # SQL script: names of tables and columns are not people or places
 
 
 def presidio_health(cfg: dict, timeout_s: float | None = None) -> str:

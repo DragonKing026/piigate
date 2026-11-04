@@ -332,9 +332,8 @@ Only on **synthetic** data ([tests/fixtures.py](tests/fixtures.py) — invented 
 `.test` e-mails, made-up streets and towns). Never on real personal data.
 
 ```bash
-tests/run.sh                                   # unit + hook + gate tests, property tests, MCP server tests (uv)
+tests/run.sh                                   # unit + hook + gate tests, property tests, engine tests, MCP server tests (uv)
 pip install --require-hashes -r tests/requirements.txt   # hypothesis (property tests), ruff — pinned by hash
-python3 -I tests/test_engine.py                # unix socket, engine modes, model checksum
 PIIGATE_TEST_LOCAL_ENGINE=1 python3 -I tests/test_engine.py   # + real local engine (downloads models once)
 PIIGATE_TEST_DB=1 tests/run.sh                 # + throwaway postgres container → psql | piigate table
 tests/e2e_claude.sh                            # claude -p with the plugin and a fake mail MCP (costs tokens)

@@ -2726,6 +2726,27 @@ class TestFalseAlarms(unittest.TestCase):
             with self.subTest(command):
                 self.assertIsNotNone(b.bash(command))
 
+    def test_built_program_names_and_scripts_stay_denied(self):
+        """Still denied (as on main): a program name built at run time, and a script written through a variable and
+        run under another name; the shell parser planned in issue #22 will judge these precisely."""
+        word = "rev" + "erse"
+        appr = "appr" + "ove"
+        for where in (self.public, self.phi):
+            b = self.gate(where)
+            for command in (
+                f"x=$(echo pii)gate; $x {word}",
+                f"x=$(echo pii)gate; $x project {appr}",
+                f'x=$(echo pii)gate; "$x" {word} a',
+                f"f=/tmp/x/a.sh; cat > \"$f\" <<'SH'\npiigate {word} x\nSH\nbash \"$f\"",
+                f"f=/tmp/x/a.sh; cat > $f <<'SH'\npiigate project {appr}\nSH\nsh $f",
+                f"f=/tmp/x/a.sh; cat > \"$f\" <<SH\npiigate {word} x\nSH\nzsh \"$f\"",
+                f"f=/tmp/x/a.sh; cat > \"$f\" <<'SH'\npiigate {word} x\nSH\nsource \"$f\"",
+                f"f=/tmp/x/a.sh; cat > \"$f\" <<'SH'\npiigate {word} x\nSH\nchmod +x \"$f\"; \"$f\"",
+                f"f=/tmp/x/a.sh; printf 'piigate {word} x' > \"$f\"; bash \"$f\"",
+            ):
+                with self.subTest(where=where.name, command=command):
+                    self.assertIsNotNone(b.bash(command))
+
     def test_relative_paths_against_tool_cwd(self):
         """The hook resolves relative paths against the tool call's cwd, not its own working directory."""
         def bash(command: str) -> dict | None:
@@ -3321,6 +3342,29 @@ class TestContentNotNames(unittest.TestCase):
         for command in (f"ls {S} | cat -", f"find {S} | sort -u | head -n 3", f"ls {S} | grep -v x | wc -l", f"ls {S} | cut -d. -f1 | uniq -c", f"ls {S} | head -5"):
             with self.subTest(command):
                 self.assertIsNone(b.bash(command))
+
+    def test_o_means_the_commands_own_thing(self):
+        """Issue #29: `-o` is "only matching" for grep and a write to a file for the others; a long --output is a write."""
+        b = self.gate()
+        S = "~/Documents/piigate/Sensitive-data"
+        ssh = "ssh prod 'bin/console dbal:run-sql \"SELECT 1\"' 2>&1"
+        for flags in ("-o", "-oE", "-Eo", "-io", "-oP", "-ho", "-c -o"):
+            with self.subTest(flags):
+                self.assertIsNone(b.bash(f"grep {flags} 'foo' {S}/a.sql 2>&1 | grep -vc foo 2>&1 | piigate text"))
+                self.assertIsNone(b.bash(f"{ssh} | grep {flags} foo 2>&1 | piigate text"))
+        for command in (
+            f"{ssh} | grep --output=/tmp/x foo 2>&1 | piigate text",
+            f"{ssh} | iconv -o /tmp/x 2>&1 | piigate text",
+            f"{ssh} | markitdown -o /tmp/a.md 2>&1 | piigate text",
+            f"markitdown {S}/a.docx -o /tmp/a.md 2>&1 | piigate text",
+            f"{ssh} | cat -o /tmp/x 2>&1 | piigate text",
+            f"{ssh} | head -o /tmp/x 2>&1 | piigate text",
+            f"{ssh} | piigate text | sort -o /tmp/x",
+            f"{ssh} | piigate text | grep -o x > /tmp/y",
+            f"{ssh} | grep -o foo > /tmp/y 2>&1 | piigate text",
+        ):
+            with self.subTest(command):
+                self.assertIsNotNone(b.bash(command))
 
     def test_grep_directories_option(self):
         b = self.gate()
@@ -4298,6 +4342,830 @@ class TestHumanApproval(unittest.TestCase):
             check=False,
         )
         self.assertEqual((w.returncode, w.stdout), (1, ""))
+
+
+class TestLineSafety(unittest.TestCase):
+    """Issue #25: the text filter never changes the number of lines, ISO timestamps and versions are not data, and
+    real dates stay masked."""
+
+    def lines_equal(self, source: str, **kw) -> str:
+        result, _ = text.filter_text(source, CONFIG, **kw)
+        self.assertEqual(result.count("\n"), source.count("\n"), result)
+        return result
+
+    def test_neighbouring_hits_on_neighbouring_lines_stay_separate(self):
+        from piigate.rules import Fragment
+
+        source = "\n".join(["wiersz jeden", "wiersz dwa", "wiersz trzy", "wiersz jeden", "2026-11-02", "2026-11-03", "koniec"])
+        result, counter = text.filter_text(source, CONFIG, rules_only=True)
+        self.assertEqual(len(result.splitlines()), 7, result)
+        self.assertEqual(counter, {"DATE": 2})
+        for type_ in ("EMAIL", "ADDRESS", "IP", "NUMBER"):  # the glue was shared by every non-person type
+            with self.subTest(type_):
+                merged = text._merge([Fragment(0, 3, type_), Fragment(4, 7, type_)], "abc\ndef")
+                self.assertEqual(len(merged), 2)
+        # a hit that spans lines (NER does that) keeps its line breaks
+        result, _ = text.filter_text("Jan\nKowalski\nkoniec", CONFIG, rules_only=True, extra=[Fragment(0, 12, "PERSON", 4)])
+        self.assertEqual(result.count("\n"), 2, result)
+        self.assertNotIn("Kowalski", result)
+
+    @unittest.skipUnless(PRESIDIO, PRESIDIO_SKIP)
+    def test_repro_from_the_issue_with_presidio(self):
+        source = "\n".join(["wiersz jeden", "wiersz dwa", "wiersz trzy", "wiersz jeden", "2026-11-02", "2026-11-03", "koniec"])
+        result = self.lines_equal(source)
+        self.assertEqual(len(re.findall(r"DATE_\d+", result)), 2, result)
+
+    @unittest.skipUnless(PRESIDIO, PRESIDIO_SKIP)
+    def test_timestamps_with_a_time_are_not_dates(self):
+        for stamp in ("2026-11-02T20:11:01Z", "2026-11-02T20:11:01.123+01:00", "2026-11-02T20:11", "2026-11-02 20:11:01"):
+            with self.subTest(stamp):
+                self.assertEqual(self.lines_equal(f"pushed_at\t{stamp}\tdone"), f"pushed_at\t{stamp}\tdone")
+        # dates stay dates: alone, in a sentence, and as a date exported with the time 00:00
+        for value in ("2026-11-02", "14.05.1944", "1990-05-14T00:00:00Z", "1990-05-14 00:00:00"):
+            with self.subTest(value):
+                result = self.lines_equal(f"ur. {value} w Warszawie")
+                self.assertIn("DATE_", result)
+                self.assertNotIn(value, result)
+
+    def test_timestamp_spans(self):
+        from piigate import rules
+
+        for stamp in ("2026-11-02T20:11:01Z", "2026-11-02T20:11:01.5-05:00", "2026-11-02 20:11:01", "2026-11-02T20:11"):
+            self.assertEqual(rules.timestamp_spans(f"x {stamp} y"), [(2, 2 + len(stamp))], stamp)
+        for value in ("2026-11-02", "2026-11-02T00:00:00Z", "2026-11-02T00:00", "2026-11-02 00:00:00.000", "2026-11-02 20:11"):
+            self.assertEqual(rules.timestamp_spans(f"x {value} y"), [], value)
+
+    BIRTH_STAMPS = ("ur. 1985-03-14 08:15:00", "data urodzenia: 1985-03-14T08:15:00Z", "Urodzony 1985-03-14 08:15:00",
+                    "DOB: 1985-03-14T08:15", "birth date 1985-03-14 08:15:00+01:00")
+
+    def test_timestamp_after_a_birth_marker_stays_a_date(self):
+        """#25 (review): `ur. 1985-03-14 08:15:00` is a birth date written with a time — only a timestamp without such a
+        marker in the 30 characters before it is a technical value."""
+        from piigate import rules
+
+        for sample in self.BIRTH_STAMPS:
+            with self.subTest(sample):
+                self.assertEqual(rules.timestamp_spans(sample), [], sample)
+        for sample in ("ur. 1985-03-14 08:15:00", "Urodzony 1985-03-14 08:15:00", "birth date 1985-03-14 08:15:00+01:00"):
+            with self.subTest(sample):  # the rules alone (no NER) find the date when the time is separated by a space
+                self.assertTrue([f for f in rules.detect(sample) if f.type_ == "DATE"], sample)
+                result, _ = text.filter_text(sample, CONFIG, rules_only=True)
+                self.assertIn("DATE_", result)
+                self.assertNotIn("1985-03-14", result)
+        # the marker too far back, or none: a timestamp as before
+        far = "ur. " + "x" * 40 + " 2026-11-02T20:11:01Z"
+        self.assertEqual(len(rules.timestamp_spans(far)), 1)
+        self.assertEqual(len(rules.timestamp_spans("pushed_at 2026-11-02T20:11:01Z")), 1)
+
+    @unittest.skipUnless(PRESIDIO, PRESIDIO_SKIP)
+    def test_timestamp_after_a_birth_marker_is_masked_with_presidio(self):
+        for sample in self.BIRTH_STAMPS:
+            with self.subTest(sample):
+                result, _ = text.filter_text(sample, CONFIG)
+                self.assertIn("DATE_", result)
+                self.assertNotIn("1985-03-14", result)
+        result, _ = text.filter_text("pushed_at 2026-11-02T20:11:01Z done", CONFIG)
+        self.assertEqual(result, "pushed_at 2026-11-02T20:11:01Z done")
+
+    def test_hits_never_cut_a_version(self):
+        from piigate import rules
+
+        text_ = "a\tv0.5.1\tb 1.80.0 c 5.5.90 d"
+        v, n, dd = text_.index("v0"), text_.index("1.80"), text_.index("5.5.90")
+        self.assertIsNone(rules.fit_to_tokens(text_, v, v + 2))  # "v0" of v0.5.1
+        self.assertIsNone(rules.fit_to_tokens(text_, n + 2, n + 5))  # "80." of 1.80.0
+        self.assertIsNone(rules.fit_to_tokens(text_, n, n + 2))  # "1." of 1.80.0
+        self.assertEqual(rules.fit_to_tokens(text_, v, v + 6), (v, v + 6))  # the whole token: unchanged
+        self.assertEqual(rules.fit_to_tokens(text_, 0, 1), (0, 1))  # no token
+        # a number that can be a date, cut by NER: the whole token is the hit (fail closed)
+        self.assertEqual(rules.fit_to_tokens(text_, dd, dd + 4), (dd, dd + 6))
+        self.assertEqual(rules.fit_to_tokens(text_, dd + 2, dd + 6), (dd, dd + 6))
+
+    def test_a_hit_inside_a_dotted_token_covers_the_whole_token_unless_it_is_a_version(self):
+        """Fail closed: whatever piece of `14.03.1985r`, `85.03.14`, `14.03` or `12.345.678` NER tags, the whole token is
+        the hit; only a token with a leading `v`, or with three or more parts that cannot be a date or a number
+        like 12.345.678, is a version whose piece is dropped."""
+        from piigate import rules
+
+        for token in ("14.03.1985r", "14.03.1985", "85.03.14", "14.03", "12.345.678", "5.5.90", "1985.03.14", "14.03.85r",
+                      "1.5", "2.60"):
+            line = f"ur. {token}."
+            first = line.index(token)
+            last = first + len(token)
+            for a in range(first, last):
+                for b in range(a + 1, last + 1):
+                    if (a, b) == (first, last):
+                        continue
+                    with self.subTest(token=token, piece=line[a:b]):
+                        self.assertEqual(rules.fit_to_tokens(line, a, b), (first, last))
+        for token in ("v0.5.1", "V1.2.3", "1.80.0", "0.5.1", "125.5.1", "2.60.0", "1.2.3-next.4", "v1.2.3-rc.1", "10.0.0.1"):
+            line = f"wersja {token}."
+            first = line.index(token)
+            last = first + len(token)
+            for a in range(first, last):
+                for b in range(a + 1, last + 1):
+                    if (a, b) == (first, last):
+                        continue
+                    with self.subTest(token=token, piece=line[a:b]):
+                        self.assertIsNone(rules.fit_to_tokens(line, a, b))
+        # a hit that cuts nothing, and one that spans the whole token and more, stay as they are
+        self.assertEqual(rules.fit_to_tokens("ur. 14.03.1985r.", 0, 3), (0, 3))
+        self.assertEqual(rules.fit_to_tokens("ur. 14.03.1985r.", 0, 16), (0, 16))
+
+    @unittest.skipUnless(PRESIDIO, PRESIDIO_SKIP)
+    def test_dates_and_numbers_next_to_a_letter_are_masked_whole(self):
+        for sample in ("Jan Kowalski 14.03.1985r.", "ur. 14.03.1985r.", "ur. 85.03.14", "tel 12.345.678", "ur. 14.03.1985r",
+                       "urodzony 14.03.85r."):
+            with self.subTest(sample):
+                result, _ = text.filter_text(sample, CONFIG)
+                for part in re.findall(r"\d{2,}", sample):  # no piece of the number is left in the output
+                    self.assertNotRegex(result, rf"(?<![_\d]){part}(?!\d)")  # (not the number of a pseudonym: DATE_14)
+        for sample in ("Wersja v0.5.1 wydana", "Rust 1.80.0 stable", "ORG_125.5.1", "Wydanie 2.60.0 i 0.5.1 oraz 125.5.1"):
+            with self.subTest(sample):
+                self.assertEqual(text.filter_text(sample, CONFIG)[0], sample)
+
+    @unittest.skipUnless(PRESIDIO, PRESIDIO_SKIP)
+    def test_versions_in_tables_stay_intact(self):
+        source = "\n".join(
+            [
+                "cli/cli\t2026-11-02T10:00:00Z\tv2.60.0",
+                "rust-lang/rust\t2026-11-01T10:00:00Z\t1.80.0",
+                "foo/bar\t2026-10-30T10:00:00Z\tv0.5.1",
+                "open-wc/open-wc\t2026-10-30T10:00:00Z\teslint-plugin-lit-a11y@5.1.3",
+            ]
+        )
+        self.assertEqual(self.lines_equal(source), source)
+
+    @unittest.skipUnless(PRESIDIO, PRESIDIO_SKIP)
+    def test_collective_gh_output_passes_by_detection_alone(self):
+        """Synthetic output of a loop over public repos: tags, versions, timestamps — nothing to hide."""
+        rows = [
+            f"org{i}/repo{i}\t2026-10-{i + 1:02d}T0{i}:11:01Z\tv0.{i}.1\t{name}@{i}.2.3-next.{i}\tmodule/v7@v7.13.{i}"
+            for i, name in enumerate(("eslint-plugin-lit-a11y", "pkg", "@scope/pkg"), 1)
+        ]
+        source = "\n".join(rows)
+        self.assertEqual(self.lines_equal(source), source)
+        self.assertEqual(verdict.check_text(source, CONFIG), {})
+
+    @unittest.skipUnless(PRESIDIO, PRESIDIO_SKIP)
+    def test_real_data_is_still_found_among_versions(self):
+        p = dt.PATIENTS[0]
+        source = f"v0.5.1\t2026-11-02T20:11:01Z\n{p['first_name']} {p['surname']}\t{p['phone']}\t{p['pesel']}\njan.kowalski@firma.pl\t1.80.0"
+        result = self.lines_equal(source)
+        self.assertEqual(leaks(result), [])
+        self.assertNotIn("kowalski@firma", result)
+        self.assertIn("v0.5.1", result)
+        self.assertIn("1.80.0", result)
+
+    def test_the_output_filter_and_the_text_filter_share_the_rules(self):
+        """Why a longer output is hidden and a shorter one is not: the filter checks the output of a command only when
+        the command text contains a glob character or a data extension (`jq '.[]'`, `-- '*.md'`, `x.csv`) — the length
+        of the output has nothing to do with it. Both the check and `piigate text` take the e-mail rule from rules.detect."""
+        g = gate.Gate(CONFIG, str(TMP))
+        self.assertTrue(g.touches_extension("gh api repos/o/r --jq '.[] | .tag_name'"))
+        self.assertFalse(g.touches_extension("gh api repos/o/r/releases/latest --jq .tag_name"))
+        for value in ("pkg@1.2.3", "go install example.org/tool@v1.2.3", "@scope/pkg@v1.2.3", "a/v7@v7.13.1"):
+            with self.subTest(value):
+                self.assertEqual(verdict.check_text(value, CONFIG), {})
+
+
+class TestEmailVersions(unittest.TestCase):
+    """Issue #24: the part after the @ is a domain only when its last label is a TLD; a version is not one."""
+
+    VERSIONS = (
+        "go install example.org/tool@v1.2.3",
+        "github.com/cloudflare/cloudflare-go/v7@v7.13.1",
+        "example.org/module/v7@v7.13.1",
+        "pkg@1.2.3",
+        "pkg@v1.2.3",
+        "pkg@1.2.3-next.4",
+        "@scope/pkg@1.2.3",
+        "eslint-plugin-lit-a11y@5.1.3",
+        "nazwa@wersja",
+        "pkg@1.2.3.beta",
+        "pkg@1.2.3-rc.1",
+        "pkg@v1.0.0-canary.3",
+        "pkg@2.0.0.final",
+        "pkg@1.2.beta",
+        "pkg@1.0.0-snapshot",
+        "pkg@1.0.0-pre.2",
+    )
+    ADDRESSES = (
+        "jan.kowalski@firma.pl",
+        "a@b.co",
+        "x@3m.com",  # a domain label that starts with a digit
+        "biuro@163.com",  # a numeric label next to a TLD is a real provider
+        "jan+tag@mail.firma.com.pl",
+        "ola@xn--e1afmkfd.xn--p1ai",
+        "jan@1.2.pl",  # numeric labels in front of a TLD are not a version (#24 review)
+        "jan@10.20.30.pl",
+        "jan@1.2.3.com",
+        "jan@v1.2.pl",
+    )
+
+    # an address followed by something glued to it (a digit, an underscore, a number after a dot or a hyphen) is still
+    # an address: only a domain that is wholly a version is not one
+    GLUED = (
+        "jan@kowalski.pl1", "jan@kowalski.pl123", "jan.kowalski@wp.pl2", "jan@kowalski.pl.501502503",
+        "jan@kowalski.pl-501502503", "jan@kowalski.pl_", "jan@2.0.dev",
+    )
+
+    def test_an_address_with_something_glued_to_it_is_still_an_address(self):
+        from piigate import rules
+
+        for value in self.GLUED:
+            with self.subTest(value):
+                self.assertTrue(rules.email_valid(value), value)
+                found = [f"dane: {value}"[f.start : f.end] for f in rules.detect(f"dane: {value}") if f.type_ == "EMAIL"]
+                self.assertEqual(len(found), 1, value)
+                self.assertTrue(found[0].startswith(value.split("@")[0]), value)
+                self.assertEqual(verdict.check_text(f"dane: {value}\n", CONFIG), {"EMAIL": 1}, value)
+
+    @unittest.skipUnless(PRESIDIO, PRESIDIO_SKIP)
+    def test_glued_addresses_are_masked_with_presidio(self):
+        for value in self.GLUED:
+            with self.subTest(value):
+                result, _ = text.filter_text(f"dane: {value}", CONFIG)
+                self.assertNotIn("kowalski", result)
+                self.assertNotIn("2.0.dev", result)
+                self.assertIn("EMAIL_", result)
+
+    def test_rules_do_not_take_versions_for_addresses(self):
+        from piigate import rules
+
+        for value in self.VERSIONS:
+            with self.subTest(value):
+                self.assertEqual([f for f in rules.detect(value) if f.type_ == "EMAIL"], [])
+                self.assertEqual(verdict.check_text(value, CONFIG), {})
+        for value in self.ADDRESSES:
+            with self.subTest(value):
+                found = [f"kontakt: {value}."[f.start : f.end] for f in rules.detect(f"kontakt: {value}.") if f.type_ == "EMAIL"]
+                self.assertEqual(found, [value])
+                self.assertEqual(verdict.check_text(f"kontakt: {value}.", CONFIG), {"EMAIL": 1})
+
+    @unittest.skipUnless(PRESIDIO, PRESIDIO_SKIP)
+    def test_text_filter_with_presidio(self):
+        for value in self.VERSIONS:
+            with self.subTest(value):
+                self.assertEqual(text.filter_text(value, CONFIG)[0], value)
+        for value in self.ADDRESSES:
+            with self.subTest(value):
+                result, _ = text.filter_text(f"Napisz do {value}, proszę.", CONFIG)
+                self.assertNotIn(value, result)
+                self.assertIn("EMAIL_", result)
+        # a version next to an address: only the address goes
+        result, _ = text.filter_text("update pkg@1.2.3 and write to jan.kowalski@firma.pl", CONFIG)
+        self.assertIn("pkg@1.2.3", result)
+        self.assertNotIn("firma.pl", result)
+
+    def test_bash_output_check_keeps_versions(self):
+        """The output of `git diff -- '*.md'` is checked (a glob character in the command); a diff with versions
+        passes, a real address in it is still reported."""
+        diff = "+go install example.org/tool@v1.2.3\n+  npm i pkg@1.2.3-next.4 @scope/pkg@v1.2.3\n"
+        data = {
+            "hook_event_name": "PostToolUse",
+            "cwd": str(TMP),
+            "tool_name": "Bash",
+            "tool_input": {"command": "git diff -- '*.md'"},
+            "tool_response": {"stdout": diff, "stderr": "", "interrupted": False, "isImage": False},
+        }
+        self.assertIsNone(hook("filter", data))
+        data["tool_response"]["stdout"] = diff + "+ kontakt: jan.kowalski@firma.pl\n"
+        out = json.dumps(hook("filter", data)["hookSpecificOutput"]["updatedToolOutput"])
+        self.assertIn("EMAIL 1", out)
+        self.assertNotIn("firma.pl", out)
+
+
+class TestChecksumNumbers(unittest.TestCase):
+    """Issue #30: PESEL and card numbers are contiguous digits (or a printed card layout) that pass the checksum;
+    digit groups that merely stand next to each other or are joined in a file name are not one number."""
+
+    CARDS = ("4111111111111111", "4111 1111 1111 1111", "4111-1111-1111-1111", "5500 0000 0000 0004", "3782 822463 10005",
+             "378282246310005")
+
+    def kinds(self, value: str) -> set[str]:
+        from piigate import rules
+
+        return {f.type_ for f in rules.detect(value)}
+
+    def test_file_names_with_a_date_and_a_number(self):
+        """`compose.yaml.bak-20261023-046`: eleven digits split by a hyphen with a valid checksum by chance."""
+        from piigate import rules
+
+        self.assertNotIn("PESEL", self.kinds("compose.yaml.bak-20261023-046"))
+        self.assertEqual(verdict.check_text("compose.yaml.bak-20261023-046\n", CONFIG), {})
+        self.assertEqual(sensors_mask("compose.yaml.bak-20261023-046"), ("compose.yaml.bak-20261023-046", 0))
+        for day in (f"2026{m:02d}{d:02d}" for m in range(1, 13) for d in (1, 9, 23, 31)):  # every suffix of every date
+            for n in range(1000):
+                name = f"compose.yaml.bak-{day}-{n:03d}"
+                found = {f.type_ for f in rules.detect(name)} & {"PESEL", "CARD"}
+                self.assertFalse(found, name)
+                self.assertEqual(sensors_mask(name)[1], 0, name)
+        # separators next to digits in other identifiers
+        for name in ("dump_2026-10-23_046.sql", "backup 20261023 046", "id-20261023-046-x"):
+            self.assertNotIn("PESEL", self.kinds(name), name)
+
+    def test_http_codes_are_not_a_card(self):
+        """`curl -w '%{http_code} '` over a few addresses; 3125 combinations of five codes, none is a card."""
+        import itertools
+
+        for combo in itertools.product(("200", "301", "302", "404", "500"), repeat=5):
+            line = " ".join(combo)
+            self.assertNotIn("CARD", self.kinds(line), line)
+            self.assertEqual(sensors_mask(line), (line, 0), line)
+        self.assertEqual(sensors_mask("200 302 200 200 200"), ("200 302 200 200 200", 0))
+
+    def test_cards_are_still_found(self):
+        for number in self.CARDS:
+            with self.subTest(number):
+                self.assertIn("CARD", self.kinds(f"karta {number}, ważna do 12/29"))
+                self.assertEqual(verdict.check_text(f"karta {number}.", CONFIG), {"CARD": 1})
+                masked, n = sensors_mask(f"Karta {number} ok")
+                self.assertEqual((masked, n), ("Karta [CARD hidden by piigate] ok", 1))
+        # a card followed by other numbers: the card goes, the rest stays
+        self.assertEqual(sensors_mask("4111 1111 1111 1111 200 302"), ("[CARD hidden by piigate] 200 302", 1))
+        # the checksum still decides
+        for number in ("4111 1111 1111 1112", "4111111111111112", "4111-1111-1111-1112"):
+            self.assertNotIn("CARD", self.kinds(number), number)
+            self.assertEqual(sensors_mask(number)[1], 0, number)
+
+    def test_pesel_is_still_found(self):
+        for p in dt.PATIENTS:
+            number = p["pesel"]
+            with self.subTest(number):
+                for template in ("{}", "PESEL: {}", "pesel={}", "({}),", "nr {}.", "x-{}-y", "{}\n"):
+                    value = template.format(number)
+                    self.assertIn("PESEL", self.kinds(value), value)
+                self.assertEqual(verdict.check_text(f"PESEL {number}", CONFIG), {"PESEL": 1})
+                self.assertEqual(sensors_mask(f"PESEL {number}"), ("PESEL [PESEL hidden by piigate]", 1))
+                # a label allows the usual separators; without it only the printed layouts 6+5 and 2-2-2-5 are a number
+                spaced = f"{number[:6]} {number[6:]}"
+                self.assertIn("PESEL", self.kinds(f"PESEL: {spaced}"))
+                self.assertIn("PESEL", self.kinds(f"Nr PESEL {number[:6]}-{number[6:]}"))
+                self.assertIn("PESEL", self.kinds(f"kod {spaced}"))  # the layout 6+5 (#30 review: unlabelled PESEL)
+                self.assertNotIn("PESEL", self.kinds(f"kod {number[:5]} {number[5:]}"))  # other groupings are not
+        # eleven digits without a valid checksum stay a (weaker) personal number
+        self.assertEqual(self.kinds("12345678901"), {"NUMBER"})
+
+    def test_pesel_in_the_printed_layouts_without_a_label(self):
+        """#30 (review): `44 05 14 01458` and `440514-01458` are a PESEL without the word PESEL, by the checksum."""
+        from piigate import rules
+
+        self.assertTrue(rules.pesel_valid("44051401458"))
+        for value in ("Pacjent: 44 05 14 01458 wizyta", "440514-01458", "440514 01458", "44-05-14-01458", "(44 05 14 01458)",
+                      "x 44-05 14-01458."):
+            with self.subTest(value):
+                self.assertIn("PESEL", self.kinds(value))
+                self.assertEqual(verdict.check_text(value, CONFIG), {"PESEL": 1}, value)
+        for p in dt.PATIENTS:
+            n = p["pesel"]
+            for value in (f"{n[:6]} {n[6:]}", f"{n[:6]}-{n[6:]}", f"{n[:2]} {n[2:4]} {n[4:6]} {n[6:]}", f"{n[:2]}-{n[2:4]}-{n[4:6]}-{n[6:]}"):
+                self.assertIn("PESEL", self.kinds(f"Pacjent: {value} wizyta"), value)
+        # not a number: a wrong checksum, glued to a word, a file name, other groupings
+        for value in ("Pacjent: 44 05 14 01459 wizyta", "440514-01458-3", "1440514-01458", "440514-014581",
+                      "compose.yaml.bak-20261023-046", "backup 20261023 046", "440514 0145", "4405140 1458"):
+            with self.subTest(value):
+                self.assertNotIn("PESEL", self.kinds(value))
+                self.assertEqual(verdict.check_text(value + "\n", CONFIG), {}, value)
+        if PRESIDIO:
+            result, _ = text.filter_text("Pacjent: 44 05 14 01458 wizyta, plik compose.yaml.bak-20261023-046", CONFIG)
+            self.assertNotIn("44 05 14", result)
+            self.assertIn("compose.yaml.bak-20261023-046", result)
+
+    def test_card_layouts_with_mixed_separators(self):
+        """#30 (review): `4111 1111-1111 1111`, a double space and `4111 11111111 1111` are a card; HTTP codes are not."""
+        for number in ("4111 1111-1111 1111", "4111-1111 1111-1111", "4111  1111  1111  1111", "4111 1111  1111 1111",
+                       "4111 11111111 1111", "4111-11111111-1111", "3782 822463 10005", "3782-822463 10005"):
+            with self.subTest(number):
+                self.assertIn("CARD", self.kinds(f"karta {number}, ważna"))
+                self.assertEqual(verdict.check_text(f"karta {number}.", CONFIG), {"CARD": 1})
+                self.assertEqual(sensors_mask(f"Karta {number} ok"), ("Karta [CARD hidden by piigate] ok", 1))
+        for number in ("4111 1111-1111 1112", "4111  1111  1111  1112", "4111 11111111 1112", "200 302 200 200 200",
+                       "14111 1111-1111 1111", "4111 1111-1111 11111", "4111   1111   1111   1111"):
+            with self.subTest(number):
+                self.assertNotIn("CARD", self.kinds(number), number)
+                self.assertEqual(sensors_mask(number)[1], 0, number)
+        if PRESIDIO:
+            result, _ = text.filter_text("karta 4111 1111-1111 1111 i kody 200 302 200 200 200", CONFIG)
+            self.assertNotIn("4111", result)
+            self.assertIn("200 302 200 200 200", result)
+
+    def test_a_letter_next_to_a_layout_does_not_hide_it(self):
+        """A letter, a mark or a file extension glued to a number in a printed layout is not a reason to let it through
+        (fail closed); only a neighbouring digit is."""
+        found = {
+            "karta4111 1111 1111 1111": "CARD", "4111 1111 1111 1111zł": "CARD", "4111-1111-1111-1111r.": "CARD",
+            "_4111 1111 1111 1111": "CARD", "3782 822463 10005x": "CARD", "x4111 1111-1111 1111": "CARD",
+            "4111 1111-1111 1111x": "CARD", "ID850314 12347": "PESEL", "850314 12347.pdf": "PESEL",
+            "85-03-14-12347zł": "PESEL", "x440514-01458": "PESEL", "440514-01458x": "PESEL", "v1.440514-01458": "PESEL",
+        }
+        for value, kind in found.items():
+            with self.subTest(value):
+                self.assertIn(kind, self.kinds(value))
+        for value in ("karta4111 1111 1111 1111", "4111 1111 1111 1111zł", "4111-1111-1111-1111r.", "_4111 1111 1111 1111",
+                      "3782 822463 10005x"):
+            self.assertEqual(sensors_mask(value)[1], 1, value)
+        # (the verdict check on the output of a tool leaves a number glued to a letter alone, as on main)
+        # a neighbouring digit still means "not this number"
+        for value in ("14111 1111 1111 1111", "4111 1111 1111 11111", "1850314 12347", "850314 123471"):
+            self.assertEqual(self.kinds(value) & {"CARD", "PESEL"}, set(), value)
+
+    def test_pesel_with_a_label_tolerates_odd_separators(self):
+        for value in ("PESEL: 850314  12347", "PESEL 850314 - 12347", "pesel: 85 03 14  12347", "PESEL 850314 -12347",
+                      "PESEL: 850314\t12347"):
+            with self.subTest(value):
+                self.assertIn("PESEL", self.kinds(value))
+                self.assertEqual(verdict.check_text(value + "\n", CONFIG), {"PESEL": 1}, value)
+        self.assertNotIn("PESEL", self.kinds("PESEL: 850314  12348"))
+
+    def test_longer_card_layouts_are_back(self):
+        """Cards printed 4-4-4-1..3, 5-5-5-1 and 4-4-4-4-3 are found by the checksum, as before the narrowing."""
+        from piigate import rules
+
+        def with_check(prefix: str, length: int) -> str:
+            body = prefix + "0" * (length - 1 - len(prefix))
+            for c in "0123456789":
+                if rules.luhn_valid(body + c):
+                    return body + c
+            raise AssertionError
+
+        for lengths in ((4, 4, 4, 1), (4, 4, 4, 2), (4, 4, 4, 3), (5, 5, 5, 1), (4, 4, 4, 4, 3)):
+            digits = with_check("4111", sum(lengths))
+            for sep in (" ", "-"):
+                parts, k = [], 0
+                for n in lengths:
+                    parts.append(digits[k : k + n])
+                    k += n
+                value = sep.join(parts)
+                with self.subTest(value):
+                    self.assertIn("CARD", self.kinds(f"karta {value} ok"))
+                    self.assertEqual(verdict.check_text(f"karta {value}.", CONFIG), {"CARD": 1})
+
+    def test_only_real_http_codes_make_a_list_of_numbers(self):
+        """#30 (review): `600 700 800 900` and a phone among other numbers stay phones; a list of status codes is not."""
+        from piigate import rules
+
+        def phones(sample: str) -> list[str]:
+            return [sample[f.start : f.end] for f in rules.detect(sample) if f.type_ == "PHONE"]
+
+        for sample in ("600 700 800 900", "numery: 600 700 800 601 701 801", "600 700 800 600 700 800",
+                       "Jan Kowalski mieszkanie 123 600 700 800 Warszawa"):
+            with self.subTest(sample):
+                self.assertTrue(phones(sample), sample)
+                if PRESIDIO:
+                    result, _ = text.filter_text(sample, CONFIG)
+                    self.assertNotIn("600 700", result)
+                    self.assertNotIn("600-700", result)
+        for sample in ("200 302 404 500 200", "kody: 200 302 200 200 200", "100 101 102 103", "451 431 226 208 503 504 511",
+                       "200-302-404-500"):
+            with self.subTest(sample):
+                self.assertEqual(phones(sample), [], sample)
+        # one number that is not a status code makes it a sequence of phones again
+        self.assertTrue(phones("200 302 404 599 200"))
+        self.assertTrue(phones("200 302 404 209 200"))
+
+    def test_a_long_column_of_number_lists_is_linear(self):
+        """A megabyte of lines with a list of codes (each one a phone-shaped group inside a list) is found in seconds."""
+        import time
+        from piigate import rules
+
+        sample = "200 200 200 200\n" * 65536
+        self.assertGreaterEqual(len(sample), 1_000_000)
+        started = time.monotonic()
+        found = rules.detect(sample)
+        elapsed = time.monotonic() - started
+        self.assertEqual([f for f in found if f.type_ == "PHONE"], [])
+        self.assertLess(elapsed, 15, f"detect took {elapsed:.1f} s on 1 MB")
+
+    @unittest.skipUnless(PRESIDIO, PRESIDIO_SKIP)
+    def test_text_filter(self):
+        p = dt.PATIENTS[0]
+        result, _ = text.filter_text(f"{p['pesel']} i plik compose.yaml.bak-20261023-046, kody 200 302 200 200 200", CONFIG)
+        self.assertNotIn(p["pesel"], result)
+        self.assertIn("compose.yaml.bak-20261023-046", result)
+        self.assertNotIn("CARD_", result)
+        result, _ = text.filter_text("karta 4111 1111 1111 1111", CONFIG)
+        self.assertNotIn("4111", result)
+
+    def test_http_code_lists_are_not_phones(self):
+        """Issue #30: four or more groups of three digits are a list of numbers; a phone stays a phone (rules and
+        sensors only — it needs no NER engine)."""
+        from piigate import rules
+
+        for lst in ("200 302 200 200 200", "kody: 200 302 404 500 200", "200 302 404 500", "200-302-404-500"):
+            with self.subTest(lst):
+                self.assertEqual([f for f in rules.detect(lst) if f.type_ == "PHONE"], [])
+                self.assertEqual(sensors_mask(lst)[1], 0)
+        for phone in ("600 302 200", "tel. 600 302 200", "+48 600 302 200", "22 630 10 10", "600-302-200"):
+            with self.subTest(phone):
+                self.assertTrue([f for f in rules.detect(f"Zadzwoń: {phone}.") if f.type_ == "PHONE"])
+        # a phone in a line with other numbers, and next to a list of codes
+        line = "kody 200 302 404 500 oraz tel. 600 302 200 i 22 630 10 10"
+        found = [line[f.start : f.end] for f in rules.detect(line) if f.type_ == "PHONE"]
+        self.assertEqual(sorted(set(found)), ["22 630 10 10", "600 302 200"])
+
+    @unittest.skipUnless(PRESIDIO, PRESIDIO_SKIP)
+    def test_http_code_lists_are_not_phones_with_presidio(self):
+        for lst in ("200 302 200 200 200", "kody: 200 302 404 500 200", "200 302 404 500", "200-302-404-500"):
+            with self.subTest(lst):
+                result, _ = text.filter_text(lst, CONFIG)
+                self.assertNotIn("PHONE_", result)
+        result, _ = text.filter_text("tel 600 302 200, kody 200 302 200 200 200", CONFIG)
+        self.assertNotIn("600 302 200", result)
+        self.assertIn("200 302 200 200 200", result)
+
+    def test_a_list_does_not_start_with_a_5xx_number(self):
+        """Phones that start with 50x and 51x (501 502 503) are not the beginning of a list of status codes."""
+        from piigate import rules
+
+        def phones(sample: str) -> list[str]:
+            return [sample[f.start : f.end] for f in rules.detect(sample) if f.type_ == "PHONE"]
+
+        self.assertEqual(phones("501 502 503 200 200 200"), ["501 502 503", "200 200 200"])
+        self.assertEqual(phones("501 502 503 501 502 503"), ["501 502 503", "501 502 503"])
+        self.assertEqual(phones("500 200 200 200"), ["500 200 200"])  # on purpose: masking is the safer error
+        self.assertEqual(phones("503 200 200 200 200"), ["503 200 200"])
+        for lst in ("kody: 200 302 404 500 200", "200 500 502 503", "404 500 503 200", "200 302 200 200 200"):
+            with self.subTest(lst):
+                self.assertEqual(phones(lst), [], lst)
+        for sample in ("501 502 503 200 200 200", "501 502 503 501 502 503"):
+            self.assertEqual(sensors_mask(sample)[1], 0)  # (the masking of a phone is the filter's job, not the sensors')
+            self.assertEqual(verdict.check_text(sample + "\n", CONFIG), {"PHONE": 2}, sample)
+
+    def test_a_list_of_numbers_stays_in_one_line_and_has_no_phone_label(self):
+        """A column of phones is not a list, and neither is a labelled phone followed by a three-digit number."""
+        from piigate import rules
+
+        for sample, phones in (
+            ("600 302 200\n700 111 222", ["600 302 200", "700 111 222"]),
+            ("600 302 200\r\n700 111 222\r\n", ["600 302 200", "700 111 222"]),
+            ("200 302 404 500 200\n600 302 200", ["600 302 200"]),
+            ("600 302 200\n100 200 300 400", ["600 302 200"]),
+            ("tel 600 302 200 700", ["600 302 200"]),
+            ("Telefon: 600 302 200 700", ["600 302 200"]),
+            ("600 302-200 700", ["600 302-200"]),  # mixed separators: not a list
+        ):
+            with self.subTest(sample):
+                found = [sample[f.start : f.end] for f in rules.detect(sample) if f.type_ == "PHONE"]
+                self.assertEqual(found, phones)
+
+
+def sensors_mask(value: str) -> tuple[str, int]:
+    from piigate import sensors
+
+    return sensors.mask(value, CONFIG)
+
+
+class TestSqlScripts(unittest.TestCase):
+    """Issue #28: a .sql file without data records is code; a dump with data is still refused; identifiers of a SQL
+    script are not people or places, string literals are still filtered."""
+
+    SCRIPT = (
+        "-- anonymization of a local copy (synthetic)\n"
+        "SET FOREIGN_KEY_CHECKS = 0;\n"
+        "UPDATE wp_users SET user_email = CONCAT('user', ID, '@example.invalid'), display_name = 'Test User';\n"
+        "UPDATE wp_usermeta SET meta_value = 'Test' WHERE meta_key IN ('first_name', 'last_name');\n"
+        "UPDATE `wp_wc_order_addresses` SET `first_name` = 'Test', `address_1` = 'Test Street 1', `city` = 'Testville';\n"
+        "DELETE FROM wp_comments WHERE comment_author_email NOT LIKE '%@example.invalid';\n"
+        "TRUNCATE TABLE wp_woocommerce_sessions;\n"
+        "SET FOREIGN_KEY_CHECKS = 1;\n"
+    )
+
+    def dump(self, kind: str) -> str:
+        p = dt.PATIENTS[0]
+        row = f"({p['first_name']!r}, {p['surname']!r}, '{p['pesel']}')".replace('"', "'")
+        return {
+            "insert": f"CREATE TABLE patient (id int, name text);\nINSERT INTO patient VALUES {row};\n",
+            "insert_cols": f"INSERT INTO `patient` (`name`, `surname`, `pesel`) VALUES {row};\n",
+            "replace": f"REPLACE INTO patient VALUES {row};\n",
+            "insert_set": f"INSERT INTO patient SET name = '{p['surname']}';\n",
+            "copy": f"COPY patient (name, surname) FROM stdin;\n{p['first_name']}\t{p['surname']}\n\\.\n",
+            "mixed": self.SCRIPT + f"INSERT INTO patient VALUES {row};\n",
+            "commented": f"/* INSERT INTO patient VALUES {row} */\nSELECT 1;\n",
+            "line_commented": f"-- x\nUPDATE t SET a = 'x -- ' ; INSERT INTO patient VALUES {row};\n",
+            # forms the first version missed (#28 review): a long column list, REPLACE without INTO, VALUES ROW, a
+            # double-quoted string (a literal in MySQL) selected into a table
+            "copy_long": f"COPY patient ({', '.join(f'column_{i:03d}' for i in range(60))}) FROM stdin;\n{p['surname']}\n\\.\n",
+            "replace_set": f"REPLACE patient SET surname = '{p['surname']}';\n",
+            "replace_values": f"REPLACE patient VALUES ('{p['surname']}');\n",
+            "values_row": f"INSERT INTO patient VALUES ROW(1, '{p['surname']}');\n",
+            "values_row_bare": f"VALUES ROW(1, '{p['surname']}');\n",
+            "select_double_quoted": f'INSERT INTO patient SELECT "{p["first_name"]}", "{p["surname"]}";\n',
+        }[kind]
+
+    def test_a_semicolon_in_a_quote_or_a_comment_does_not_end_a_copy(self):
+        """`COPY "a;b" (…) FROM stdin;` and `COPY t (…) -- x;` + `FROM stdin;` with rows are a dump."""
+        from piigate import sql
+
+        p = dt.PATIENTS[0]
+        rows = f"{p['first_name']}\t{p['surname']}\n\\.\n"
+        for head in ('COPY "a;b" (name, surname)', "COPY 'a;b' (name, surname)", "COPY `a;b` (name, surname)",
+                     "COPY t (name, surname) -- x;\n", "COPY t (name, surname) # x;\n", "COPY t /* x; */ (name, surname)",
+                     "COPY t (name, surname) -- it's; x\n", 'COPY "a;""b" (name, surname)'):
+            for tail in ("FROM stdin;\n", "FROM stdin\n"):
+                text_ = f"CREATE TABLE t (name text);\n{head} {tail}{rows}"
+                with self.subTest(text_):
+                    self.assertTrue(sql.has_data_records(text_))
+                    self.assertFalse(sql.is_script(text_.encode(), sql.SCRIPT_LIMIT, table._decode))
+        # no rows: still a script; a real semicolon between COPY and FROM stdin still separates the statements
+        self.assertFalse(sql.has_data_records('COPY "a;b" (name) FROM stdin;\n\\.\n'))
+        self.assertFalse(sql.has_data_records("COPY t TO 'file';\nSELECT name FROM stdin\n" + rows))
+
+    def test_script_or_dump(self):
+        from piigate import sql
+
+        ok = lambda data: sql.is_script(data, sql.SCRIPT_LIMIT, table._decode)  # noqa: E731
+        self.assertTrue(ok(self.SCRIPT.encode()))
+        self.assertTrue(ok(b"CREATE TABLE t (id int);\nALTER TABLE t ADD COLUMN x int;\nCOPY t (id) FROM stdin;\n\\.\n"))
+        for kind in ("insert", "insert_cols", "replace", "insert_set", "copy", "mixed", "commented", "line_commented",
+                     "copy_long", "replace_set", "replace_values", "values_row", "values_row_bare", "select_double_quoted"):
+            with self.subTest(kind):
+                self.assertFalse(ok(self.dump(kind).encode()))
+        # still scripts: a function call named REPLACE, a SELECT of identifiers, a COPY without rows (long columns too)
+        self.assertTrue(ok(b"UPDATE t SET a = REPLACE(a, x, y);\nCOPY t (" + b"c_1, " * 100 + b"c_2) FROM stdin;\n\\.\n"))
+        self.assertTrue(ok(b"INSERT INTO t SELECT id, name FROM u;\nCOPY t FROM 'file.csv';\n"))
+        # fail closed: too large, binary, compressed, not text
+        self.assertFalse(ok(self.SCRIPT.encode() + b" " * (sql.SCRIPT_LIMIT + 1)))
+        self.assertFalse(ok(b"UPDATE t SET a = 1;\0\1\2"))
+        self.assertFalse(ok(b"\x1f\x8b\x08\x00" + self.SCRIPT.encode()))
+        self.assertFalse(ok(b"PGDMP\x01\x0e" + self.SCRIPT.encode()))
+        self.assertFalse(ok(b""[:0] + bytes(range(128, 256)) * 4 + self.dump("insert").encode()))
+
+    def test_tools_read_a_script_but_not_a_dump(self):
+        script = FILES["eml"].parent / "anonymization.sql"
+        script.write_text(self.SCRIPT, encoding="utf-8")
+        self.assertIn("wp_users", anonymization.document_text("anonymization.sql", script.read_bytes()))
+        if PRESIDIO:  # describe_file() and anonymize() run the text filter, which needs the NER engine; the directory as in TestAnonymization
+            result = files.describe_file(script, CONFIG, source="files")
+            self.assertIn("wp_users", result)
+            self.assertIn("user_email", result)
+            self.assertNotIn("PERSON_", result)
+            cfg = json.loads(json.dumps(CONFIG))
+            cfg["anonymization"]["directory"] = str(TMP / "anonymized")
+            w = anonymization.anonymize("anonymization.sql", script.read_bytes(), cfg)
+            copy = "\n".join(p.read_text(encoding="utf-8") for p in w.directory.iterdir())
+            self.assertIn("wp_users", copy)
+            self.assertNotIn("PERSON_", copy)
+            with self.assertRaisesRegex(FilterError, "database dump"):
+                anonymization.anonymize("x.sql", self.dump("insert").encode(), cfg)
+        for kind in ("insert", "copy", "mixed"):
+            with self.subTest(kind):
+                with self.assertRaisesRegex(FilterError, "database dump"):
+                    files.describe_data("x.sql", self.dump(kind).encode(), CONFIG, source="files")
+                with self.assertRaisesRegex(FilterError, "database dump"):
+                    anonymization.document_text("x.sql", self.dump(kind).encode())
+        with self.assertRaisesRegex(FilterError, "database dump"):
+            files.describe_data("x.dump", self.SCRIPT.encode(), CONFIG, source="files")  # .dump: always a dump
+
+    def test_identifiers_are_not_people_but_literals_are(self):
+        from piigate import rules, sql
+        from piigate.rules import Fragment
+
+        p = dt.PATIENTS[0]
+        script = f"UPDATE wp_users SET user_email = 'x@example.invalid', display_name = '{p['first_name']} {p['surname']}';\n"
+        found = [(script[f.start : f.end], f.type_) for f in rules.detect(script)]
+        self.assertIn((f"{p['first_name']} {p['surname']}", "PERSON"), found)  # the literal is still data
+        identifiers = "UPDATE wp_users SET user_login = 'a' WHERE user_email = 'b';\n"
+        # a NER hit on an identifier is dropped, on a literal kept; spanning both it is cut to the literal
+        ner = [Fragment(identifiers.index("wp_users"), identifiers.index("wp_users") + 8, "PERSON", 2),
+               Fragment(identifiers.index("'a'") + 1, identifiers.index("'a'") + 2, "PERSON", 2)]
+        kept = sql.drop_identifiers(identifiers, ner)
+        self.assertEqual([(identifiers[f.start : f.end]) for f in kept], ["a"])
+        span = Fragment(identifiers.index("user_login"), identifiers.index("'a'") + 3, "ADDRESS", 2)
+        self.assertEqual([identifiers[f.start : f.end] for f in sql.drop_identifiers(identifiers, [span])], ["'a'"])
+        # not a script (prose, or a statement of another shape) — nothing is dropped
+        prose = "Please UPDATE the records of Jan Kowalski; then SET them aside."
+        self.assertFalse(sql.looks_like_script(prose))
+        frag = [Fragment(prose.index("Jan"), prose.index("Jan") + 12, "PERSON", 2)]
+        self.assertEqual(sql.drop_identifiers(prose, frag), frag)
+        mixed = "UPDATE t SET a = 1;\nJan Kowalski mieszka tutaj;\n"
+        self.assertFalse(sql.looks_like_script(mixed))
+        # a weight-4 hit (pointed out by the local model) is never dropped
+        pointed = [Fragment(identifiers.index("wp_users"), identifiers.index("wp_users") + 8, "PERSON", 4)]
+        self.assertEqual(sql.drop_identifiers(identifiers, pointed), pointed)
+        # backslash escapes and quotes inside literals do not open a hole for data
+        tricky = "UPDATE t SET a = 'it\\'s " + p["surname"] + "', b = 'x';\n"
+        f2 = [Fragment(tricky.index(p["surname"]), tricky.index(p["surname"]) + len(p["surname"]), "PERSON", 2)]
+        self.assertEqual(sql.drop_identifiers(tricky, f2), f2)
+
+    def test_drop_identifiers_is_not_quadratic(self):
+        """#28 (review): 20000 statements (1.4 MB) took 45 s — a list lookup and a scan of all literals per fragment."""
+        import time
+
+        from piigate import sql
+        from piigate.rules import Fragment
+
+        statement = "UPDATE wp_users SET user_login = 'a' WHERE user_email = 'b';\n"
+        text = statement * 20000
+        fragments = []
+        for i in range(20000):
+            base = i * len(statement)
+            fragments.append(Fragment(base + statement.index("wp_users"), base + statement.index("wp_users") + 8, "PERSON", 2))
+            fragments.append(Fragment(base + statement.index("'a'") + 1, base + statement.index("'a'") + 2, "PERSON", 2))
+        started = time.monotonic()
+        kept = sql.drop_identifiers(text, fragments)
+        seconds = time.monotonic() - started
+        self.assertLess(seconds, 5, seconds)
+        self.assertEqual(len(kept), 20000)  # the literals stay, the table names go
+        self.assertTrue(all(text[f.start : f.end] == "a" for f in kept))
+
+    def test_only_an_identifier_outside_a_literal_is_dropped(self):
+        """#28 (review): text outside a literal that is not shaped like an identifier (a name after `=`) keeps its hit,
+        although every statement starts with a keyword; a table or column name is still dropped."""
+        from piigate import rules, sql
+        from piigate.rules import Fragment
+
+        for script in (
+            "UPDATE t SET name = Jan Kowalski;\n",
+            "UPDATE t SET name = Jan Kowalski WHERE id = 1;\nSET @a = 1;\n",
+            "SET @a = 1;\nUPDATE t SET name = Anna Nowak;\n",
+        ):
+            with self.subTest(script):
+                person = re.search(r"(?:Jan Kowalski|Anna Nowak)", script)
+                hit = [Fragment(person.start(), person.end(), "PERSON", 2)]
+                self.assertTrue(sql.looks_like_script(script))
+                self.assertEqual(sql.drop_identifiers(script, hit), hit)
+                self.assertIn(person.group(), [script[f.start : f.end] for f in rules.detect(script) if f.type_ == "PERSON"])
+        script = "UPDATE `wp_users` SET user_login = 'a' WHERE wp_users.user_email = 'b';\n"
+        for name in ("`wp_users`", "user_login", "wp_users.user_email"):
+            hit = [Fragment(script.index(name), script.index(name) + len(name), "ORG", 2)]
+            with self.subTest(name):
+                self.assertEqual(sql.drop_identifiers(script, hit), [])
+
+    def test_a_name_in_a_value_position_keeps_its_hit(self):
+        """A name written without quotes right after `=` or inside `VALUES (…)` is a value, not an identifier; a table or
+        column name in an identifier position is still dropped."""
+        for script in (
+            "UPDATE pacjenci SET nazwisko = Kowalski;",
+            "UPDATE pacjenci SET nazwisko=Kowalski;",
+            "INSERT INTO t VALUES (Wiśniewska);",
+            "UPDATE t SET a=`Kowalski`;",
+            'UPDATE t SET a = "Kowalski";',
+            "UPDATE pacjenci SET imie = Jan, nazwisko = Kowalski WHERE id = 1;",
+            "UPDATE t SET a = 1 WHERE nazwisko = Kowalski;",
+            "INSERT INTO t (a, b) VALUES (Jan, Kowalski);",
+            "INSERT INTO t VALUES (1, Kowalski), (2, Nowak);",
+            "INSERT INTO t VALUES (1, 'x'),\n  (2, Kowalski);",
+            "INSERT INTO t VALUES (1, f(Kowalski));",
+            "INSERT INTO t VALUE (Kowalski);",
+        ):
+            with self.subTest(script):
+                self.assertEqual(verdict.check_text(script + "\n", CONFIG).get("PERSON", 0) > 0, True, script)
+        for script in (
+            "UPDATE wp_users SET user_email = 'x'",
+            "DELETE FROM wp_users",
+            "UPDATE Kowalski SET a = 1;",
+            "INSERT INTO Kowalski (a) VALUES (1);",
+            "INSERT INTO t (Kowalski, Nowak) VALUES (1, 2);",
+            "UPDATE t SET Kowalski = 1, Nowak = 2;",
+        ):
+            with self.subTest(script):
+                self.assertEqual(verdict.check_text(script + "\n", CONFIG).get("PERSON", 0), 0, script)
+
+    @unittest.skipUnless(PRESIDIO, PRESIDIO_SKIP)
+    def test_text_filter_on_a_script(self):
+        result, counter = text.filter_text(self.SCRIPT, CONFIG)
+        for name in ("wp_users", "user_email", "wp_usermeta", "meta_key", "wp_wc_order_addresses", "FOREIGN_KEY_CHECKS"):
+            self.assertIn(name, result)
+        self.assertNotIn("PERSON", counter)
+        # a real person in a literal and a real address in a script are still masked
+        p = dt.PATIENTS[0]
+        script = self.SCRIPT + f"UPDATE wp_users SET display_name = '{p['first_name']} {p['surname']}', user_email = '{p['email']}';\n"
+        result, _ = text.filter_text(script, CONFIG)
+        self.assertEqual(leaks(result), [])
+        self.assertIn("wp_users", result)
+
+
+    def test_unclosed_quotes_cost_no_memory(self):
+        """An unclosed quote in a large text: linear time and no memory per character (a regex loop over single
+        characters kept ~285 MB per MB). Also the other patterns of the scripts / dumps decision."""
+        import time
+        import tracemalloc
+
+        from piigate import sql
+        from piigate.rules import Fragment
+
+        size = 8 * 1024 * 1024
+        cases = [("UPDATE t SET a = " + q + "x" * size) for q in ("'", "`", '"', "/*", "$$", "'\\")]
+        cases += ["COPY a " * 200_000, "/* " * 1_000_000, "INSERT INTO t SELECT x " * 100_000, "BEGIN" + " " * 3000 + "Jan"]
+        cases += ["COPY a FROM stdin\n\\.\n" * 100_000, "COPY x " + "FROM stdin\n\\.\n" * 100_000, "FROM stdin " * 300_000]
+        for case in cases:
+            for function in (sql.looks_like_script, sql.has_data_records, sql.data_spans):
+                with self.subTest(case[:20], function=function.__name__):
+                    tracemalloc.start()
+                    started = time.monotonic()
+                    function(case)
+                    seconds = time.monotonic() - started
+                    peak = tracemalloc.get_traced_memory()[1]
+                    tracemalloc.stop()
+                    self.assertLess(peak, 200 * 1024 * 1024, peak)  # the text itself is up to 8 MB
+                    self.assertLess(seconds, 20, seconds)
+        # an unclosed literal still counts as data: nothing after the quote is code
+        p = dt.PATIENTS[0]
+        unclosed = f"UPDATE t SET a = 'x;\nDelete this: {p['first_name']} {p['surname']}\n"
+        name = f"{p['first_name']} {p['surname']}"
+        found = Fragment(unclosed.index(name), unclosed.index(name) + len(name), "PERSON", 2)
+        self.assertEqual(sql.drop_identifiers(unclosed, [found]), [found])
 
 
 def tearDownModule():

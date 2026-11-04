@@ -14,7 +14,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import FilterError, config, files, project, table, text
+from . import FilterError, config, files, project, sql, table, text
 from .pseudonym_map import PseudonymMap
 from .rules import Fragment
 
@@ -292,7 +292,7 @@ def document_text(name: str, data: bytes) -> str:
         raise FilterError("image — OCR is not supported")
     if ext in (".xls", ".doc", ".msg", ".rtf"):
         raise FilterError(f"format {ext} is not supported — save it as XLSX/CSV/DOCX/EML")
-    if ext in (".sql", ".dump"):
+    if ext == ".dump" or (ext == ".sql" and not sql.is_script(data, sql.SCRIPT_LIMIT, table._decode)):
         raise FilterError("database dump — load it into a local database and use `piigate table`")
     if ext == ".pdf":
         import tempfile

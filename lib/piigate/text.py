@@ -21,7 +21,9 @@ def _merge(fragments: list[Fragment], text: str) -> list[Fragment]:
         if result:
             o = result[-1]
             gap = text[o.end : f.start]
-            glue = r"[ \t]*" if f.type_ == "PERSON" else r"[\s.,/-]*"  # two persons separated by a comma are two persons
+            # two persons separated by a comma are two persons; hits on neighbouring lines are never one (a line would
+            # disappear from the output)
+            glue = r"[ \t]*" if f.type_ == "PERSON" else r"[ \t.,/-]*"
             if f.start < o.end or (o.type_ == f.type_ and len(gap) <= 2 and re.fullmatch(glue, gap)):
                 type_ = o.type_ if o.weight >= f.weight else f.type_
                 result[-1] = Fragment(o.start, max(o.end, f.end), type_, max(o.weight, f.weight))
@@ -90,6 +92,8 @@ def filter_text(
         fragments = [f for f in fragments if f.type_ != "ORG"]
     if t.get("dates") == "none":
         fragments = [f for f in fragments if f.type_ != "DATE"]
+    if stamps := rules.timestamp_spans(text):  # 2026-11-02T20:11:01Z is not a birth date
+        fragments = [f for f in fragments if f.type_ != "DATE" or not any(f.start < k and s < f.end for s, k in stamps)]
     fragments = [p for f in _skip_pseudonyms(fragments, text) if (p := _trim(f, text))]
     fragments = _merge(fragments, text)
 
@@ -131,7 +135,9 @@ def filter_text(
     result = text
     counter: dict[str, int] = {}
     for f, p in sorted(assigned, key=lambda x: x[0].start, reverse=True):
-        result = result[: f.start] + p + result[f.end :]
+        # a hit that spans lines (NER sometimes does) keeps its line breaks: the output has as many lines as the input
+        breaks = "".join(re.findall(r"\r\n|\r|\n", text[f.start : f.end]))
+        result = result[: f.start] + p + breaks + result[f.end :]
         label = p.rsplit("_", 1)[0]
         counter[label] = counter.get(label, 0) + 1
 

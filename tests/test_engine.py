@@ -395,8 +395,11 @@ class TestContainerConfig(unittest.TestCase):
 
     def test_dockerfile_pins(self):
         m = local_engine.MODELS["pl"]
-        self.assertIn(f"PL_MODEL_SHA256={m['sha256']}", self.dockerfile)
-        self.assertIn(f"{m['name']}-{m['version']}-py3-none-any.whl", self.dockerfile)
+        self.assertIn("--require-hashes", self.dockerfile)
+        self.assertIn("pl-model-requirements.txt", self.dockerfile)
+        requirements = (ROOT / "docker" / "pl-model-requirements.txt").read_text(encoding="utf-8")
+        self.assertIn(f"--hash=sha256:{m['sha256']}", requirements)
+        self.assertIn(f"{m['name']}-{m['version']}-py3-none-any.whl", requirements)
         bases = re.findall(r"^ARG (?:BUILDER|BASE)=(\S+)$", self.dockerfile, re.M)
         self.assertEqual(len(bases), 2)
         for b in bases:
