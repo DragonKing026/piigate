@@ -113,6 +113,30 @@ class AstGate(gate.Gate):
             return self.cwd
         return next(iter(c.cwds)) if c.cwd_known and len(c.cwds) == 1 else None
 
+    # `$(command)` whose output the gate knows without running it. Deliberately short and explicit:
+    #  - `pwd`: the directory of the command (an exactly known one);
+    #  - `git rev-parse --show-toplevel`: the root of the repository of that directory, computed from the files;
+    #  - `dirname P` / `basename P` of a static path;
+    #  - date, whoami, hostname, uname, id, nproc, arch with static arguments free of `/`, `*`, `?`, `[`: their output has no
+    #    path separator or glob, so it can only stand for a piece of a name — it is replaced by the plain letter X.
+    # Anything else (mktemp, ls, find, cat …) is unknown. The value is a path the line does not control only in the second
+    # case, and there it is a real directory that is then judged like any path in the line.
+    SAFE_OUTPUT = {"date", "whoami", "hostname", "uname", "id", "nproc", "arch"}
+
+    def _command_value(self, argv: tuple, pwd: str | None) -> str | None:
+        name, args = argv[0], argv[1:]
+        if name == "pwd" and all(a in ("-L", "-P") for a in args):
+            return pwd
+        if name == "git" and args == ("rev-parse", "--show-toplevel") and pwd is not None:
+            from . import config
+
+            return config.git_root(pwd)
+        if name in ("dirname", "basename") and len(args) == 1 and not args[0].startswith("-"):
+            return os.path.dirname(args[0]) or "." if name == "dirname" else os.path.basename(args[0].rstrip("/"))
+        if name in self.SAFE_OUTPUT and not any(re.search(r"[/*?\[]", a) for a in args):
+            return "X"
+        return None
+
     def _word_tokens(self, w: shell.Word, c: shell.Call | None, use: int, origin: str) -> list[str]:
         if OPERATOR_WORD.fullmatch(w.text):
             # `cat '>' f`, `find -exec x {} \;`: a word that reads like an operator must not become one in the flat list
@@ -122,10 +146,17 @@ class AstGate(gate.Gate):
         model = self._model
         positional = c.positional if c is not None else None
 
+        declared = c is not None and c.declared and positional is None
+
         def lookup(name: str):
+            if declared and (name.isdigit() and name != "0" or name in ("@", "*", "#")):
+                return "declared", None
             return model.value(name, use, origin, positional, pwd) if model is not None else ("unknown", None)
 
-        variants, unresolved = shell.subst_word(w, lookup, self.dialect)
+        def cmd_value(argv: tuple) -> str | None:
+            return self._command_value(argv, pwd)
+
+        variants, unresolved = shell.subst_word(w, lookup, self.dialect, cmd_value)
         if w.segs and w.text.startswith("~+") and "tilde" in w.kinds:  # `~+/x` is $PWD/x, `~-` is $OLDPWD
             if pwd is not None and len(variants) == 1 and len(variants[0]) == 1:
                 variants = [[pwd + variants[0][0][2:]]]
@@ -133,7 +164,7 @@ class AstGate(gate.Gate):
                 unresolved.append("PWD")
         elif w.text.startswith("~-") and "tilde" in w.kinds:
             unresolved.append("OLDPWD")
-        subst = bool({"cmd", "proc"} & w.kinds)
+        subst = "proc" in w.kinds or "(substitution)" in unresolved
         if len(variants) == 1:
             words = variants[0]
         elif all(len(v) == 1 for v in variants):

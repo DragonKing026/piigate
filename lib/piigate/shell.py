@@ -115,6 +115,7 @@ class Call:
     )
     piped_in: bool = False  # stdin comes from a pipe
     piped_stderr: bool = False  # ... from `|&`: the previous stage's stderr comes with it
+    declared: bool = False  # emitted where a function is DECLARED (its calls are judged again where it is called)
     positional: tuple | None = None  # `$1 $2 …` of the function whose body this is (static arguments of the call), else None
     loop_var: str = ""  # the variable of a `for` / `select` pseudo-call
     pipes_out: bool = False  # its stage feeds a later stage of the pipeline (every command of a `{ a; b; } | c` stage does)
@@ -399,6 +400,14 @@ def _expansion_seg(p: dict, kinds: set[str], quoted: bool) -> tuple[str, tuple]:
     own: set[str] = set()
     text = _expansion_text(p, own)
     kinds |= own
+    if p.get("Type") == "CmdSubst":  # `$(pwd)`, `$(date +%F)`: when it is ONE simple command of static words, say which
+        stmts = p.get("Stmts") or []
+        if len(stmts) == 1 and not (stmts[0].get("Redirs") or stmts[0].get("Background") or stmts[0].get("Negated")):
+            cmd = stmts[0].get("Cmd") or {}
+            if cmd.get("Type") == "CallExpr" and not cmd.get("Assigns") and cmd.get("Args"):
+                words = [_word(w) for w in cmd["Args"]]
+                if all(w.static for w in words):
+                    return text, ("cmd", tuple(w.text for w in words), quoted)
     return text, ("opaque", text, tuple(sorted(k[1:] for k in own if k.startswith("$"))))
 
 
@@ -572,8 +581,15 @@ def build_model(calls: list, assigned_in_expansions=(), session: str = "/") -> V
     for i, c in enumerate(calls):
         persistent = not c.argv or c.name in DECLARATIONS  # `x=1` alone / `declare x=1`; `x=1 cmd` is only for cmd
         for a in c.assigns:
-            static = persistent and a.value is not None and not a.array and not a.append and a.value.static
-            sites.setdefault(a.name, []).append((i, "static" if static else "dynamic", a.value.text if static else None))
+            plain = persistent and a.value is not None and not a.array and not a.append
+            static = plain and a.value.static
+            # a value made of literals and `$(simple static command)` is resolved where it is used (`x=$(pwd)`)
+            lazy = plain and not static and a.value.segs and all(g[0] in ("lit", "cmd") for g in a.value.segs) and not (
+                a.value.kinds - {"cmd"}
+            )
+            sites.setdefault(a.name, []).append(
+                (i, "static" if static or lazy else "dynamic", (a.value.text if static else a.value) if static or lazy else None)
+            )
         if c.loop_var:
             items = c.argv[1:]
             ok = bool(items) and all(w.static or (w.kinds - {"glob", "brace"} == set() and w.segs) for w in items)
@@ -593,7 +609,7 @@ MAX_VARIANTS = 64
 _GLOB_CHARS = re.compile(r"[*?\[]")
 
 
-def subst_word(w: Word, lookup, dialect: str = DEFAULT_DIALECT) -> tuple[list[list[str]], list[str]]:
+def subst_word(w: Word, lookup, dialect: str = DEFAULT_DIALECT, cmd_value=None) -> tuple[list[list[str]], list[str]]:
     """The words a shell makes of `w` when the variables in it are known: (variants, unresolved). Each variant is the list of
     words (usually one); a SET variable gives one variant per value. `lookup(name)` is `VarModel.value`. Pieces that are
     not known stay as `${name}` / the expansion's text and their variables are listed as unresolved. Word splitting
@@ -607,12 +623,29 @@ def subst_word(w: Word, lookup, dialect: str = DEFAULT_DIALECT) -> tuple[list[li
     for seg in w.segs:
         if seg[0] == "lit":
             options.append([seg[1]])
+        elif seg[0] == "cmd":  # `$(pwd)`: the value of a few commands whose output is known without running them
+            got = cmd_value(seg[1]) if cmd_value else None
+            if got is None:
+                options.append(["$(…)"])
+                unresolved.append("(substitution)")
+            else:
+                options.append([got])
         elif seg[0] == "opaque":
             options.append([seg[1]])
-            unresolved.extend(seg[2] or ("(expansion)",))
+            unresolved.extend(seg[2] or ("(substitution)" if seg[1].startswith(("$(", "<(", ">(", "=(")) else "(expansion)",))
         else:
             _, name, quoted = seg
             kind, val = lookup(name)
+            if kind == "declared":  # a parameter of a function, seen where it is declared: judged where it is called
+                options.append(["${" + name + "}"])
+                continue
+            if kind == "static" and isinstance(val, Word):
+                inner, bad = subst_word(val, lookup, dialect, cmd_value)
+                if bad or len(inner) != 1 or len(inner[0]) != 1:
+                    options.append(["${" + name + "}"])
+                    unresolved.append(name)
+                    continue
+                val = inner[0][0]
             if kind == "list":
                 if single and name == "@":
                     return [list(val)], []  # `"$@"`: one word per argument
@@ -743,6 +776,7 @@ class _Walker:
         self.dialect = dialect
         self.model = model  # values of variables (second pass only): `cd "$D"` is followed when D is known
         self.positional: tuple | None = None
+        self.declaring = 0
         self.loops = 0  # loops open around the statement being walked
         self.functions: dict[str, dict] = {}  # name -> body of the functions declared so far: analysed again at each call
         self.stack: list[str] = []  # functions being walked (a recursive call is refused)
@@ -754,6 +788,7 @@ class _Walker:
     # -- emitting
     def emit(self, call: Call) -> Call:
         call.positional = self.positional
+        call.declared = self.declaring > 0 and not self.stack
         if not self.dry:
             self.calls.append(call)
         return call
@@ -851,7 +886,11 @@ class _Walker:
             self.functions[name] = body
             # the words of the body are emitted where it is declared (nothing disappears even if it is never called); the
             # effect on the directory and the pipeline is analysed where it is CALLED (`call`)
-            self.stmt(body, st, sub, inherited, "function")
+            self.declaring += 1
+            try:
+                self.stmt(body, st, sub, inherited, "function")
+            finally:
+                self.declaring -= 1
             return st
         if t == "CoprocClause":
             # a coprocess runs beside the rest of the line and its output comes back through `$COPROC`: nobody follows it

@@ -286,6 +286,54 @@ class TestRules(Base):
             self.assertTrue(g.parse_error)
 
 
+class TestWordValuesAgainstARealShell(Base):
+    """B1: the value of a word is computed from the pieces of the tree. For a corpus of static variables and every way to
+    glue them to quotes, the words `AstGate` makes of `cat WORD` are what a real zsh / bash makes of `printf [%s] WORD`."""
+
+    PREFIX = "x='../Sens'; y='a  b'; e=''; q='it'; s='*'; "
+    WORDS = (
+        '"$x"itive-data/p', '$x"itive-data"/p', "$x'itive-data'/p", "$x\\itive", "\"$x\"$'itive'", '"$x"_', "${x}y", "$x$x", "${x}${q}",
+        '"$y"', '"$y"x', "$y", "x$y", "$e", '"$e"', "a$e", '"$e"a', '$e"$e"', "pre${q}post", '"${x}"', "'$x'", '"a$x b"', "$s", '"$s"',
+    )
+
+    def real(self, shell_name: str, word: str) -> str:
+        import shutil
+        import subprocess
+        import tempfile
+
+        exe = shutil.which(shell_name)
+        if not exe:
+            self.skipTest(f"{shell_name} not installed")
+        with tempfile.TemporaryDirectory() as d:  # empty: a glob matches nothing
+            argv = [exe, "-f", "-c"] if shell_name == "zsh" else [exe, "--noprofile", "--norc", "-c"]
+            done = subprocess.run([*argv, self.PREFIX + "printf '[%s]' " + word], cwd=d, capture_output=True, text=True, timeout=10, check=False)
+        return done.stdout
+
+    def test_the_words_are_what_the_shell_makes(self):
+        for dialect in shell.DIALECTS:
+            for word in self.WORDS:
+                real = self.real(dialect, word)
+                g = self.ast(dialect)
+                g.bash(self.PREFIX + "cat " + word)
+                tokens = g._current.tokens if g._current else []
+                words = tokens[tokens.index("cat") + 1 :] if "cat" in tokens else []
+                if any(getattr(t, "dyn", False) for t in words):
+                    continue  # not resolved (bash splits `x$y`): a refusal for a reader, never a wrong value
+                made = "".join(f"[{t}]" for t in words) or "[]"  # printf with no argument prints one empty field
+                # a glob character that survives is the gate's to expand (`$s` is `*` for bash: unresolved, kept as text)
+                if ("*" in word or "$s" in word) and dialect == "bash":
+                    continue
+                with self.subTest(dialect=dialect, word=word):
+                    self.assertEqual(made.replace("\\", ""), real)
+
+    def test_the_gluing_cases_of_the_review(self):
+        for word in ('"$x"itive-data/people.csv', '$x"itive-data"/people.csv', "$x'itive-data'/people.csv", "$x\\itive-data/people.csv",
+                     "\"$x\"$'itive-data'/people.csv"):
+            with self.subTest(word):
+                for dialect in shell.DIALECTS:
+                    self.assertIsNotNone(self.ast(dialect).bash("x=../Sens; cat " + word), (word, dialect))
+
+
 class TestSealedBinary(Base):
     def test_no_fallback_to_the_file_when_the_seal_fails(self):
         from unittest import mock
