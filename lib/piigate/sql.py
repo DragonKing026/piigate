@@ -225,24 +225,42 @@ _INSERT = re.compile(
 _VALUES_CALL = re.compile(r"(?i)\bVALUES\s*(?:ROW\s*)?\(")
 
 
+def _statement_ends(t: str) -> list[int]:
+    """Positions of the `;` that end a statement: outside quotes, identifiers and comments under either reading of the
+    backslash (a `;` that is inside one under one reading is not counted — when in doubt, the text stays one statement,
+    which can only make more of it a dump)."""
+    inside = sorted((s, k) for backslash in (True, False) for s, k, _ in _regions(t, backslash))
+    starts, ends = [s for s, _ in inside], []
+    top = -1
+    for _, k in inside:  # running maximum of the ends: a span may be contained in an earlier, longer one
+        top = max(top, k)
+        ends.append(top)
+    result, pos = [], 0
+    while (i := t.find(";", pos)) >= 0:
+        j = bisect.bisect_right(starts, i) - 1
+        if j < 0 or ends[j] <= i:
+            result.append(i)
+        pos = i + 1
+    return result
+
+
 def _copy_from_stdin_with_rows(t: str) -> bool:
     """`COPY … FROM stdin` followed by rows, however long the column list is. Linear: each `FROM stdin` is matched with
-    the nearest `COPY` before it (no `;` in between), and the text between them is scanned for `;` only once."""
+    the nearest `COPY` before it, and a statement end between them (see `_statement_ends`) makes it another statement."""
     copies = [m.start() for m in _COPY_WORD.finditer(t)]
     if not copies:
         return False
-    index, seen_to, has_semicolon, current = -1, 0, False, -1
+    ends: list[int] | None = None
+    index = -1
     for m in _FROM_STDIN.finditer(t):
         while index + 1 < len(copies) and copies[index + 1] < m.start():
             index += 1
         if index < 0:
             continue
-        if copies[index] != current:
-            current, seen_to, has_semicolon = copies[index], copies[index], False
-        if not has_semicolon and seen_to < m.start():
-            has_semicolon = t.find(";", seen_to, m.start()) >= 0
-            seen_to = m.start()
-        if not has_semicolon and not _NO_ROWS.match(t, m.end()):
+        if ends is None:
+            ends = _statement_ends(t)
+        k = bisect.bisect_left(ends, copies[index])
+        if (k >= len(ends) or ends[k] >= m.start()) and not _NO_ROWS.match(t, m.end()):
             return True
     return False
 

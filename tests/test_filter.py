@@ -4953,6 +4953,24 @@ class TestSqlScripts(unittest.TestCase):
             "select_double_quoted": f'INSERT INTO patient SELECT "{p["first_name"]}", "{p["surname"]}";\n',
         }[kind]
 
+    def test_a_semicolon_in_a_quote_or_a_comment_does_not_end_a_copy(self):
+        """`COPY "a;b" (…) FROM stdin;` and `COPY t (…) -- x;` + `FROM stdin;` with rows are a dump."""
+        from piigate import sql
+
+        p = dt.PATIENTS[0]
+        rows = f"{p['first_name']}\t{p['surname']}\n\\.\n"
+        for head in ('COPY "a;b" (name, surname)', "COPY 'a;b' (name, surname)", "COPY `a;b` (name, surname)",
+                     "COPY t (name, surname) -- x;\n", "COPY t (name, surname) # x;\n", "COPY t /* x; */ (name, surname)",
+                     "COPY t (name, surname) -- it's; x\n", 'COPY "a;""b" (name, surname)'):
+            for tail in ("FROM stdin;\n", "FROM stdin\n"):
+                text_ = f"CREATE TABLE t (name text);\n{head} {tail}{rows}"
+                with self.subTest(text_):
+                    self.assertTrue(sql.has_data_records(text_))
+                    self.assertFalse(sql.is_script(text_.encode(), sql.SCRIPT_LIMIT, table._decode))
+        # no rows: still a script; a real semicolon between COPY and FROM stdin still separates the statements
+        self.assertFalse(sql.has_data_records('COPY "a;b" (name) FROM stdin;\n\\.\n'))
+        self.assertFalse(sql.has_data_records("COPY t TO 'file';\nSELECT name FROM stdin\n" + rows))
+
     def test_script_or_dump(self):
         from piigate import sql
 
