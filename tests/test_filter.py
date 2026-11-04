@@ -3780,7 +3780,7 @@ class TestLineSafety(unittest.TestCase):
                 "cli/cli\t2026-11-02T10:00:00Z\tv2.60.0",
                 "rust-lang/rust\t2026-11-01T10:00:00Z\t1.80.0",
                 "foo/bar\t2026-10-30T10:00:00Z\tv0.5.1",
-                "open-wc/open-wc\t2026-10-30T10:00:00Z\teslint-plugin-lit-a11y-5.1.3",
+                "open-wc/open-wc\t2026-10-30T10:00:00Z\teslint-plugin-lit-a11y@5.1.3",
             ]
         )
         self.assertEqual(self.lines_equal(source), source)
@@ -3789,7 +3789,7 @@ class TestLineSafety(unittest.TestCase):
     def test_collective_gh_output_passes_by_detection_alone(self):
         """Synthetic output of a loop over public repos: tags, versions, timestamps — nothing to hide."""
         rows = [
-            f"org{i}/repo{i}\t2026-10-{i + 1:02d}T0{i}:11:01Z\tv0.{i}.1\t{name}-{i}.2.3-next.{i}\tmodule/v7-v7.13.{i}"
+            f"org{i}/repo{i}\t2026-10-{i + 1:02d}T0{i}:11:01Z\tv0.{i}.1\t{name}@{i}.2.3-next.{i}\tmodule/v7@v7.13.{i}"
             for i, name in enumerate(("eslint-plugin-lit-a11y", "pkg", "@scope/pkg"), 1)
         ]
         source = "\n".join(rows)
@@ -3805,6 +3805,87 @@ class TestLineSafety(unittest.TestCase):
         self.assertNotIn("kowalski@firma", result)
         self.assertIn("v0.5.1", result)
         self.assertIn("1.80.0", result)
+
+    def test_the_output_filter_and_the_text_filter_share_the_rules(self):
+        """Why a longer output is hidden and a shorter one is not: the filter checks the output of a command only when
+        the command text contains a glob character or a data extension (`jq '.[]'`, `-- '*.md'`, `x.csv`) — the length
+        of the output has nothing to do with it. Both the check and `piigate text` take the e-mail rule from rules.detect."""
+        g = gate.Gate(CONFIG, str(TMP))
+        self.assertTrue(g.touches_extension("gh api repos/o/r --jq '.[] | .tag_name'"))
+        self.assertFalse(g.touches_extension("gh api repos/o/r/releases/latest --jq .tag_name"))
+        for value in ("pkg@1.2.3", "go install example.org/tool@v1.2.3", "@scope/pkg@v1.2.3", "a/v7@v7.13.1"):
+            with self.subTest(value):
+                self.assertEqual(verdict.check_text(value, CONFIG), {})
+
+
+class TestEmailVersions(unittest.TestCase):
+    """Issue #24: the part after the @ is a domain only when its last label is a TLD; a version is not one."""
+
+    VERSIONS = (
+        "go install example.org/tool@v1.2.3",
+        "github.com/cloudflare/cloudflare-go/v7@v7.13.1",
+        "example.org/module/v7@v7.13.1",
+        "pkg@1.2.3",
+        "pkg@v1.2.3",
+        "pkg@1.2.3-next.4",
+        "@scope/pkg@1.2.3",
+        "eslint-plugin-lit-a11y@5.1.3",
+        "nazwa@wersja",
+        "pkg@1.2.3.beta",
+    )
+    ADDRESSES = (
+        "jan.kowalski@firma.pl",
+        "a@b.co",
+        "x@3m.com",  # a domain label that starts with a digit
+        "biuro@163.com",  # a numeric label next to a TLD is a real provider
+        "jan+tag@mail.firma.com.pl",
+        "ola@xn--e1afmkfd.xn--p1ai",
+    )
+
+    def test_rules_do_not_take_versions_for_addresses(self):
+        from piigate import rules
+
+        for value in self.VERSIONS:
+            with self.subTest(value):
+                self.assertEqual([f for f in rules.detect(value) if f.type_ == "EMAIL"], [])
+                self.assertEqual(verdict.check_text(value, CONFIG), {})
+        for value in self.ADDRESSES:
+            with self.subTest(value):
+                found = [f"kontakt: {value}."[f.start : f.end] for f in rules.detect(f"kontakt: {value}.") if f.type_ == "EMAIL"]
+                self.assertEqual(found, [value])
+                self.assertEqual(verdict.check_text(f"kontakt: {value}.", CONFIG), {"EMAIL": 1})
+
+    @unittest.skipUnless(PRESIDIO, PRESIDIO_SKIP)
+    def test_text_filter_with_presidio(self):
+        for value in self.VERSIONS:
+            with self.subTest(value):
+                self.assertEqual(text.filter_text(value, CONFIG)[0], value)
+        for value in self.ADDRESSES:
+            with self.subTest(value):
+                result, _ = text.filter_text(f"Napisz do {value}, proszę.", CONFIG)
+                self.assertNotIn(value, result)
+                self.assertIn("EMAIL_", result)
+        # a version next to an address: only the address goes
+        result, _ = text.filter_text("update pkg@1.2.3 and write to jan.kowalski@firma.pl", CONFIG)
+        self.assertIn("pkg@1.2.3", result)
+        self.assertNotIn("firma.pl", result)
+
+    def test_bash_output_check_keeps_versions(self):
+        """The output of `git diff -- '*.md'` is checked (a glob character in the command); a diff with versions
+        passes, a real address in it is still reported."""
+        diff = "+go install example.org/tool@v1.2.3\n+  npm i pkg@1.2.3-next.4 @scope/pkg@v1.2.3\n"
+        data = {
+            "hook_event_name": "PostToolUse",
+            "cwd": str(TMP),
+            "tool_name": "Bash",
+            "tool_input": {"command": "git diff -- '*.md'"},
+            "tool_response": {"stdout": diff, "stderr": "", "interrupted": False, "isImage": False},
+        }
+        self.assertIsNone(hook("filter", data))
+        data["tool_response"]["stdout"] = diff + "+ kontakt: jan.kowalski@firma.pl\n"
+        out = json.dumps(hook("filter", data)["hookSpecificOutput"]["updatedToolOutput"])
+        self.assertIn("EMAIL 1", out)
+        self.assertNotIn("firma.pl", out)
 
 
 def tearDownModule():

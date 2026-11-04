@@ -280,6 +280,19 @@ WORD_RE = re.compile(rf"{NAME}")
 ACRONYM_TAIL = re.compile(rf"[{UPPER}]+(?![{LOWER}])")
 
 
+_TLD_RE = re.compile(r"[^\W\d_]{2,}|xn--[A-Za-z0-9-]+")
+
+
+def email_valid(address: str) -> bool:
+    """Whether what follows the last `@` can be a domain: the last label (TLD) is made of letters, and it is not a
+    version (`pkg@1.2.3`, `module/v7@v7.13.1`, `pkg@1.2.3-next.4`, `pkg@1.2.3.beta`)."""
+    labels = address.rsplit("@", 1)[-1].strip(".").split(".")
+    if len(labels) < 2 or not _TLD_RE.fullmatch(labels[-1]):
+        return False
+    numeric = [s for s in labels[:-1] if re.fullmatch(r"v?\d+", s)]
+    return not (len(labels) > 2 and len(numeric) == len(labels) - 1)
+
+
 # ISO 8601 / RFC 3339 timestamps (2026-11-02T20:11:01Z, 2026-11-02 20:11:01+01:00): a technical value (release time,
 # log line), not a birth date. A date with the time 00:00 is how databases export a plain date — that stays a date.
 TIMESTAMP_RE = re.compile(
@@ -331,6 +344,8 @@ def detect(text: str, *, dates: str = "all", drugs: bool = True) -> list[Fragmen
                 before = text[max(0, s - 30) : s].casefold()
                 if not re.search(r"ur\.|urodz|dob|birth", before):
                     continue
+            if type_ == "EMAIL" and not email_valid(m.group()):
+                continue
             result.append(Fragment(s, k, type_, weight))
 
     for m in DIGITS_RE.finditer(text):  # PESEL, NIP, cards — by checksum

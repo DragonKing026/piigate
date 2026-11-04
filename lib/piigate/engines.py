@@ -196,6 +196,8 @@ def presidio(text: str, cfg: dict) -> list[Fragment]:
                     continue  # "przyszła z Babcią" — a capitalized common noun, not a person
                 if type_ in ("PERSON", "ORG", "ADDRESS") and rules.technical_term(text, start, end, type_):
                     continue  # Vite, cypress-axe, ps_customersignin, vendor/package — technology, not data
+                if type_ == "EMAIL" and not rules.email_valid(value):
+                    continue  # tool@v1.2.3, pkg@1.2.3-next.4 — a version after the @, not a domain
                 if type_ in ("DATE", "ORG", "NUMBER"):
                     fitted = rules.fit_to_tokens(text, start, end)
                     if fitted is None:
