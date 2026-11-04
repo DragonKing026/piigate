@@ -3362,6 +3362,45 @@ class TestContentNotNames(unittest.TestCase):
                 self.assertIsNotNone(b.bash(command))
         self.assertIsNone(b.bash(f"git commit -m 'mentions {S}' && ./build.sh"))
 
+    def test_script_from_a_quoted_heredoc_is_read_by_its_body(self):
+        """Issue #27: the target of a redirection is not text built at run time; a quoted heredoc is judged by its body,
+        the same for `"$f"` and a literal path. Text the gate cannot read keeps the denial, with its own wording."""
+        b = self.gate()
+        S = "Sensitive-data"
+        for target in ('"$f"', "$f", "/tmp/x/a.sh"):
+            for rest in ('bash "$f"; rm -f "$f"', 'wc -l "$f"', "true", "sh /tmp/x/a.sh"):
+                command = f"f=/tmp/x/a.sh; cat > {target} <<'SH'\necho ok\nSH\n{rest}"
+                with self.subTest(command):
+                    self.assertIsNone(b.bash(command))
+        # the body is read: a sensitive path in it is a read of a sensitive directory
+        for command in (
+            f"f=/tmp/x/a.sh; cat > \"$f\" <<'SH'\ncat {S}/x.txt\nSH\nbash \"$f\"",
+            f"cat > /tmp/x/a.sh <<'SH'\ncat {S}/x.txt\nSH\nbash /tmp/x/a.sh",
+        ):
+            with self.subTest(command):
+                self.assertIn("a sensitive data directory (Sensitive-data/x.txt)", b.bash(command))
+        # text the gate cannot read: an unquoted heredoc with `$`, echo/printf of built text — own wording, no directory
+        for command in (
+            'f=/tmp/x/a.sh; cat > "$f" <<SH\necho $HOME\nSH\nbash "$f"',
+            "cat > /tmp/x/a.sh <<SH\necho $HOME\nSH\nbash /tmp/x/a.sh",
+            'echo "$x" > s.sh; bash s.sh',
+            "printf '%s' x > s.sh; bash s.sh",
+            'f=s.sh; echo "$x" > "$f"; bash "$f"',
+            'f=s.sh; printf "%s" x > "$f"; bash "$f"',
+        ):
+            with self.subTest(command):
+                reason = b.bash(command)
+                self.assertIn("a script written from text built at run time", reason)
+                self.assertNotIn("a sensitive data directory", reason)
+                self.assertNotIn("multi-line command", reason)
+        # a variable target without a heredoc and without built text: as before
+        for command in (
+            'f=a.txt; echo one-line > "$f"; wc -l "$f"; rm -f "$f"', 'f=a.sh; echo one-line > "$f"; wc -l "$f"',
+            'echo "$x" > s.sh && wc -l s.sh',  # nothing runs it
+        ):
+            with self.subTest(command):
+                self.assertIsNone(b.bash(command))
+
     def test_names_and_writes_in_sensitive_directories_pass(self):
         b = self.gate()
         S = "Sensitive-data"

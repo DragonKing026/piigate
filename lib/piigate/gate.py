@@ -183,6 +183,7 @@ def ssh_valid(arguments: list[str]) -> bool:
     return True
 
 
+UNVETTABLE = "a script written from text built at run time and then run in the same command"
 PDFTOTEXT_WITH_VALUE = {"-f", "-l", "-r", "-x", "-y", "-W", "-H", "-enc", "-eol", "-opw", "-upw", "-fixed", "-margin"}
 OUTPUT_OPTIONS = re.compile(r"^(?:-o|-O|--output(?:=.*)?|--out(?:=.*)?|-o.+|--output-file(?:=.*)?)$")
 SEARCHERS = {
@@ -935,20 +936,64 @@ class Gate:
                     return True
         return False
 
+    @staticmethod
+    def _heredocs(tokens: list[str]) -> list[tuple[bool, list[str]]]:
+        """Heredocs in a token list: (the delimiter is quoted, the body's tokens). The body is literal text when quoted."""
+        result: list[tuple[bool, list[str]]] = []
+        pending: list[tuple[str, bool]] = []
+        k = 0
+        while k < len(tokens):
+            t = tokens[k]
+            if t in ("<<", "<<-") and k + 1 < len(tokens):
+                pending.append((str(tokens[k + 1]), bool(getattr(tokens[k + 1], "quote", ""))))
+                k += 2
+                continue
+            if t == "\n" and pending:
+                delimiter, quoted = pending.pop(0)
+                body: list[str] = []
+                j, line = k + 1, []
+                while j < len(tokens):
+                    if tokens[j] == "\n":
+                        if line == [delimiter]:
+                            break
+                        body += [*line, "\n"]
+                        line = []
+                    else:
+                        line.append(tokens[j])
+                    j += 1
+                result.append((quoted, body))
+                k = j
+                continue
+            k += 1
+        return result
+
     def _unvettable_script(self, tokens: list[str]) -> bool:
         """A file is written from text that the gate cannot read as a literal (`printf '…%s…' x > s.sh`, `echo "$x" >
-        s.sh`) and a later stage may run it: the written code can name a sensitive path built at run time."""
+        s.sh`, an unquoted heredoc with `$`) and a later stage may run it: the written code can name a sensitive path
+        built at run time. A quoted heredoc is literal text, judged by its body like any other stage; then the written
+        file's name may be a variable too (#27) — without a heredoc the name counts as before."""
         stages, writes, _ = self._script_stages(tokens)
         if not writes:
             return False
         first = min(k for k, _, _ in writes)
         if all(self._safe_stage(core) for core in stages[first + 1 :]):
             return False
+        heredocs = self._heredocs(tokens)
         for k, _, target in writes:
             core = stages[k]
             scripty = re.search(r"\.(?:sh|bash|zsh|ksh|fish|py|pl|rb|js|php|mk)$", target) or "." not in os.path.basename(target)
-            if scripty and core[0] in ("echo", "printf", "cat", "tee") and any(
-                ("%" in t and core[0] == "printf") or (re.search(r"\$", t) and not getattr(t, "single", False)) for t in core[1:]
+            if not (scripty and core[0] in ("echo", "printf", "cat", "tee")):
+                continue
+            if any("<<" in t and set(t) <= {"<", "-"} for t in core) and heredocs:
+                if any(not quoted and any(re.search(r"[$`]", w) for w in body) for quoted, body in heredocs):
+                    return True
+                skip = {i for kk, i, _ in writes if kk == k}  # the redirect target: not text that is written
+            else:
+                skip = set()
+            if any(
+                ("%" in t and core[0] == "printf") or (re.search(r"\$", t) and not getattr(t, "single", False))
+                for i, t in enumerate(core[1:], 1)
+                if i not in skip
             ):
                 return True
         return False
@@ -2074,7 +2119,7 @@ class Gate:
                     if hit := next((t for t in targets if SEEDING.search(t)), None):
                         kinds.setdefault("sensitive", f"{hit} (a file that runs later, in a command naming a sensitive path)")
         if self._unvettable_script(tokens):
-            kinds.setdefault("sensitive", "a script written from text built at run time and then run in the same command")
+            kinds.setdefault("sensitive", UNVETTABLE)
         paths_text = self._marker_text(tokens, text)
         for z in self.markers:
             if z in paths_text:
@@ -2713,6 +2758,12 @@ class Gate:
         reason = self._piigate_safe(command, tokens)
         if reason is None:
             return None
+        if kind == "sensitive" and what == UNVETTABLE:  # no sensitive path is named: the script's text cannot be read
+            return (
+                f"piigate: command denied — {UNVETTABLE}: its text is not a literal, so it cannot be checked for a "
+                "sensitive path built at run time. Write the script from a quoted heredoc (<<'EOF') or run it in "
+                f"a separate command. {HINT}"
+            )
         p = _path(what, self.cwd) if kind == "sensitive" else ""
         if p and not _inside(p, self.sensitive) and _ancestor(p, self.sensitive):
             sub = ", ".join(os.path.relpath(k, p) for k in self.sensitive if _inside(k, [p]))
