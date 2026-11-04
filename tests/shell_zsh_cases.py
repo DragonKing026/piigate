@@ -115,6 +115,7 @@ class World:
         for name in ("x.csv", "s.csv"):
             (self.work / name).write_text("plain\n", encoding="utf-8")
         (self.work / "hook").write_text(f"cat {HIDDEN}\n", encoding="utf-8")
+        (self.work / "ln").symlink_to("../" + SENSITIVE_NAME)  # a symlink into the dummy sensitive directory
 
     def gate(self, factory=None):
         from piigate import config, gate
@@ -136,6 +137,11 @@ class World:
         if not zsh:
             return {"available": False}
         argv = [zsh, "-f", "-c", command]
+        if mode == "bash":
+            bash = shutil.which("bash")
+            if not bash:
+                return {"available": False}
+            argv = [bash, "--noprofile", "--norc", "-c", command]
         if mode == "cc":
             env["PIIGATE_LINE"] = command
             argv = [zsh, "-f", "-c", 'setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL; eval "$PIIGATE_LINE"']

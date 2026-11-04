@@ -1,0 +1,228 @@
+"""Adversarial corpus for the Bash gate front-ends (issue 340, round 2): lines that try to read a sensitive file without
+the gate noticing, and the lines the gate must keep deciding as it does.
+
+Sections: A1-A5 (words / heredocs / pipelines / directories / code the first prototype lost), D1-D7 (holes the old gate
+has too), F (must not break: cd in loops and conditions, operator-like words, heredocs, here-strings, substitutions in
+odd places, piigate reverse/approve, the allowed filtered pipeline). Every case runs for real in a throw-away directory
+with a dummy sensitive file (see tests/shell_zsh_cases.py): `zsh -f -c`, Claude Code's way (`zsh -c` with NO_EXTENDED_GLOB
+NO_BARE_GLOB_QUAL, then `eval`) and `bash -c` — "reads" means the dummy's canary came out.
+
+`KNOWN` lists the cases a front-end may still allow although a real shell reads: each has the reason. `measure()` returns
+one row per case; `python3 -I tests/shell_adversarial.py` prints the table.
+"""
+
+from __future__ import annotations
+
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent / "lib"))
+sys.path.insert(0, str(HERE))
+
+import shell_zsh_cases as zc  # noqa: E402
+
+V = "../Sensitive-data/people.csv"  # the dummy sensitive file, path spelled out
+G = "../S*/p*.csv"  # the same through a glob (no directory name in the line)
+
+
+@dataclass(frozen=True)
+class Adv:
+    name: str
+    section: str
+    command: str
+    expect: str | None = None  # "allow" | "deny" when the gate must decide so (piigate lines), else None
+
+
+def _c(section: str, name: str, command: str, expect: str | None = None) -> Adv:
+    return Adv(name, section, command.replace("{V}", V).replace("{G}", G), expect)
+
+
+CASES: list[Adv] = [
+    # A1 — words of a loop header
+    _c("A1", "for-glob", "for f in {G}; do cat $f; done"),
+    _c("A1", "for-visible", "for f in {V}; do cat $f; done"),
+    _c("A1", "select", "select f in {G}; do cat $f; break; done"),
+    _c("A1", "for-subst-free", "for f in {G}; do echo $f; done"),
+    _c("A1", "case-word", "case {V} in x) :;; esac"),
+    # A2 — a heredoc given to a group, a loop, a function
+    _c("A2", "brace-bash", "{ bash; } <<'EOF'\ncat {V}\nEOF"),
+    _c("A2", "subshell-bash", "( bash ) <<'EOF'\ncat {V}\nEOF"),
+    _c("A2", "if-bash", "if true; then bash; fi <<'EOF'\ncat {V}\nEOF"),
+    _c("A2", "for-bash", "for i in 1; do bash; done <<'EOF'\ncat {V}\nEOF"),
+    _c("A2", "while-bash", "while true; do bash; break; done <<'EOF'\ncat {V}\nEOF"),
+    _c("A2", "function-bash", "f() { bash; } <<'EOF'\ncat {V}\nEOF\nf"),
+    _c("A2", "brace-python", "{ python3 -; } <<'EOF'\nprint(open('{V}').read())\nEOF"),
+    _c("A2", "brace-cat-to-bash", "{ cat; } <<'EOF' | bash\ncat {V}\nEOF"),
+    _c("A2", "brace-bash-unquoted", "{ bash; } <<EOF\ncat {G}\nEOF"),
+    # A3 — a pipeline stage that is a group
+    _c("A3", "brace-find-xargs", "{ find ../Sensitive-data -type f; :; } | xargs cat"),
+    _c("A3", "subshell-find-xargs", "( find ../Sensitive-data -type f; : ) | xargs cat"),
+    _c("A3", "for-find-xargs", "for d in ../Sensitive-data; do find $d -type f; done | xargs cat"),
+    _c("A3", "find-while-read", "find ../Sensitive-data -type f | while read f; do cat \"$f\"; done"),
+    _c("A3", "group-echo-sh", "{ echo 'cat {V}'; :; } | sh"),
+    _c("A3", "group-echo-tee-bash", "{ echo 'cat {V}'; :; } | tee /dev/null | bash"),
+    _c("A3", "group-echo-python", "{ echo 'print(open(\"{V}\").read())'; :; } | python3 -"),
+    _c("A3", "group-echo-python-c", "{ echo 'print(open(\"{V}\").read())'; :; } | python3 -c 'import sys; exec(sys.stdin.read())'"),
+    _c("A3", "group-ls-names", "{ ls ../Sensitive-data; :; } | cat"),
+    # A4 — a directory changed where the walker does not look
+    _c("A4", "function-cd", "f() { cd ../Sensitive-data; }; f; cat people.csv"),
+    _c("A4", "function-reads-after-cd", "f() { cat people.csv; }; cd ../Sensitive-data && f"),
+    _c("A4", "function-cd-grep", "f() { cd ../Sensitive-data; }; f; grep -r CANARY"),
+    # A5 — code or a path made by a substitution
+    _c("A5", "eval-subst", "eval \"$(echo 'cat {G}')\""),
+    _c("A5", "bash-c-subst", "bash -c \"$(echo 'cat {G}')\""),
+    _c("A5", "backtick-command", "`echo cat {G}`"),
+    _c("A5", "operand-subst", "cat \"$(echo {G})\""),
+    _c("A5", "operand-default-subst", "cat \"${f:-$(echo {G})}\""),
+    _c("A5", "eval-variable", "x='cat {G}'; eval $x"),
+    _c("A5", "bash-c-variable", "x='cat {G}'; bash -c \"$x\""),
+    # D1 — a quoted word equal to an operator
+    _c("D1", "quoted-gt", "cat '>' {V}"),
+    _c("D1", "quoted-gtgt", "cat '>>' {V}"),
+    _c("D1", "quoted-pipe-gt", "cat '>|' {V}"),
+    _c("D1", "quoted-amp-gt", "cat '&>' {V}"),
+    _c("D1", "escaped-gt", "cat \\> {V}"),
+    _c("D1", "quoted-semicolon", "cat ';' {V}"),
+    # D2 — an operand built by a substitution
+    _c("D2", "operand-bare-subst", "cat $(echo {G})"),
+    _c("D2", "operand-via-variable", "f=$(echo {G}); cat \"$f\""),
+    _c("D2", "operand-default", "cat ${f:-$(echo {G})}"),
+    _c("D2", "operand-process-subst", "cat <(echo {G})"),
+    # D3 — a cd to a place the line does not spell out
+    _c("D3", "cd-glob", "cd ../Sens* && cat people.csv"),
+    _c("D3", "cd-brace", "cd ../{Sensitive-data,x} && cat people.csv"),
+    _c("D3", "cd-tilde-plus", "cd ~+/../Sensitive-data && cat people.csv"),
+    _c("D3", "pushd-glob", "pushd ../Sens* && cat people.csv"),
+    _c("D3", "cd-variable", "d=../Sensitive-data; cd $d && cat people.csv"),
+    # D7 — bash `${x@P}`
+    _c("D7", "prompt-expansion", "x='$(cat {G} >&2)'; echo \"${x@P}\""),
+    # D4-D6 and others the gate cannot close by a rule (see KNOWN)
+    _c("D4", "path-from-variable", "d=../Sensitive-data; cat $d/people.csv"),
+    _c("D4", "path-from-three-variables", "a=..; b=Sensit; c=ive-data; cat $a/$b$c/people.csv"),
+    _c("D5", "script-written-then-run-by-pattern", "echo 'cat {G}' > s1.sh; bash s?.sh"),
+    _c("D5", "script-prepared-by-an-earlier-call", "bash hook"),
+    _c("D6", "base64-to-sh", "echo Y2F0IC4uL1NlbnNpdGl2ZS1kYXRhL3Blb3BsZS5jc3YK | base64 -d | sh"),
+    _c("D6", "base64-to-bash-c", "bash -c \"$(echo Y2F0IC4uL1NlbnNpdGl2ZS1kYXRhL3Blb3BsZS5jc3YK | base64 -d)\""),
+    _c("D8", "autoload", "fpath=(.); autoload -Uz hook; hook"),
+    # F — must not break
+    _c("F", "cd-in-loop", "for i in 1 2; do cd ../Sensitive-data; cat people.csv; done"),
+    _c("F", "cd-in-condition", "if cd ../Sensitive-data; then cat people.csv; fi"),
+    _c("F", "cd-in-while-cond", "while cd ../Sensitive-data; do cat people.csv; break; done"),
+    _c("F", "cd-and-background", "cd ../Sensitive-data & cat people.csv"),
+    _c("F", "cd-in-subshell", "(cd ../Sensitive-data); cat people.csv"),
+    _c("F", "cd-subshell-then-read-inside", "(cd ../Sensitive-data && cat people.csv)"),
+    _c("F", "cd-eval", "eval 'cd ../Sensitive-data'; cat people.csv"),
+    _c("F", "cd-alias", "alias c='cd ../Sensitive-data'; c; cat people.csv"),
+    _c("F", "cd-source", "echo 'cd ../Sensitive-data' > c.sh; source ./c.sh; cat people.csv"),
+    _c("F", "cd-dash", "cd ../Sensitive-data; cd -; cd -; cat people.csv"),
+    _c("F", "symlink", "cat ln/people.csv"),
+    _c("F", "symlink-glob", "cat ln/p*.csv"),
+    _c("F", "plain-cd-then-read", "cd ../Sensitive-data && cat people.csv"),
+    _c("F", "plain-ls", "ls", "allow"),
+    _c("F", "operator-word-semicolon", "echo ';' ; cat {V}"),
+    _c("F", "operator-word-pipe", "echo '|' && cat {V}"),
+    _c("F", "operator-word-paren", "echo '(' ; cat {V}"),
+    _c("F", "operator-word-redirect", "echo '2>' ; cat {V}"),
+    _c("F", "find-exec-semicolon", "find ../Sensitive-data -type f -exec cat {} \\;"),
+    _c("F", "heredoc-quoted-text", "cat <<'EOF'\n{V}\nEOF"),
+    _c("F", "heredoc-unquoted-substitution", "cat <<EOF\n$(cat {V})\nEOF"),
+    _c("F", "heredoc-to-file-then-run", "cat > s3.sh <<'EOF'\ncat {V}\nEOF\nbash s3.sh"),
+    _c("F", "here-string-to-bash", "bash <<< 'cat {V}'"),
+    _c("F", "source-stdin", "source /dev/stdin <<< 'cat {V}'"),
+    _c("F", "source-stdin-heredoc", ". /dev/stdin <<EOF\ncat {V}\nEOF"),
+    _c("F", "subst-in-redirect-input", "cat < <(cat {V})"),
+    _c("F", "subst-in-redirect-target", "echo x > \"$(cat {V})\""),
+    _c("F", "subst-in-index", "a=(1 2); echo ${a[$(cat {V} >&2; echo 1)]}"),
+    _c("F", "subst-in-test", "[[ $(cat {V}) ]]"),
+    _c("F", "subst-in-arith", "(( $(cat {V} | wc -l) ))"),
+    _c("F", "subst-in-case", "case $(cat {V}) in x) :;; esac"),
+    _c("F", "piigate-reverse", "piigate reverse x", "deny"),
+    _c("F", "piigate-approve", "piigate project approve", "deny"),
+    _c("F", "piigate-quoted", "\"piigate\" reverse x", "deny"),
+    _c("F", "piigate-split-quote", "p'ii'gate reverse x", "deny"),
+    _c("F", "piigate-variable-name", "p=piigate; $p reverse x", "deny"),
+    _c("F", "piigate-env", "env piigate reverse x", "deny"),
+    _c("F", "piigate-bash-c", "bash -c 'piigate reverse x'", "deny"),
+    _c("F", "piigate-subst", "echo $(piigate reverse x)", "deny"),
+    _c("F", "piigate-heredoc-shell", "bash <<'EOF'\npiigate reverse x\nEOF", "deny"),
+    _c("F", "filtered-pipeline-allowed", "cat {V} 2>&1 | piigate text", "allow"),
+]
+
+# A line a front-end may allow although a real shell reads the dummy: why it stays (README "Limitations")
+KNOWN: dict[str, str] = {
+    "path-from-variable": "D4: the path is assembled from variables at run time; a rule would need the values",
+    "path-from-three-variables": "D4: the same, from three variables (the first variant, with the directory name spelled out, is caught by the name)",
+    "script-written-then-run-by-pattern": "D5: the script is written to s1.sh and run as `s?.sh`; the gate cannot match a pattern to a written file",
+    "script-prepared-by-an-earlier-call": "D5: the script was written by an earlier tool call, the line only names it",
+    "base64-to-sh": "D6: the code is encoded; nothing in the line names the path",
+    "base64-to-bash-c": "D6: the same through `bash -c`",
+    "autoload": "D8: zsh `autoload` runs a function body from a file in $fpath — code outside the line",
+}
+
+
+def measure(world: zc.World | None = None, cases: list[Adv] | None = None) -> list[dict]:
+    from piigate import gate, shell_gate
+
+    own = world is None
+    world = world or zc.World()
+    rows = []
+    try:
+        for case in cases if cases is not None else CASES:
+            old_gate = world.gate()
+            old = gate.Gate.bash(old_gate, case.command, True)
+            row = {"name": case.name, "section": case.section, "command": case.command, "expect": case.expect,
+                   "old": "allow" if old is None else "deny", "old_reason": (old or "")[:140]}
+            for d in shell.DIALECTS:
+                g = shell_gate.AstGate(old_gate.cfg, old_gate.cwd, d)
+                reason = g.bash(case.command, True)
+                category = "parse-error" if g.parse_error else (
+                    "same-allow" if old is None and reason is None else
+                    "same-deny" if old is not None and reason is not None else
+                    "OLD-DENY-NEW-ALLOW" if old is not None else "OLD-ALLOW-NEW-DENY")
+                row[d] = {"decision": "allow" if reason is None else "deny", "category": category,
+                          "parse_error": g.parse_error, "internal_error": g.internal_error, "reason": (reason or "")[:160]}
+            real = {m: world.real(case.command, m) for m in ("f", "cc", "bash")}
+            row["real"] = {m: bool(r.get("reads")) for m, r in real.items()}
+            row["real_any"] = any(row["real"].values())
+            row["old_hole"] = old is None and row["real_any"]
+            for d in shell.DIALECTS:
+                row[d]["hole"] = row[d]["decision"] == "allow" and row["real_any"]
+            row["known"] = KNOWN.get(case.name)
+            rows.append(row)
+    finally:
+        if own:
+            world.close()
+    return rows
+
+
+def holes(rows: list[dict], dialect: str) -> list[dict]:
+    return [r for r in rows if r[dialect]["hole"]]
+
+
+def unexplained(rows: list[dict], dialect: str) -> list[dict]:
+    return [r for r in holes(rows, dialect) if not r["known"]]
+
+
+from piigate import shell  # noqa: E402
+
+
+def main() -> None:
+    rows = measure()
+    print(f"{'case':36} {'old':5} {'bash-AST':9} {'zsh-AST':8} {'real f/cc/bash':15}")
+    for r in rows:
+        real = "/".join("R" if r["real"][m] else "-" for m in ("f", "cc", "bash"))
+        flag = ""
+        if r["old_hole"]:
+            flag += " OLD-ALLOWS-READ"
+        for d in shell.DIALECTS:
+            if r[d]["hole"]:
+                flag += f" {d}-AST-ALLOWS-READ" + (" (known)" if r["known"] else " (UNEXPLAINED)")
+        print(f"{r['section'] + ' ' + r['name']:36} {r['old']:5} {r['bash']['decision']:9} {r['zsh']['decision']:8} {real:15}{flag}")
+    for d in shell.DIALECTS:
+        print(f"\n{d}: {len(holes(rows, d))} lines a real shell reads and the AST gate allows, {len(unexplained(rows, d))} unexplained")
+
+
+if __name__ == "__main__":
+    main()

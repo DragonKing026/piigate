@@ -405,7 +405,7 @@ def _expansion_text(p: dict, kinds: set[str]) -> str:
                 kinds.add("zsh-code")  # `(e)` evaluates `$(…)` and `$x` inside the value — works without any setopt
         exp = p.get("Exp") or {}
         if exp.get("Op") == "@" and exp.get("Word") and _word(exp["Word"]).text == "P":
-            kinds.add("cmd")  # bash `${x@P}`: prompt expansion runs `$(…)` found in the value
+            kinds.update({"cmd", "exec"})  # bash `${x@P}`: prompt expansion runs `$(…)` found in the value
         return _param_text(p, kinds)
     if t == "CmdSubst":
         kinds.add("cmd")

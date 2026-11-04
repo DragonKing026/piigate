@@ -259,6 +259,8 @@ class AstGate(gate.Gate):
             for w in self._words(c):
                 if "zsh-code" in w.kinds:
                     return "zsh syntax that runs code (a glob qualifier `(e:…:)` / `(+func)`, a flag `${(e)x}`)"
+                if "exec" in w.kinds:
+                    return "an expansion that runs code (`${x@P}`)"
                 if options and "zsh" in w.kinds:
                     return "a zsh glob qualifier or parameter flag in a command that may change the shell options"
             if c.opaque_code:
