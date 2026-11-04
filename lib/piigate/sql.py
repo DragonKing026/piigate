@@ -191,28 +191,55 @@ def _strip_block_comments(text: str) -> str:
 
 
 _CONDITIONAL_OPEN = re.compile(r"/\*!\d*")
-_COPY_STDIN = re.compile(r"(?i)\bCOPY\b[^;]{0,300}?\bFROM\s+stdin\b")
+_COPY_WORD = re.compile(r"(?i)\bCOPY\b")
+_FROM_STDIN = re.compile(r"(?i)\bFROM\s+stdin\b")
 _NO_ROWS = re.compile(r"[^\n]*\r?\n\\\.")  # the line after COPY ... FROM stdin is the terminator
-_INSERT = re.compile(r"(?i)\bINSERT\b|\bREPLACE\s+(?:LOW_PRIORITY\s+|DELAYED\s+)?INTO\b")
-_VALUES_CALL = re.compile(r"(?i)\bVALUES\s*\(")
+# INSERT, REPLACE INTO, and REPLACE without INTO followed by a table name and `(`, SET, VALUES or SELECT (not the
+# function `REPLACE(a, b, c)`)
+_INSERT = re.compile(
+    r"(?i)\bINSERT\b|\bREPLACE\s+(?:(?:LOW_PRIORITY|DELAYED)\s+)?INTO\b"
+    r"|\bREPLACE\s+(?:(?:LOW_PRIORITY|DELAYED)\s+)?(?!INTO\b)(?:[\w.$]+|`[^`]*`)\s*(?:\(|SET\b|VALUES\b|SELECT\b)"
+)
+_VALUES_CALL = re.compile(r"(?i)\bVALUES\s*(?:ROW\s*)?\(")
+
+
+def _copy_from_stdin_with_rows(t: str) -> bool:
+    """`COPY … FROM stdin` followed by rows, however long the column list is. Linear: each `FROM stdin` is matched with
+    the nearest `COPY` before it (no `;` in between), and the text between them is scanned for `;` only once."""
+    copies = [m.start() for m in _COPY_WORD.finditer(t)]
+    if not copies:
+        return False
+    index, seen_to, has_semicolon, current = -1, 0, False, -1
+    for m in _FROM_STDIN.finditer(t):
+        while index + 1 < len(copies) and copies[index + 1] < m.start():
+            index += 1
+        if index < 0:
+            continue
+        if copies[index] != current:
+            current, seen_to, has_semicolon = copies[index], copies[index], False
+        if not has_semicolon and seen_to < m.start():
+            has_semicolon = t.find(";", seen_to, m.start()) >= 0
+            seen_to = m.start()
+        if not has_semicolon and not _NO_ROWS.match(t, m.end()):
+            return True
+    return False
 
 
 def has_data_records(text: str) -> bool:
     """INSERT / REPLACE with values (or a literal), COPY ... FROM stdin with rows, a VALUES list. When in doubt (an
     INSERT inside a comment that may be a literal) the answer is yes — fail closed."""
     t = _CONDITIONAL_OPEN.sub(" ", _strip_block_comments(_LINE_COMMENT.sub(" ", text)))
-    if _VALUES_CALL.search(t):
+    if _VALUES_CALL.search(t) or _copy_from_stdin_with_rows(t):
         return True
-    for m in _COPY_STDIN.finditer(t):
-        if not _NO_ROWS.match(t, m.end()):
-            return True
     for m in _INSERT.finditer(t):
         end = t.find(";", m.end(), m.end() + 20000)
         if end < 0:  # no end of the statement within reach — cannot judge it: data
             return True
         statement = t[m.start() : end]
-        if re.search(r"(?i)\bSET\b", statement) or not re.search(r"(?i)\bSELECT\b", statement) or "'" in statement:
-            return True  # INSERT ... SET, DEFAULT VALUES, unrecognized, or a SELECT of literals; only a plain SELECT passes
+        # INSERT ... SET, DEFAULT VALUES, unrecognized, or a SELECT of literals (a double-quoted string is a literal in
+        # MySQL); only a plain SELECT passes
+        if re.search(r"(?i)\bSET\b", statement) or not re.search(r"(?i)\bSELECT\b", statement) or "'" in statement or '"' in statement:
+            return True
     return False
 
 

@@ -4836,6 +4836,14 @@ class TestSqlScripts(unittest.TestCase):
             "mixed": self.SCRIPT + f"INSERT INTO patient VALUES {row};\n",
             "commented": f"/* INSERT INTO patient VALUES {row} */\nSELECT 1;\n",
             "line_commented": f"-- x\nUPDATE t SET a = 'x -- ' ; INSERT INTO patient VALUES {row};\n",
+            # forms the first version missed (#28 review): a long column list, REPLACE without INTO, VALUES ROW, a
+            # double-quoted string (a literal in MySQL) selected into a table
+            "copy_long": f"COPY patient ({', '.join(f'column_{i:03d}' for i in range(60))}) FROM stdin;\n{p['surname']}\n\\.\n",
+            "replace_set": f"REPLACE patient SET surname = '{p['surname']}';\n",
+            "replace_values": f"REPLACE patient VALUES ('{p['surname']}');\n",
+            "values_row": f"INSERT INTO patient VALUES ROW(1, '{p['surname']}');\n",
+            "values_row_bare": f"VALUES ROW(1, '{p['surname']}');\n",
+            "select_double_quoted": f'INSERT INTO patient SELECT "{p["first_name"]}", "{p["surname"]}";\n',
         }[kind]
 
     def test_script_or_dump(self):
@@ -4844,9 +4852,13 @@ class TestSqlScripts(unittest.TestCase):
         ok = lambda data: sql.is_script(data, sql.SCRIPT_LIMIT, table._decode)  # noqa: E731
         self.assertTrue(ok(self.SCRIPT.encode()))
         self.assertTrue(ok(b"CREATE TABLE t (id int);\nALTER TABLE t ADD COLUMN x int;\nCOPY t (id) FROM stdin;\n\\.\n"))
-        for kind in ("insert", "insert_cols", "replace", "insert_set", "copy", "mixed", "commented", "line_commented"):
+        for kind in ("insert", "insert_cols", "replace", "insert_set", "copy", "mixed", "commented", "line_commented",
+                     "copy_long", "replace_set", "replace_values", "values_row", "values_row_bare", "select_double_quoted"):
             with self.subTest(kind):
                 self.assertFalse(ok(self.dump(kind).encode()))
+        # still scripts: a function call named REPLACE, a SELECT of identifiers, a COPY without rows (long columns too)
+        self.assertTrue(ok(b"UPDATE t SET a = REPLACE(a, x, y);\nCOPY t (" + b"c_1, " * 100 + b"c_2) FROM stdin;\n\\.\n"))
+        self.assertTrue(ok(b"INSERT INTO t SELECT id, name FROM u;\nCOPY t FROM 'file.csv';\n"))
         # fail closed: too large, binary, compressed, not text
         self.assertFalse(ok(self.SCRIPT.encode() + b" " * (sql.SCRIPT_LIMIT + 1)))
         self.assertFalse(ok(b"UPDATE t SET a = 1;\0\1\2"))
@@ -4937,6 +4949,7 @@ class TestSqlScripts(unittest.TestCase):
         size = 8 * 1024 * 1024
         cases = [("UPDATE t SET a = " + q + "x" * size) for q in ("'", "`", '"', "/*", "$$", "'\\")]
         cases += ["COPY a " * 200_000, "/* " * 1_000_000, "INSERT INTO t SELECT x " * 100_000, "BEGIN" + " " * 3000 + "Jan"]
+        cases += ["COPY a FROM stdin\n\\.\n" * 100_000, "COPY x " + "FROM stdin\n\\.\n" * 100_000, "FROM stdin " * 300_000]
         for case in cases:
             for function in (sql.looks_like_script, sql.has_data_records, sql.data_spans):
                 with self.subTest(case[:20], function=function.__name__):
