@@ -60,6 +60,18 @@ DIRECT_LAUNCHERS = {
     "exec", "command", "builtin", "env", "sudo", "doas", "nohup", "setsid", "time", "timeout", "nice", "ionice",
     "stdbuf", "chrt", "taskset", "unbuffer",
 }
+# value-taking options of launchers (their value is not the command), launchers whose arguments are code, interpreters
+LAUNCHER_VALUE_OPTIONS = {
+    "env": {"-u", "-C", "-S", "--unset", "--chdir", "--split-string"},
+    "sudo": {"-u", "-g", "-h", "-p", "-C", "-D", "-R", "-T", "-U", "-r", "-t"}, "doas": {"-u", "-C"},
+    "nice": {"-n", "--adjustment"}, "ionice": {"-c", "-n", "-p", "-P", "-u"}, "timeout": {"-s", "-k", "--signal", "--kill-after"},
+    "stdbuf": {"-i", "-o", "-e"}, "taskset": {"-c"}, "chrt": set(), "flock": {"-w", "-E"}, "time": {"-f", "-o"},
+    "ssh": {"-p", "-i", "-l", "-o", "-F", "-J", "-L", "-R", "-D", "-b", "-c", "-E", "-e", "-I", "-m", "-O", "-S", "-W", "-w"},
+}
+CODE_LAUNCHERS = {"parallel", "watch", "script", "trap"}  # their arguments are code
+INTERPRETER = re.compile(r"(?:python|pypy)[\d.]*|node|nodejs|perl|ruby|php")
+INLINE_FLAGS = {"python": r"-[A-Za-z]*c", "pypy": r"-[A-Za-z]*c", "node": r"-[A-Za-z]*[ep]|--eval|--print", "nodejs": r"-[A-Za-z]*[ep]|--eval|--print",
+                "perl": r"-[A-Za-z]*[eE]", "ruby": r"-[A-Za-z]*e", "php": r"-[A-Za-z]*r"}
 SHELL_KEYWORDS = {"{", "}", "!", "if", "then", "elif", "else", "fi", "do", "done", "while", "until", "for", "case"}
 # commands that never run what they are given (a file written earlier in the same command may be their argument)
 NON_RUNNING = {"ls", "rm", "stat", "mv", "cp", "touch", "mkdir", "chmod", "diff", "echo", "printf", "true", "test", "["}
@@ -205,6 +217,7 @@ VALUE_OPTIONS = {
     **{c: {"-e", "-m", "-A", "-B", "-C"} for c in ("grep", "egrep", "fgrep", "zgrep", "rg", "rga", "ag", "ack")},
 }
 XARGS_WITH_VALUE = {"-I", "-n", "-P", "-L", "-s", "-d", "-E", "-a", "--max-args", "--max-procs", "--max-lines", "--delimiter"}
+LAUNCHER_VALUE_OPTIONS["xargs"] = XARGS_WITH_VALUE
 UNVETTABLE = "a script written from text built at run time and then run in the same command"
 COMPUTED = "a file operand built by a command substitution or by xargs"
 PDFTOTEXT_WITH_VALUE = {"-f", "-l", "-r", "-x", "-y", "-W", "-H", "-enc", "-eol", "-opw", "-upw", "-fixed", "-margin"}
@@ -2700,7 +2713,7 @@ class Gate:
             standalone = re.search(r"(?<![\w./-])piigate(?![\w.-])", flat)
             # the program that runs may be built at run time: a substitution, backticks or `${…}` as the command word (or
             # as the command given to a launcher), eval — not a substitution somewhere else (`X=$(date); echo "$X"`)
-            suspicious = tokens is None or re.search(r"\beval\b", command) or self._dynamic_command(command) or (
+            suspicious = tokens is None or re.search(r"\beval\b", command) or self._dynamic_command(command, word) or (
                 standalone and "$" in command
             )
             prefix = r"(?:project['\",\s]+)?" if word == "approve" else ""
@@ -2721,9 +2734,39 @@ class Gate:
                 )
         return None
 
-    def _dynamic_command(self, command: str, depth: int = 0) -> bool:
-        """The command word of some stage (or the command a launcher runs, or what a shell/eval/xargs gets) is built at
-        run time — it holds a substitution, backticks or `${…}` — also inside a substitution. Unparsable — True."""
+    @staticmethod
+    def _launched_index(stage: list[str], k: int) -> int | None:
+        """Index of the command word that the launcher at `stage[k]` runs (after its options, their values, assignments
+        and positional arguments such as the duration of `timeout` or the host of `ssh`); None when it runs nothing."""
+        name = Path(stage[k]).name
+        values = LAUNCHER_VALUE_OPTIONS.get(name, set())
+        counted = 1 if name in ("flock", "ssh") else 0
+        j = k + 1
+        while j < len(stage):
+            t = stage[j]
+            if t == "--":
+                j += 1
+                break
+            if t.startswith("-") and len(t) > 1:
+                j += 2 if t in values else 1
+            elif name in ("env", "sudo", "doas") and re.match(r"^\w+=", t):
+                j += 1
+            elif name in ("timeout", "chrt", "taskset") and re.fullmatch(r"[\d.]+[smhd]?|0x[0-9a-fA-F]+", t):
+                j += 1
+            elif counted:
+                counted -= 1
+                j += 1
+            else:
+                break
+        return j if j < len(stage) else None
+
+    def _dynamic_command(self, command: str, word: str, depth: int = 0) -> bool:
+        """`piigate reverse` / `project approve` may be run by a program built at run time (#26): a substitution,
+        backticks or any `$` in the command word of some stage (also after a launcher, `ssh` or `find -exec`), a
+        substitution among the arguments of a launcher, a `$` or substitution together with the word in the code of
+        `sh -c`, `su -c` or an interpreter's inline code, or in text piped into a shell or an interpreter that reads
+        the script from stdin — also inside a substitution. A variable elsewhere (`echo "$X approve"`) is not a reason.
+        Unparsable — True."""
         if depth > 8:
             return True
         text = self._strip_heredocs(command)
@@ -2732,7 +2775,7 @@ class Gate:
         for start, end, inner in spans:
             masked += [text[position:start], "\x01"]
             position = end
-            if self._dynamic_command(inner, depth + 1):
+            if self._dynamic_command(inner, word, depth + 1):
                 return True
         masked.append(text[position:])
         lex = shlex.shlex("".join(masked), posix=True, punctuation_chars=";&|()\n")
@@ -2743,17 +2786,16 @@ class Gate:
             tokens = list(lex)
         except ValueError:
             return True
+        word_re = re.compile(rf"(?<![\w-]){word}(?![\w-])")
 
-        def built(t: str) -> bool:
-            return "\x01" in t or "`" in t or "${" in t
+        def dollar(t: str) -> bool:  # a substitution (masked), backticks or a variable
+            return "\x01" in t or "`" in t or "$" in t
 
-        stages: list[list[str]] = [[]]
-        for t in tokens:
-            if re.fullmatch(r"[;&|()\n]+", t):
-                stages.append([])
-            else:
-                stages[-1].append(t)
-        for stage in stages:
+        def with_word(t: str) -> bool:
+            return dollar(t) and bool(word_re.search(t))
+
+        def analyze(stage: list[str]) -> tuple[bool, str, list[str]]:
+            """(the command is built at run time, the program finally run, its arguments)"""
             k = 0
             while k < len(stage):
                 t = stage[k]
@@ -2763,12 +2805,73 @@ class Gate:
                     k += 2
                 else:
                     break
-            if k >= len(stage):
-                continue
-            if built(stage[k]):
+            for _ in range(8):  # launcher chains: `sudo -u me nice -n 5 env A=1 $x …`
+                if k >= len(stage):
+                    return False, "", []
+                if dollar(stage[k]):
+                    return True, "", []
+                name = Path(stage[k]).name
+                if name == "ssh":
+                    j = self._launched_index(stage, k)
+                    return (j is not None and self._dynamic_command(" ".join(stage[j:]), word, depth + 1)), name, []
+                if name == "find":
+                    for e, t in enumerate(stage):
+                        if t in ("-exec", "-execdir", "-ok", "-okdir") and analyze(stage[e + 1 :])[0]:
+                            return True, name, []
+                    return False, name, stage[k + 1 :]
+                if name not in LAUNCHERS or name in NO_COMMAND_LAUNCHERS:
+                    return False, name, stage[k + 1 :]
+                if any(dollar(t) for t in stage[k + 1 :]) and (
+                    name in CODE_LAUNCHERS or any("\x01" in t or "`" in t or "${" in t for t in stage[k + 1 :])
+                ):
+                    return True, name, []
+                j = self._launched_index(stage, k)
+                if j is None or name in SHELLS:
+                    return False, name, stage[k + 1 :]
+                k = j
+            return True, "", []  # chain too long
+
+        def reads_stdin(name: str, args: list[str]) -> bool:
+            shell_like = name in SHELLS or name == "su" or INTERPRETER.fullmatch(name)
+            return bool(shell_like) and all(a in ("-", "-s", "-i", "-l", "-") or a.startswith(("<", ">")) for a in args)
+
+        def inline(name: str, args: list[str]) -> bool:
+            """The code given to a shell or an interpreter on the command line."""
+            if name in SHELLS or name == "su":
+                flags = r"-[A-Za-z]*c|--command"
+            elif INTERPRETER.fullmatch(name):
+                flags = INLINE_FLAGS[re.sub(r"[\d.]+$", "", name)]
+            else:
+                return False
+            for i, a in enumerate(args[:-1]):
+                if re.fullmatch(flags, a):
+                    code = args[i + 1]
+                    if name in SHELLS or name == "su":
+                        if self._dynamic_command(code, word, depth + 1):
+                            return True
+                    elif with_word(code):
+                        return True
+            return False
+
+        stages: list[list[str]] = [[]]
+        group: list[int] = [0]
+        for t in tokens:
+            if re.fullmatch(r"[;&|()\n]+", t):
+                group.append(group[-1] if t in ("|", "|&") else group[-1] + 1)
+                stages.append([])
+            else:
+                stages[-1].append(t)
+        results = [analyze(stage) for stage in stages]
+        for dynamic, name, args in results:
+            if dynamic or inline(name, args):
                 return True
-            runs = Path(stage[k]).name in LAUNCHERS and stage[k] not in NO_COMMAND_LAUNCHERS
-            if runs and any(built(t) for t in stage[k + 1 :]):
+            if "<<<" in args and reads_stdin(name, args[: args.index("<<<")]):  # sh <<< "$x reverse"
+                if any(with_word(t) for t in args[args.index("<<<") + 1 :]):
+                    return True
+        for i, (dynamic, name, args) in enumerate(results):
+            if reads_stdin(name, args) and any(
+                with_word(t) for j in range(i) if group[j] == group[i] for t in stages[j]
+            ):
                 return True
         return False
 

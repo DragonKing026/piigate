@@ -2737,6 +2737,54 @@ class TestFalseAlarms(unittest.TestCase):
                 with self.subTest(where=where.name, command=command):
                     self.assertIsNone(b.bash(command))
 
+    def test_human_only_built_program_name_in_every_position(self):
+        """Issue #26 (review): a program name held in a variable or a substitution is a call in every position — as a
+        command word, under a launcher, in `sh -c` / `su -c` / an interpreter's inline code, fed to a shell through a
+        pipe — while a variable elsewhere (a text argument) stays harmless."""
+        word = "rev" + "erse"
+        appr = "appr" + "ove"
+        pre = "x=$(echo pii)gate; "
+        denied = []
+        for w in (f"{word}", f"project {appr}"):
+            denied += [
+                f"{pre}$x {w}", f'{pre}"$x" {w}', f"{pre}{{ $x {w}; }}", f"{pre}( $x {w} )",
+                f"{pre}if $x {w}; then :; fi", f"{pre}for i in 1 2; do $x {w}; done",
+                f"{pre}while $x {w}; do :; done", f"{pre}! $x {w}",
+                f"{pre}env $x {w}", f"{pre}env -u FOO A=1 $x {w}", f"{pre}command $x {w}", f"{pre}exec $x {w}",
+                f"{pre}nice -n 5 $x {w}", f"{pre}setsid $x {w}", f"{pre}sudo -u me $x {w}", f"{pre}timeout 5 $x {w}",
+                f"{pre}ssh localhost $x {w}", f'{pre}ssh -p 22 localhost "$x {w}"',
+                f'{pre}su -c "$x {w}"', f'{pre}sh -c "$x {w}"', f'{pre}bash -lc "$x {w}"',
+                f'{pre}echo "$x {w}" | sh', f'{pre}echo "$x {w}" | bash -s', f'{pre}printf "%s" "$x {w}" | python3',
+                f'{pre}sh <<< "$x {w}"', f"{pre}sh <<EOF\n$x {w}\nEOF",
+                f'{pre}find . -maxdepth 0 -exec $x {w} \\;',
+                f"{pre}python3 -c \"import os;os.system('$x {w}')\"",
+                f"{pre}node -e \"require('child_process').execSync('$x {w}')\"",
+                f"{pre}perl -e \"system('$x {w}')\"", f"{pre}ruby -e \"system('$x {w}')\"",
+                f"{pre}php -r \"system('$x {w}');\"",
+                f"{pre}xargs $x {w}",
+            ]
+        for command in denied:
+            for where in (self.public, self.phi):
+                with self.subTest(where=where.name, command=command):
+                    self.assertIsNotNone(self.gate(where).decision("Bash", {"command": command}))
+        for where in (self.public, self.phi):
+            b = self.gate(where)
+            for command in (
+                f'X=$(echo hi); echo "$X https://example.test/api/orders/1/{appr}"',
+                f'X=$(echo hi); echo "$X"; grep -c -E "a|{appr}" /dev/null',
+                f"X=$(echo hi); python3 -c 'print(sorted([1, 2], {word}=True))'",
+                f'echo "$(date) {appr}"', f'echo "${{HOME}} {appr}"',
+                f'for f in $(ls); do grep -c {appr} "$f"; done',
+                f'export X=$(echo hi); grep {appr} a.txt',
+                f'X=$(echo hi) && sudo -n echo "$X {appr}"',
+                f'X=1; env A=1 nice -n 5 echo "$X {appr}"',
+                f"X=1; sh -c 'echo \"$X {appr}\"'",
+                f'X=1; echo "$X {appr}" | wc -l',
+                f'X=1; echo "$X {appr}" | grep -c a',
+            ):
+                with self.subTest(where=where.name, command=command):
+                    self.assertIsNone(b.decision("Bash", {"command": command}))
+
     def test_human_only_word_after_a_substitution(self):
         """Issue #26: a command substitution elsewhere does not turn the word into a call; a call stays denied
         wherever `piigate` runs (also in or after a substitution, built at run time, under a launcher)."""
