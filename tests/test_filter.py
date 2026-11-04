@@ -3975,6 +3975,153 @@ def sensors_mask(value: str) -> tuple[str, int]:
     return sensors.mask(value, CONFIG)
 
 
+class TestSqlScripts(unittest.TestCase):
+    """Issue #28: a .sql file without data records is code; a dump with data is still refused; identifiers of a SQL
+    script are not people or places, string literals are still filtered."""
+
+    SCRIPT = (
+        "-- anonymization of a local copy (synthetic)\n"
+        "SET FOREIGN_KEY_CHECKS = 0;\n"
+        "UPDATE wp_users SET user_email = CONCAT('user', ID, '@example.invalid'), display_name = 'Test User';\n"
+        "UPDATE wp_usermeta SET meta_value = 'Test' WHERE meta_key IN ('first_name', 'last_name');\n"
+        "UPDATE `wp_wc_order_addresses` SET `first_name` = 'Test', `address_1` = 'Test Street 1', `city` = 'Testville';\n"
+        "DELETE FROM wp_comments WHERE comment_author_email NOT LIKE '%@example.invalid';\n"
+        "TRUNCATE TABLE wp_woocommerce_sessions;\n"
+        "SET FOREIGN_KEY_CHECKS = 1;\n"
+    )
+
+    def dump(self, kind: str) -> str:
+        p = dt.PATIENTS[0]
+        row = f"({p['first_name']!r}, {p['surname']!r}, '{p['pesel']}')".replace('"', "'")
+        return {
+            "insert": f"CREATE TABLE patient (id int, name text);\nINSERT INTO patient VALUES {row};\n",
+            "insert_cols": f"INSERT INTO `patient` (`name`, `surname`, `pesel`) VALUES {row};\n",
+            "replace": f"REPLACE INTO patient VALUES {row};\n",
+            "insert_set": f"INSERT INTO patient SET name = '{p['surname']}';\n",
+            "copy": f"COPY patient (name, surname) FROM stdin;\n{p['first_name']}\t{p['surname']}\n\\.\n",
+            "mixed": self.SCRIPT + f"INSERT INTO patient VALUES {row};\n",
+            "commented": f"/* INSERT INTO patient VALUES {row} */\nSELECT 1;\n",
+            "line_commented": f"-- x\nUPDATE t SET a = 'x -- ' ; INSERT INTO patient VALUES {row};\n",
+        }[kind]
+
+    def test_script_or_dump(self):
+        from piigate import sql
+
+        ok = lambda data: sql.is_script(data, sql.SCRIPT_LIMIT, table._decode)  # noqa: E731
+        self.assertTrue(ok(self.SCRIPT.encode()))
+        self.assertTrue(ok(b"CREATE TABLE t (id int);\nALTER TABLE t ADD COLUMN x int;\nCOPY t (id) FROM stdin;\n\\.\n"))
+        for kind in ("insert", "insert_cols", "replace", "insert_set", "copy", "mixed", "commented", "line_commented"):
+            with self.subTest(kind):
+                self.assertFalse(ok(self.dump(kind).encode()))
+        # fail closed: too large, binary, compressed, not text
+        self.assertFalse(ok(self.SCRIPT.encode() + b" " * (sql.SCRIPT_LIMIT + 1)))
+        self.assertFalse(ok(b"UPDATE t SET a = 1;\0\1\2"))
+        self.assertFalse(ok(b"\x1f\x8b\x08\x00" + self.SCRIPT.encode()))
+        self.assertFalse(ok(b"PGDMP\x01\x0e" + self.SCRIPT.encode()))
+        self.assertFalse(ok(b""[:0] + bytes(range(128, 256)) * 4 + self.dump("insert").encode()))
+
+    def test_tools_read_a_script_but_not_a_dump(self):
+        script = FILES["eml"].parent / "anonymization.sql"
+        script.write_text(self.SCRIPT, encoding="utf-8")
+        result = files.describe_file(script, CONFIG, source="files")
+        self.assertIn("wp_users", result)
+        self.assertIn("user_email", result)
+        self.assertNotIn("PERSON_", result)
+        self.assertIn("wp_users", anonymization.document_text("anonymization.sql", script.read_bytes()))
+        if PRESIDIO:  # anonymize() runs the text filter, which needs the NER engine; the directory as in TestAnonymization
+            cfg = json.loads(json.dumps(CONFIG))
+            cfg["anonymization"]["directory"] = str(TMP / "anonymized")
+            w = anonymization.anonymize("anonymization.sql", script.read_bytes(), cfg)
+            copy = "\n".join(p.read_text(encoding="utf-8") for p in w.directory.iterdir())
+            self.assertIn("wp_users", copy)
+            self.assertNotIn("PERSON_", copy)
+            with self.assertRaisesRegex(FilterError, "database dump"):
+                anonymization.anonymize("x.sql", self.dump("insert").encode(), cfg)
+        for kind in ("insert", "copy", "mixed"):
+            with self.subTest(kind):
+                with self.assertRaisesRegex(FilterError, "database dump"):
+                    files.describe_data("x.sql", self.dump(kind).encode(), CONFIG, source="files")
+                with self.assertRaisesRegex(FilterError, "database dump"):
+                    anonymization.document_text("x.sql", self.dump(kind).encode())
+        with self.assertRaisesRegex(FilterError, "database dump"):
+            files.describe_data("x.dump", self.SCRIPT.encode(), CONFIG, source="files")  # .dump: always a dump
+
+    def test_identifiers_are_not_people_but_literals_are(self):
+        from piigate import rules, sql
+        from piigate.rules import Fragment
+
+        p = dt.PATIENTS[0]
+        script = f"UPDATE wp_users SET user_email = 'x@example.invalid', display_name = '{p['first_name']} {p['surname']}';\n"
+        found = [(script[f.start : f.end], f.type_) for f in rules.detect(script)]
+        self.assertIn((f"{p['first_name']} {p['surname']}", "PERSON"), found)  # the literal is still data
+        identifiers = "UPDATE wp_users SET user_login = 'a' WHERE user_email = 'b';\n"
+        # a NER hit on an identifier is dropped, on a literal kept; spanning both it is cut to the literal
+        ner = [Fragment(identifiers.index("wp_users"), identifiers.index("wp_users") + 8, "PERSON", 2),
+               Fragment(identifiers.index("'a'") + 1, identifiers.index("'a'") + 2, "PERSON", 2)]
+        kept = sql.drop_identifiers(identifiers, ner)
+        self.assertEqual([(identifiers[f.start : f.end]) for f in kept], ["a"])
+        span = Fragment(identifiers.index("user_login"), identifiers.index("'a'") + 3, "ADDRESS", 2)
+        self.assertEqual([identifiers[f.start : f.end] for f in sql.drop_identifiers(identifiers, [span])], ["'a'"])
+        # not a script (prose, or a statement of another shape) — nothing is dropped
+        prose = "Please UPDATE the records of Jan Kowalski; then SET them aside."
+        self.assertFalse(sql.looks_like_script(prose))
+        frag = [Fragment(prose.index("Jan"), prose.index("Jan") + 12, "PERSON", 2)]
+        self.assertEqual(sql.drop_identifiers(prose, frag), frag)
+        mixed = "UPDATE t SET a = 1;\nJan Kowalski mieszka tutaj;\n"
+        self.assertFalse(sql.looks_like_script(mixed))
+        # a weight-4 hit (pointed out by the local model) is never dropped
+        pointed = [Fragment(identifiers.index("wp_users"), identifiers.index("wp_users") + 8, "PERSON", 4)]
+        self.assertEqual(sql.drop_identifiers(identifiers, pointed), pointed)
+        # backslash escapes and quotes inside literals do not open a hole for data
+        tricky = "UPDATE t SET a = 'it\\'s " + p["surname"] + "', b = 'x';\n"
+        f2 = [Fragment(tricky.index(p["surname"]), tricky.index(p["surname"]) + len(p["surname"]), "PERSON", 2)]
+        self.assertEqual(sql.drop_identifiers(tricky, f2), f2)
+
+    @unittest.skipUnless(PRESIDIO, PRESIDIO_SKIP)
+    def test_text_filter_on_a_script(self):
+        result, counter = text.filter_text(self.SCRIPT, CONFIG)
+        for name in ("wp_users", "user_email", "wp_usermeta", "meta_key", "wp_wc_order_addresses", "FOREIGN_KEY_CHECKS"):
+            self.assertIn(name, result)
+        self.assertNotIn("PERSON", counter)
+        # a real person in a literal and a real address in a script are still masked
+        p = dt.PATIENTS[0]
+        script = self.SCRIPT + f"UPDATE wp_users SET display_name = '{p['first_name']} {p['surname']}', user_email = '{p['email']}';\n"
+        result, _ = text.filter_text(script, CONFIG)
+        self.assertEqual(leaks(result), [])
+        self.assertIn("wp_users", result)
+
+
+    def test_unclosed_quotes_cost_no_memory(self):
+        """An unclosed quote in a large text: linear time and no memory per character (a regex loop over single
+        characters kept ~285 MB per MB). Also the other patterns of the scripts / dumps decision."""
+        import time
+        import tracemalloc
+
+        from piigate import sql
+        from piigate.rules import Fragment
+
+        size = 8 * 1024 * 1024
+        cases = [("UPDATE t SET a = " + q + "x" * size) for q in ("'", "`", '"', "/*", "$$", "'\\")]
+        cases += ["COPY a " * 200_000, "/* " * 1_000_000, "INSERT INTO t SELECT x " * 100_000, "BEGIN" + " " * 3000 + "Jan"]
+        for case in cases:
+            for function in (sql.looks_like_script, sql.has_data_records, sql.data_spans):
+                with self.subTest(case[:20], function=function.__name__):
+                    tracemalloc.start()
+                    started = time.monotonic()
+                    function(case)
+                    seconds = time.monotonic() - started
+                    peak = tracemalloc.get_traced_memory()[1]
+                    tracemalloc.stop()
+                    self.assertLess(peak, 200 * 1024 * 1024, peak)  # the text itself is up to 8 MB
+                    self.assertLess(seconds, 20, seconds)
+        # an unclosed literal still counts as data: nothing after the quote is code
+        p = dt.PATIENTS[0]
+        unclosed = f"UPDATE t SET a = 'x;\nDelete this: {p['first_name']} {p['surname']}\n"
+        name = f"{p['first_name']} {p['surname']}"
+        found = Fragment(unclosed.index(name), unclosed.index(name) + len(name), "PERSON", 2)
+        self.assertEqual(sql.drop_identifiers(unclosed, [found]), [found])
+
+
 def tearDownModule():
     shutil.rmtree(TMP, ignore_errors=True)
 

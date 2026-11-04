@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
+from . import sql
+
 UPPER = "A-ZĄĆĘŁŃÓŚŹŻ"
 LOWER = "a-ząćęłńóśźż"
 WORD_CAPITALIZED = rf"[{UPPER}][{LOWER}]+(?:-[{UPPER}][{LOWER}]+)?"  # Kowalska, Nowak-Kowalska
@@ -387,7 +389,7 @@ def detect(text: str, *, dates: str = "all", drugs: bool = True) -> list[Fragmen
                 result.append(Fragment(m.start(1), m.end(1), "DRUG", 2))
 
     result += find_persons(text)
-    return result
+    return sql.drop_identifiers(text, result)  # table and column names of a SQL script are not people or places
 
 
 def find_persons(text: str) -> list[Fragment]:

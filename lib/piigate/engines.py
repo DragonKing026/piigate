@@ -16,7 +16,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from . import FilterError, engine_socket, rules
+from . import FilterError, engine_socket, rules, sql
 from .rules import Fragment
 
 PRESIDIO_TYPES = {
@@ -206,7 +206,7 @@ def presidio(text: str, cfg: dict) -> list[Fragment]:
                 if type_ == "PHONE" and re.search(r"[/A-Za-z]", value):
                     type_ = "NUMBER"  # FV/2026/10/123 is a document number, not a phone — still masked
                 result.append(Fragment(start, end, type_, weight))
-    return result
+    return sql.drop_identifiers(text, result)  # SQL script: names of tables and columns are not people or places
 
 
 def presidio_health(cfg: dict, timeout_s: float | None = None) -> str:

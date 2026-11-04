@@ -11,7 +11,7 @@ import tempfile
 from pathlib import Path
 from xml.etree import ElementTree as ET  # expat: no external entities
 
-from . import FilterError, config, table, text
+from . import FilterError, config, sql, table, text
 from .pseudonym_map import PseudonymMap
 
 TABULAR = {".csv", ".tsv", ".xlsx", ".xlsm", ".ods"}
@@ -124,7 +124,7 @@ def describe_data(
         raise FilterError("image — the filter does not show images (OCR is not supported); ask a human to describe it")
     if ext in (".xls", ".doc", ".msg", ".rtf"):
         raise FilterError(f"format {ext} is not supported — a human can save the file as XLSX/CSV/DOCX/EML")
-    if ext in (".sql", ".dump"):
+    if ext == ".dump" or (ext == ".sql" and not sql.is_script(data, sql.SCRIPT_LIMIT, table._decode)):
         raise FilterError("database dump — load it into a local database and view query results through `piigate table`")
     if ext in TABULAR:
         if ext in (".xlsx", ".xlsm"):

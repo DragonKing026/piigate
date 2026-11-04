@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import FilterError, config, project, rules
+from . import FilterError, config, project, rules, sql
 
 CLEAN, PERSONAL, UNKNOWN = "clean", "personal", "unknown"
 PHI = PERSONAL  # old name, still used by search.py
@@ -46,7 +46,7 @@ EXAMPLE_EMAIL_RE = re.compile(
 )
 DEFAULTS = {"enabled": True, "limit_mb": 10, "max_files": 50}
 MAX_ENTRIES = 5000
-_RULE_FILES = [Path(rules.__file__), Path(rules.__file__).with_name("first_names.txt"), Path(__file__)]
+_RULE_FILES = [Path(rules.__file__), Path(rules.__file__).with_name("first_names.txt"), Path(sql.__file__), Path(__file__)]
 
 
 @dataclass(frozen=True)
