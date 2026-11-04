@@ -314,6 +314,9 @@ through the full text filter.
   `sitecustomize.py`, `.vscode/tasks.json`, `.pre-commit-config.yaml`, a script run by a later call); inside one command,
   writing a script and running it is refused when the command names a sensitive path or builds the script from text
   assembled at run time (`printf '…%s…'`, `"$x"`).
+  A `cd` is followed to its directory when the target is literal, a pattern or brace list expanded on disk (up to 64 matches,
+  more is refused), or a variable assigned once in the line to a plain value; a target built any other way (a variable set
+  by a command, `printf -v`, a substitution) is not followed.
   The gate is a seat belt against mistakes and shortcuts, not a sandbox.
 - **The syntax-tree front-end (shadow mode only, not the gate).** A second Bash front-end, built on the syntax tree of the
   bundled `shfmt`, judges commands next to the gate in [shadow mode](#shadow-mode); it decides nothing. It reads the
