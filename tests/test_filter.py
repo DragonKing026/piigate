@@ -3320,6 +3320,29 @@ class TestContentNotNames(unittest.TestCase):
             with self.subTest(command):
                 self.assertIsNone(b.bash(command))
 
+    def test_o_means_the_commands_own_thing(self):
+        """Issue #29: `-o` is "only matching" for grep and a write to a file for the others; a long --output is a write."""
+        b = self.gate()
+        S = "~/Documents/piigate/Sensitive-data"
+        ssh = "ssh prod 'bin/console dbal:run-sql \"SELECT 1\"' 2>&1"
+        for flags in ("-o", "-oE", "-Eo", "-io", "-oP", "-ho", "-c -o"):
+            with self.subTest(flags):
+                self.assertIsNone(b.bash(f"grep {flags} 'foo' {S}/a.sql 2>&1 | grep -vc foo 2>&1 | piigate text"))
+                self.assertIsNone(b.bash(f"{ssh} | grep {flags} foo 2>&1 | piigate text"))
+        for command in (
+            f"{ssh} | grep --output=/tmp/x foo 2>&1 | piigate text",
+            f"{ssh} | iconv -o /tmp/x 2>&1 | piigate text",
+            f"{ssh} | markitdown -o /tmp/a.md 2>&1 | piigate text",
+            f"markitdown {S}/a.docx -o /tmp/a.md 2>&1 | piigate text",
+            f"{ssh} | cat -o /tmp/x 2>&1 | piigate text",
+            f"{ssh} | head -o /tmp/x 2>&1 | piigate text",
+            f"{ssh} | piigate text | sort -o /tmp/x",
+            f"{ssh} | piigate text | grep -o x > /tmp/y",
+            f"{ssh} | grep -o foo > /tmp/y 2>&1 | piigate text",
+        ):
+            with self.subTest(command):
+                self.assertIsNotNone(b.bash(command))
+
     def test_grep_directories_option(self):
         b = self.gate()
         for command in ("grep -d recurse x", "grep --directories=recurse x", "grep --directories recurse x", "grep -drecurse x", "grep -rd recurse x"):
