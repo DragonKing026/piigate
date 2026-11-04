@@ -257,8 +257,8 @@ PATTERNS: list[tuple[str, re.Pattern, int]] = [
     (
         "PHONE",
         re.compile(
-            r"(?<![\w+-])(?:(?:\+|00)48[\s-]?\d{3}[\s-]?\d{3}[\s-]?\d{3}|\d{3}[\s-]\d{3}[\s-]\d{3}"
-            r"|\(?\d{2}\)?[\s-]\d{3}[\s-]\d{2}[\s-]\d{2})(?![\w]|-\d)"
+            r"(?<![\w+-])(?:(?:\+|00)48[\s-]?\d{3}[\s-]?\d{3}[\s-]?\d{3}|\d{3}[ \t-]\d{3}[ \t-]\d{3}"
+            r"|\(?\d{2}\)?[ \t-]\d{3}[ \t-]\d{2}[ \t-]\d{2})(?![\w]|-\d)"
         ),
         2,
     ),
@@ -347,7 +347,7 @@ def _group(m: re.Match) -> tuple[int, int]:
 # four or more groups of three digits in one line, with one kind of separator, are a list of numbers (HTTP codes
 # `200 302 404 500`), not a phone; a line break never joins them (a column of phones), nor does a phone label
 NUMBER_LIST_RE = re.compile(r"(?<![\w+.-])\d{3}([ \t-])\d{3}(?:\1\d{3}){2,}(?!\w)")
-BARE_PHONE_RE = re.compile(r"\d{3}[\s-]\d{3}[\s-]\d{3}")
+BARE_PHONE_RE = re.compile(r"\d{3}[ \t-]\d{3}[ \t-]\d{3}")
 PHONE_LABEL_RE = re.compile(r"(?i)\b(?:tel|telefon\w*|kom|komórk\w*)\.?\s*[:.]?\s*$")
 
 

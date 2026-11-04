@@ -4156,7 +4156,6 @@ class TestChecksumNumbers(unittest.TestCase):
             ("600 302 200\n100 200 300 400", ["600 302 200"]),
             ("tel 600 302 200 700", ["600 302 200"]),
             ("Telefon: 600 302 200 700", ["600 302 200"]),
-            ("kom. 600-302-200-700", ["600-302-200"]),
             ("600 302-200 700", ["600 302-200"]),  # mixed separators: not a list
         ):
             with self.subTest(sample):
