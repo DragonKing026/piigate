@@ -3888,6 +3888,93 @@ class TestEmailVersions(unittest.TestCase):
         self.assertNotIn("firma.pl", out)
 
 
+class TestChecksumNumbers(unittest.TestCase):
+    """Issue #30: PESEL and card numbers are contiguous digits (or a printed card layout) that pass the checksum;
+    digit groups that merely stand next to each other or are joined in a file name are not one number."""
+
+    CARDS = ("4111111111111111", "4111 1111 1111 1111", "4111-1111-1111-1111", "5500 0000 0000 0004", "3782 822463 10005",
+             "378282246310005")
+
+    def kinds(self, value: str) -> set[str]:
+        from piigate import rules
+
+        return {f.type_ for f in rules.detect(value)}
+
+    def test_file_names_with_a_date_and_a_number(self):
+        """`compose.yaml.bak-20261023-046`: eleven digits split by a hyphen with a valid checksum by chance."""
+        from piigate import rules
+
+        self.assertNotIn("PESEL", self.kinds("compose.yaml.bak-20261023-046"))
+        self.assertEqual(verdict.check_text("compose.yaml.bak-20261023-046\n", CONFIG), {})
+        self.assertEqual(sensors_mask("compose.yaml.bak-20261023-046"), ("compose.yaml.bak-20261023-046", 0))
+        for day in (f"2026{m:02d}{d:02d}" for m in range(1, 13) for d in (1, 9, 23, 31)):  # every suffix of every date
+            for n in range(1000):
+                name = f"compose.yaml.bak-{day}-{n:03d}"
+                found = {f.type_ for f in rules.detect(name)} & {"PESEL", "CARD"}
+                self.assertFalse(found, name)
+                self.assertEqual(sensors_mask(name)[1], 0, name)
+        # separators next to digits in other identifiers
+        for name in ("dump_2026-10-23_046.sql", "backup 20261023 046", "id-20261023-046-x"):
+            self.assertNotIn("PESEL", self.kinds(name), name)
+
+    def test_http_codes_are_not_a_card(self):
+        """`curl -w '%{http_code} '` over a few addresses; 3125 combinations of five codes, none is a card."""
+        import itertools
+
+        for combo in itertools.product(("200", "301", "302", "404", "500"), repeat=5):
+            line = " ".join(combo)
+            self.assertNotIn("CARD", self.kinds(line), line)
+            self.assertEqual(sensors_mask(line), (line, 0), line)
+        self.assertEqual(sensors_mask("200 302 200 200 200"), ("200 302 200 200 200", 0))
+
+    def test_cards_are_still_found(self):
+        for number in self.CARDS:
+            with self.subTest(number):
+                self.assertIn("CARD", self.kinds(f"karta {number}, ważna do 12/29"))
+                self.assertEqual(verdict.check_text(f"karta {number}.", CONFIG), {"CARD": 1})
+                masked, n = sensors_mask(f"Karta {number} ok")
+                self.assertEqual((masked, n), ("Karta [CARD hidden by piigate] ok", 1))
+        # a card followed by other numbers: the card goes, the rest stays
+        self.assertEqual(sensors_mask("4111 1111 1111 1111 200 302"), ("[CARD hidden by piigate] 200 302", 1))
+        # the checksum still decides
+        for number in ("4111 1111 1111 1112", "4111111111111112", "4111-1111-1111-1112"):
+            self.assertNotIn("CARD", self.kinds(number), number)
+            self.assertEqual(sensors_mask(number)[1], 0, number)
+
+    def test_pesel_is_still_found(self):
+        for p in dt.PATIENTS:
+            number = p["pesel"]
+            with self.subTest(number):
+                for template in ("{}", "PESEL: {}", "pesel={}", "({}),", "nr {}.", "x-{}-y", "{}\n"):
+                    value = template.format(number)
+                    self.assertIn("PESEL", self.kinds(value), value)
+                self.assertEqual(verdict.check_text(f"PESEL {number}", CONFIG), {"PESEL": 1})
+                self.assertEqual(sensors_mask(f"PESEL {number}"), ("PESEL [PESEL hidden by piigate]", 1))
+                # a label allows the usual separators; without it separated groups are not a number
+                spaced = f"{number[:6]} {number[6:]}"
+                self.assertIn("PESEL", self.kinds(f"PESEL: {spaced}"))
+                self.assertIn("PESEL", self.kinds(f"Nr PESEL {number[:6]}-{number[6:]}"))
+                self.assertNotIn("PESEL", self.kinds(f"kod {spaced}"))
+        # eleven digits without a valid checksum stay a (weaker) personal number
+        self.assertEqual(self.kinds("12345678901"), {"NUMBER"})
+
+    @unittest.skipUnless(PRESIDIO, PRESIDIO_SKIP)
+    def test_text_filter(self):
+        p = dt.PATIENTS[0]
+        result, _ = text.filter_text(f"{p['pesel']} i plik compose.yaml.bak-20261023-046, kody 200 302 200 200 200", CONFIG)
+        self.assertNotIn(p["pesel"], result)
+        self.assertIn("compose.yaml.bak-20261023-046", result)
+        self.assertNotIn("CARD_", result)
+        result, _ = text.filter_text("karta 4111 1111 1111 1111", CONFIG)
+        self.assertNotIn("4111", result)
+
+
+def sensors_mask(value: str) -> tuple[str, int]:
+    from piigate import sensors
+
+    return sensors.mask(value, CONFIG)
+
+
 def tearDownModule():
     shutil.rmtree(TMP, ignore_errors=True)
 

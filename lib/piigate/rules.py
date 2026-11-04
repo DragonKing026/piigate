@@ -274,7 +274,16 @@ REGON_RE = re.compile(r"(?i)\bREGON\s*[:.]?\s*(\d{9}(?:\d{5})?)\b")
 KRS_RE = re.compile(r"(?i)\bKRS\s*[:.]?\s*(?:nr\.?\s*)?(\d{10})\b")
 # IPv6: candidate with ≥ 2 colons and a digit, then validation (time 12:45:30, MAC, `std::x` are rejected)
 IPV6_RE = re.compile(r"(?<![\w:.])(?=[0-9A-Fa-f:]*\d)(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?![\w:])")
-DIGITS_RE = re.compile(r"(?<![\d])\d[\d -]{9,22}\d(?![\d])")
+# PESEL: eleven contiguous digits. Digit groups joined by spaces or hyphens are not one number (`bak-20261023-046`
+# holds eleven digits split by a hyphen); with a "PESEL" label the usual separators are tolerated.
+PESEL_RE = re.compile(r"(?<!\d)\d{11}(?!\d)")
+PESEL_LABELLED_RE = re.compile(r"(?i)\bpesel\b[^\d\n]{0,15}(\d(?:[ -]?\d){10})(?!\d)")
+# payment card: 13-19 contiguous digits, or the printed layouts 4-4-4-4 and 4-6-5 / 4-6-4 (Amex, Diners) with one
+# kind of separator; numbers that merely sit next to each other (HTTP codes `200 302 200 200 200`) are not one card
+CARD_RE = re.compile(
+    r"(?<!\d)\d{13,19}(?!\d)"
+    r"|(?<!\w)(?<!\w-)(?:\d{4}([ -])\d{4}\1\d{4}\1\d{4}|\d{4}([ -])\d{6}\2\d{4,5})(?!\w|-\w)"
+)
 WORD_RE = re.compile(rf"{NAME}")
 # capital letters glued to a name and not starting another capitalized word (MariaDB, JanSQL — unlike JanKowalski)
 ACRONYM_TAIL = re.compile(rf"[{UPPER}]+(?![{LOWER}])")
@@ -348,15 +357,17 @@ def detect(text: str, *, dates: str = "all", drugs: bool = True) -> list[Fragmen
                 continue
             result.append(Fragment(s, k, type_, weight))
 
-    for m in DIGITS_RE.finditer(text):  # PESEL, NIP, cards — by checksum
-        digits = re.sub(r"\D", "", m.group())
-        if pesel_valid(digits):
+    for m in PESEL_RE.finditer(text):  # PESEL, cards — by checksum
+        if pesel_valid(m.group()):
             result.append(Fragment(m.start(), m.end(), "PESEL", 3))
-        elif luhn_valid(digits):
-            result.append(Fragment(m.start(), m.end(), "CARD", 3))
-    for m in re.finditer(r"(?<!\d)\d{11}(?!\d)", text):
-        if not pesel_valid(m.group()):  # 11 digits without a valid checksum — still a personal number
+        else:  # 11 digits without a valid checksum — still a personal number
             result.append(Fragment(m.start(), m.end(), "NUMBER", 2))
+    for m in PESEL_LABELLED_RE.finditer(text):
+        if not PESEL_RE.fullmatch(m.group(1)) and pesel_valid(re.sub(r"\D", "", m.group(1))):
+            result.append(Fragment(m.start(1), m.end(1), "PESEL", 3))
+    for m in CARD_RE.finditer(text):
+        if luhn_valid(re.sub(r"\D", "", m.group())):
+            result.append(Fragment(m.start(), m.end(), "CARD", 3))
     for m in NIP_RE.finditer(text):
         if nip_valid(re.sub(r"\D", "", m.group())):
             result.append(Fragment(m.start(), m.end(), "NIP", 3))

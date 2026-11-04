@@ -9,7 +9,6 @@ import re
 
 from . import project, rules
 
-DIGITS_RE = re.compile(r"(?<![\d])\d[\d -]{9,30}\d(?![\d])")
 ACCOUNT_RE = re.compile(r"\b(?:PL\s?)?\d{2}(?:[ ]?\d{4}){6}\b")
 
 
@@ -24,12 +23,16 @@ def mask(text: str, cfg: dict) -> tuple[str, int]:
             return "[ACCOUNT hidden by piigate]"
         return m.group()
 
-    def digits(m: re.Match) -> str:
+    def pesel(m: re.Match) -> str:
         nonlocal counter
-        s = re.sub(r"\D", "", m.group())
-        if c.get("pesel", True) and len(s) == 11 and rules.pesel_valid(s) and re.fullmatch(r"\d{11}", m.group()):
+        if c.get("pesel", True) and rules.pesel_valid(m.group()):
             counter += 1
             return "[PESEL hidden by piigate]"
+        return m.group()
+
+    def card(m: re.Match) -> str:
+        nonlocal counter
+        s = re.sub(r"\D", "", m.group())
         if c.get("card", True) and rules.luhn_valid(s) and len(s) >= 15 and not s.startswith("0"):
             counter += 1
             return "[CARD hidden by piigate]"
@@ -45,5 +48,6 @@ def mask(text: str, cfg: dict) -> tuple[str, int]:
         counter += 1
     if c.get("account", True):
         text = ACCOUNT_RE.sub(account, text)
-    text = DIGITS_RE.sub(digits, text)
+    text = rules.PESEL_RE.sub(pesel, text)
+    text = rules.CARD_RE.sub(card, text)
     return text, counter
