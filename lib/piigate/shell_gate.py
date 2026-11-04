@@ -92,6 +92,10 @@ class AstGate(gate.Gate):
         names = {os.path.basename(w.text) for w in (first, *words[:1]) if w.static}
         return bool(names & LAUNCHERS) or bool(c.stdin_interpreter and c.stdin_interpreter in SHELLS)
 
+    @staticmethod
+    def _body_words(text: str) -> list[str]:
+        return gate.Gate._tokens(text) or text.split()
+
     def _file_writer(self, c: shell.Call) -> list[str] | None:
         """Names a heredoc is written to (`cat > f <<EOF`, `tee f <<EOF`) or [] for a commit message (`git commit -F -`);
         None when the heredoc is stdin data of something else."""
@@ -116,7 +120,7 @@ class AstGate(gate.Gate):
         calls = shell.parse(command, cwd=self.cwd, dialect=self.dialect)
         # bodies of heredocs read by a shell or launcher are code: parsed like the command itself
         bodies: list[_Body] = []
-        launcher_words: list[list[str]] = []
+        text_bodies: list[str] = []  # stdin text of a non-shell: not shell code, so it has no tree
         for c in list(calls):
             for r in c.redirects:
                 if r.heredoc is None or r.inherited:
@@ -131,10 +135,12 @@ class AstGate(gate.Gate):
                         bodies.append(_Body(h.body, h.quoted, True, False))
                     else:  # a launcher (xargs, find, env…) or no command: its words are what the body holds
                         bodies.append(_Body(h.body, h.quoted, True, False))
-                        launcher_words.append(h.body.split())
+                        text_bodies.append(h.body)
                 else:
                     stripped = self._file_writer(c) is not None
                     bodies.append(_Body(h.body, h.quoted, False, stripped))
+                    if not stripped:
+                        text_bodies.append(h.body)
         top = shell._toplevel(calls)
         groups: list[tuple[list[str], shell.Call | None, str]] = []
         pending: list[shell.Call] = []
@@ -150,9 +156,6 @@ class AstGate(gate.Gate):
             groups.append((self._call_tokens(c), c, "|" if c.piped_in else ";"))
             pending.extend(self._descend(c))
         flush()
-        for words in launcher_words:  # the old tokenizer saw the words of such a body as one more stage
-            if words:
-                groups.append((words, None, ";"))
         tokens: list[str] = []
         stage_calls: list[shell.Call | None] = []
         previous: shell.Call | None = None
@@ -164,6 +167,16 @@ class AstGate(gate.Gate):
             tokens += toks
             stage_calls.append(c)
             previous = c
+        # A text body is data, not shell: it is cut into words by the same tokenizer as before (quotes, punctuation) —
+        # the only place where the old tokenizer is still used. Its words are judged as stages (a path in a script the
+        # model feeds to python is a path), with no command attached.
+        for body in text_bodies:
+            words = self._body_words(body)
+            if words:
+                if tokens:
+                    tokens.append(";")
+                tokens += words
+                stage_calls += [None] * len(self._stages_loose(words))
         if previous is not None and previous.background:
             tokens.append("&")
         # text view for the checks that look for a word in the whole line (heredoc bodies written to a file left out)
@@ -243,8 +256,8 @@ class AstGate(gate.Gate):
             return p.view, set(), set(), ""
         body = "\n".join(b.text for b in texts)
         rest = set(p.tokens)
-        inner = set(body.split())
-        expanded = {w for b in texts if not b.quoted for w in b.text.split()}
+        inner = set(self._body_words(body))
+        expanded = {w for b in texts if not b.quoted for w in self._body_words(b.text)}
         return p.view, inner - rest, inner - rest - expanded, body
 
     def _stage_dirs(self, command: str, tokens: list[str]) -> list[list[str]]:
