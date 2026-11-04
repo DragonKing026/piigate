@@ -3708,6 +3708,105 @@ class TestHumanApproval(unittest.TestCase):
         self.assertEqual((w.returncode, w.stdout), (1, ""))
 
 
+class TestLineSafety(unittest.TestCase):
+    """Issue #25: the text filter never changes the number of lines, ISO timestamps and versions are not data, and
+    real dates stay masked."""
+
+    def lines_equal(self, source: str, **kw) -> str:
+        result, _ = text.filter_text(source, CONFIG, **kw)
+        self.assertEqual(result.count("\n"), source.count("\n"), result)
+        return result
+
+    def test_neighbouring_hits_on_neighbouring_lines_stay_separate(self):
+        from piigate.rules import Fragment
+
+        source = "\n".join(["wiersz jeden", "wiersz dwa", "wiersz trzy", "wiersz jeden", "2026-11-02", "2026-11-03", "koniec"])
+        result, counter = text.filter_text(source, CONFIG, rules_only=True)
+        self.assertEqual(len(result.splitlines()), 7, result)
+        self.assertEqual(counter, {"DATE": 2})
+        for type_ in ("EMAIL", "ADDRESS", "IP", "NUMBER"):  # the glue was shared by every non-person type
+            with self.subTest(type_):
+                merged = text._merge([Fragment(0, 3, type_), Fragment(4, 7, type_)], "abc\ndef")
+                self.assertEqual(len(merged), 2)
+        # a hit that spans lines (NER does that) keeps its line breaks
+        result, _ = text.filter_text("Jan\nKowalski\nkoniec", CONFIG, rules_only=True, extra=[Fragment(0, 12, "PERSON", 4)])
+        self.assertEqual(result.count("\n"), 2, result)
+        self.assertNotIn("Kowalski", result)
+
+    @unittest.skipUnless(PRESIDIO, PRESIDIO_SKIP)
+    def test_repro_from_the_issue_with_presidio(self):
+        source = "\n".join(["wiersz jeden", "wiersz dwa", "wiersz trzy", "wiersz jeden", "2026-11-02", "2026-11-03", "koniec"])
+        result = self.lines_equal(source)
+        self.assertEqual(len(re.findall(r"DATE_\d+", result)), 2, result)
+
+    @unittest.skipUnless(PRESIDIO, PRESIDIO_SKIP)
+    def test_timestamps_with_a_time_are_not_dates(self):
+        for stamp in ("2026-11-02T20:11:01Z", "2026-11-02T20:11:01.123+01:00", "2026-11-02T20:11", "2026-11-02 20:11:01"):
+            with self.subTest(stamp):
+                self.assertEqual(self.lines_equal(f"pushed_at\t{stamp}\tdone"), f"pushed_at\t{stamp}\tdone")
+        # dates stay dates: alone, in a sentence, and as a date exported with the time 00:00
+        for value in ("2026-11-02", "14.05.1944", "1990-05-14T00:00:00Z", "1990-05-14 00:00:00"):
+            with self.subTest(value):
+                result = self.lines_equal(f"ur. {value} w Warszawie")
+                self.assertIn("DATE_", result)
+                self.assertNotIn(value, result)
+
+    def test_timestamp_spans(self):
+        from piigate import rules
+
+        for stamp in ("2026-11-02T20:11:01Z", "2026-11-02T20:11:01.5-05:00", "2026-11-02 20:11:01", "2026-11-02T20:11"):
+            self.assertEqual(rules.timestamp_spans(f"x {stamp} y"), [(2, 2 + len(stamp))], stamp)
+        for value in ("2026-11-02", "2026-11-02T00:00:00Z", "2026-11-02T00:00", "2026-11-02 00:00:00.000", "2026-11-02 20:11"):
+            self.assertEqual(rules.timestamp_spans(f"x {value} y"), [], value)
+
+    def test_hits_never_cut_a_version(self):
+        from piigate import rules
+
+        text_ = "a\tv0.5.1\tb 1.80.0 c 5.5.90 d"
+        v, n, dd = text_.index("v0"), text_.index("1.80"), text_.index("5.5.90")
+        self.assertIsNone(rules.fit_to_tokens(text_, v, v + 2))  # "v0" of v0.5.1
+        self.assertIsNone(rules.fit_to_tokens(text_, n + 2, n + 5))  # "80." of 1.80.0
+        self.assertIsNone(rules.fit_to_tokens(text_, n, n + 2))  # "1." of 1.80.0
+        self.assertEqual(rules.fit_to_tokens(text_, v, v + 6), (v, v + 6))  # the whole token: unchanged
+        self.assertEqual(rules.fit_to_tokens(text_, 0, 1), (0, 1))  # no token
+        # a number that can be a date, cut by NER: the whole token is the hit (fail closed)
+        self.assertEqual(rules.fit_to_tokens(text_, dd, dd + 4), (dd, dd + 6))
+        self.assertEqual(rules.fit_to_tokens(text_, dd + 2, dd + 6), (dd, dd + 6))
+
+    @unittest.skipUnless(PRESIDIO, PRESIDIO_SKIP)
+    def test_versions_in_tables_stay_intact(self):
+        source = "\n".join(
+            [
+                "cli/cli\t2026-11-02T10:00:00Z\tv2.60.0",
+                "rust-lang/rust\t2026-11-01T10:00:00Z\t1.80.0",
+                "foo/bar\t2026-10-30T10:00:00Z\tv0.5.1",
+                "open-wc/open-wc\t2026-10-30T10:00:00Z\teslint-plugin-lit-a11y-5.1.3",
+            ]
+        )
+        self.assertEqual(self.lines_equal(source), source)
+
+    @unittest.skipUnless(PRESIDIO, PRESIDIO_SKIP)
+    def test_collective_gh_output_passes_by_detection_alone(self):
+        """Synthetic output of a loop over public repos: tags, versions, timestamps — nothing to hide."""
+        rows = [
+            f"org{i}/repo{i}\t2026-10-{i + 1:02d}T0{i}:11:01Z\tv0.{i}.1\t{name}-{i}.2.3-next.{i}\tmodule/v7-v7.13.{i}"
+            for i, name in enumerate(("eslint-plugin-lit-a11y", "pkg", "@scope/pkg"), 1)
+        ]
+        source = "\n".join(rows)
+        self.assertEqual(self.lines_equal(source), source)
+        self.assertEqual(verdict.check_text(source, CONFIG), {})
+
+    @unittest.skipUnless(PRESIDIO, PRESIDIO_SKIP)
+    def test_real_data_is_still_found_among_versions(self):
+        p = dt.PATIENTS[0]
+        source = f"v0.5.1\t2026-11-02T20:11:01Z\n{p['first_name']} {p['surname']}\t{p['phone']}\t{p['pesel']}\njan.kowalski@firma.pl\t1.80.0"
+        result = self.lines_equal(source)
+        self.assertEqual(leaks(result), [])
+        self.assertNotIn("kowalski@firma", result)
+        self.assertIn("v0.5.1", result)
+        self.assertIn("1.80.0", result)
+
+
 def tearDownModule():
     shutil.rmtree(TMP, ignore_errors=True)
 

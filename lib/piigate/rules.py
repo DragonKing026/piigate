@@ -280,6 +280,42 @@ WORD_RE = re.compile(rf"{NAME}")
 ACRONYM_TAIL = re.compile(rf"[{UPPER}]+(?![{LOWER}])")
 
 
+# ISO 8601 / RFC 3339 timestamps (2026-11-02T20:11:01Z, 2026-11-02 20:11:01+01:00): a technical value (release time,
+# log line), not a birth date. A date with the time 00:00 is how databases export a plain date — that stays a date.
+TIMESTAMP_RE = re.compile(
+    r"(?<![\w.-])(?:19|20)\d{2}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2}(?:[.,]\d+)?)?|\s\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)"
+    r"(?:Z|[+-]\d{2}(?::?\d{2})?)?(?![\w:])"
+)
+
+
+def timestamp_spans(text: str) -> list[tuple[int, int]]:
+    """Spans of timestamps with a real time of day (see TIMESTAMP_RE)."""
+    return [
+        (m.start(), m.end())
+        for m in TIMESTAMP_RE.finditer(text)
+        if re.search(r"[1-9]", re.sub(r"[Z+-]\d{2}(?::?\d{2})?$|^.{10}", "", m.group()))
+    ]
+
+
+# a dotted number (`v0.5.1`, `1.80.0`, `1.2.3-next.4`): NER sometimes tags a piece of it ("v0", "80.") and the pseudonym
+# would cut the token (`ORG_5.5.1`, `1.DATE_7.0`)
+VERSION_TOKEN_RE = re.compile(r"(?<![\w.])v?\d+(?:\.\d+)+(?:[-+][\w.]+)?(?![\w])")
+_DATE_LIKE_RE = re.compile(r"(\d{1,2})\.(\d{1,2})\.(?:\d{2}|\d{4})")
+
+
+def fit_to_tokens(text: str, start: int, end: int) -> tuple[int, int] | None:
+    """A NER hit that begins or ends inside a dotted number: a number that can be a date (5.5.90) — the whole token
+    (fail closed); anything else (a version) — None, the hit is dropped. A hit that does not cut a token: unchanged."""
+    for m in VERSION_TOKEN_RE.finditer(text, max(0, start - 128), min(len(text), end + 128)):
+        if m.end() <= start or end <= m.start() or (start <= m.start() and m.end() <= end):
+            continue
+        d = _DATE_LIKE_RE.fullmatch(m.group())
+        if d and int(d.group(1)) <= 31 and int(d.group(2)) <= 12:
+            return min(start, m.start()), max(end, m.end())
+        return None
+    return start, end
+
+
 def _group(m: re.Match) -> tuple[int, int]:
     return (m.start(1), m.end(1)) if m.re.groups and m.group(1) else (m.start(), m.end())
 
