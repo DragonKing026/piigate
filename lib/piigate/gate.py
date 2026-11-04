@@ -53,27 +53,12 @@ LAUNCHERS = {
     "find", "fd", "watch", "flock", "script", "unbuffer", "alias", "function", "export", "declare", "typeset",
     "local", "readonly", "trap",
 }
-NO_COMMAND_LAUNCHERS = {"export", "declare", "typeset", "local", "readonly", "alias", "function"}  # arguments are data
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "fish"}
 # launchers followed directly by the command and its own arguments (`timeout 60 tool --dir X`): the arguments are known
 DIRECT_LAUNCHERS = {
     "exec", "command", "builtin", "env", "sudo", "doas", "nohup", "setsid", "time", "timeout", "nice", "ionice",
     "stdbuf", "chrt", "taskset", "unbuffer",
 }
-# value-taking options of launchers (their value is not the command), launchers whose arguments are code, interpreters
-LAUNCHER_VALUE_OPTIONS = {
-    "env": {"-u", "-C", "-S", "--unset", "--chdir", "--split-string"},
-    "sudo": {"-u", "-g", "-h", "-p", "-C", "-D", "-R", "-T", "-U", "-r", "-t"}, "doas": {"-u", "-C"},
-    "nice": {"-n", "--adjustment"}, "ionice": {"-c", "-n", "-p", "-P", "-u"}, "timeout": {"-s", "-k", "--signal", "--kill-after"},
-    "stdbuf": {"-i", "-o", "-e"}, "taskset": {"-c"}, "chrt": set(), "flock": {"-w", "-E"}, "time": {"-f", "-o"},
-    "ssh": {"-p", "-i", "-l", "-o", "-F", "-J", "-L", "-R", "-D", "-b", "-c", "-E", "-e", "-I", "-m", "-O", "-S", "-W", "-w"},
-}
-UNWRAP_LAUNCHERS = {"exec", "sudo", "doas", "command", "env", "nice", "nohup", "time", "timeout", "setsid", "stdbuf", "ionice"}
-CURL_DATA_OPTIONS = {"-d", "--data", "--data-binary", "--data-raw", "--data-urlencode", "--data-ascii", "-F", "--form"}
-CODE_LAUNCHERS = {"parallel", "watch", "script", "trap"}  # their arguments are code
-INTERPRETER = re.compile(r"(?:python|pypy)[\d.]*|node|nodejs|perl|ruby|php")
-INLINE_FLAGS = {"python": r"-[A-Za-z]*c", "pypy": r"-[A-Za-z]*c", "node": r"-[A-Za-z]*[ep]|--eval|--print", "nodejs": r"-[A-Za-z]*[ep]|--eval|--print",
-                "perl": r"-[A-Za-z]*[eE]", "ruby": r"-[A-Za-z]*e", "php": r"-[A-Za-z]*r"}
 SHELL_KEYWORDS = {"{", "}", "!", "if", "then", "elif", "else", "fi", "do", "done", "while", "until", "for", "case"}
 # commands that never run what they are given (a file written earlier in the same command may be their argument)
 NON_RUNNING = {"ls", "rm", "stat", "mv", "cp", "touch", "mkdir", "chmod", "diff", "echo", "printf", "true", "test", "["}
@@ -202,29 +187,6 @@ def ssh_valid(arguments: list[str]) -> bool:
     return True
 
 
-# commands that read the files named by their operands (and what `xargs` runs): an operand built by a substitution is a
-# path the gate cannot know
-READERS = {
-    "cat", "tac", "head", "tail", "less", "more", "bat", "batcat", "wc", "sort", "uniq", "cut", "sed", "awk", "gawk", "nl",
-    "od", "xxd", "hexdump", "strings", "jq", "yq", "mlr", "column", "fold", "fmt", "rev", "paste", "join", "comm", "diff",
-    "cmp", "md5sum", "sha1sum", "sha256sum", "sha512sum", "b2sum", "cksum", "grep", "egrep", "fgrep", "zgrep", "rg", "rga",
-    "ag", "ack", "tar", "zip", "unzip", "gzip", "gunzip", "zcat", "bzcat", "xzcat", "cp", "mv", "install", "rsync", "scp",
-    "source", ".", "python", "python3", "node", "ruby", "perl", "php", "bash", "sh", "zsh", "sqlite3", "duckdb",
-    "base64", "shuf", "expand", "unexpand", "pr",
-}
-PATTERN_FIRST = {"grep", "egrep", "fgrep", "zgrep", "rg", "rga", "ag", "ack", "sed", "awk", "gawk", "jq", "yq"}  # 1st operand: pattern/program
-# options whose value is the next word and is not a path (a count, a pattern, a separator)
-VALUE_OPTIONS = {
-    "head": {"-n", "-c"}, "tail": {"-n", "-c"}, "sort": {"-k", "-t"}, "cut": {"-d", "-f", "-c"}, "uniq": {"-f", "-s", "-w"},
-    "sed": {"-e"}, "awk": {"-F", "-v"}, "gawk": {"-F", "-v"}, "jq": {"--arg", "--argjson"},
-    "base64": {"-w", "--wrap"}, "shuf": {"-n", "-i", "-o", "--head-count", "--input-range", "--output", "--random-source"},
-    "expand": {"-t", "--tabs"}, "unexpand": {"-t", "--tabs"}, "pr": {"-h", "-l", "-w", "-o", "-s", "-e", "-i", "-n", "-N"},
-    **{c: {"-e", "-m", "-A", "-B", "-C"} for c in ("grep", "egrep", "fgrep", "zgrep", "rg", "rga", "ag", "ack")},
-}
-XARGS_WITH_VALUE = {"-I", "-n", "-P", "-L", "-s", "-d", "-E", "-a", "--max-args", "--max-procs", "--max-lines", "--delimiter"}
-LAUNCHER_VALUE_OPTIONS["xargs"] = XARGS_WITH_VALUE
-UNVETTABLE = "a script written from text built at run time and then run in the same command"
-COMPUTED = "a file operand built by a command substitution or by xargs"
 PDFTOTEXT_WITH_VALUE = {"-f", "-l", "-r", "-x", "-y", "-W", "-H", "-enc", "-eol", "-opw", "-upw", "-fixed", "-margin"}
 OUTPUT_OPTIONS = re.compile(r"^(?:-o|-O|--output(?:=.*)?|--out(?:=.*)?|-o.+|--output-file(?:=.*)?)$")
 SEARCHERS = {
@@ -980,64 +942,20 @@ class Gate:
                     return True
         return False
 
-    @staticmethod
-    def _heredocs(tokens: list[str]) -> list[tuple[bool, list[str]]]:
-        """Heredocs in a token list: (the delimiter is quoted, the body's tokens). The body is literal text when quoted."""
-        result: list[tuple[bool, list[str]]] = []
-        pending: list[tuple[str, bool]] = []
-        k = 0
-        while k < len(tokens):
-            t = tokens[k]
-            if t in ("<<", "<<-") and k + 1 < len(tokens):
-                pending.append((str(tokens[k + 1]), bool(getattr(tokens[k + 1], "quote", ""))))
-                k += 2
-                continue
-            if t == "\n" and pending:
-                delimiter, quoted = pending.pop(0)
-                body: list[str] = []
-                j, line = k + 1, []
-                while j < len(tokens):
-                    if tokens[j] == "\n":
-                        if line == [delimiter]:
-                            break
-                        body += [*line, "\n"]
-                        line = []
-                    else:
-                        line.append(tokens[j])
-                    j += 1
-                result.append((quoted, body))
-                k = j
-                continue
-            k += 1
-        return result
-
     def _unvettable_script(self, tokens: list[str]) -> bool:
         """A file is written from text that the gate cannot read as a literal (`printf '…%s…' x > s.sh`, `echo "$x" >
-        s.sh`, an unquoted heredoc with `$`) and a later stage may run it: the written code can name a sensitive path
-        built at run time. A quoted heredoc is literal text, judged by its body like any other stage; then the written
-        file's name may be a variable too (#27) — without a heredoc the name counts as before."""
+        s.sh`) and a later stage may run it: the written code can name a sensitive path built at run time."""
         stages, writes, _ = self._script_stages(tokens)
         if not writes:
             return False
         first = min(k for k, _, _ in writes)
         if all(self._safe_stage(core) for core in stages[first + 1 :]):
             return False
-        heredocs = self._heredocs(tokens)
         for k, _, target in writes:
             core = stages[k]
             scripty = re.search(r"\.(?:sh|bash|zsh|ksh|fish|py|pl|rb|js|php|mk)$", target) or "." not in os.path.basename(target)
-            if not (scripty and core[0] in ("echo", "printf", "cat", "tee")):
-                continue
-            if any("<<" in t and set(t) <= {"<", "-"} for t in core) and heredocs:
-                if any(not quoted and any(re.search(r"[$`]", w) for w in body) for quoted, body in heredocs):
-                    return True
-                skip = {i for kk, i, _ in writes if kk == k}  # the redirect target: not text that is written
-            else:
-                skip = set()
-            if any(
-                ("%" in t and core[0] == "printf") or (re.search(r"\$", t) and not getattr(t, "single", False))
-                for i, t in enumerate(core[1:], 1)
-                if i not in skip
+            if scripty and core[0] in ("echo", "printf", "cat", "tee") and any(
+                ("%" in t and core[0] == "printf") or (re.search(r"\$", t) and not getattr(t, "single", False)) for t in core[1:]
             ):
                 return True
         return False
@@ -1555,11 +1473,6 @@ class Gate:
     def _substitutions(text: str) -> list[str]:
         """Contents of $(…), <(…), >(…) and `…` that the shell runs: unquoted or in double quotes, never inside single
         quotes (#23: a single-quoted word is literal — its backticks and `$(` are text)."""
-        return [inner for _, _, inner in Gate._substitution_spans(text)]
-
-    @staticmethod
-    def _substitution_spans(text: str) -> list[tuple[int, int, str]]:
-        """The outermost substitutions of `_substitutions` as (start, end, contents) positions in the text."""
         result, i, single, double = [], 0, False, False
         while i < len(text):
             z = text[i]
@@ -1574,14 +1487,14 @@ class Gate:
             elif z == "`":
                 j = text.find("`", i + 1)
                 j = len(text) if j < 0 else j
-                result.append((i, j + 1, text[i + 1 : j]))
+                result.append(text[i + 1 : j])
                 i = j
             elif (z == "$" or (z in "<>" and not double)) and text[i + 1 : i + 2] == "(":
                 depth, j = 1, i + 2
                 while j < len(text) and depth:
                     depth += {"(": 1, ")": -1}.get(text[j], 0)
                     j += 1
-                result.append((i, j, text[i + 2 : j - 1]))
+                result.append(text[i + 2 : j - 1])
                 i = j - 1
             i += 1
         return result
@@ -2197,9 +2110,7 @@ class Gate:
                     if hit := next((t for t in targets if SEEDING.search(t)), None):
                         kinds.setdefault("sensitive", f"{hit} (a file that runs later, in a command naming a sensitive path)")
         if self._unvettable_script(tokens):
-            kinds.setdefault("sensitive", UNVETTABLE)
-        if self._computed_operand(command):
-            kinds.setdefault("sensitive", COMPUTED)
+            kinds.setdefault("sensitive", "a script written from text built at run time and then run in the same command")
         paths_text = self._marker_text(tokens, text)
         for z in self.markers:
             if z in paths_text:
@@ -2716,9 +2627,7 @@ class Gate:
                 continue
             flat = _flat(command)
             standalone = re.search(r"(?<![\w./-])piigate(?![\w.-])", flat)
-            # the program that runs may be built at run time: a substitution, backticks or `${…}` as the command word (or
-            # as the command given to a launcher), eval — not a substitution somewhere else (`X=$(date); echo "$X"`)
-            suspicious = tokens is None or re.search(r"\beval\b", command) or self._dynamic_command(command, word) or (
+            suspicious = tokens is None or re.search(r"\$\(|`|<\(|\$\{|\beval\b", command) or (
                 standalone and "$" in command
             )
             prefix = r"(?:project['\",\s]+)?" if word == "approve" else ""
@@ -2738,299 +2647,6 @@ class Gate:
                     "Show the human the command to run."
                 )
         return None
-
-    @staticmethod
-    def _launched_index(stage: list[str], k: int) -> int | None:
-        """Index of the command word that the launcher at `stage[k]` runs (after its options, their values, assignments
-        and positional arguments such as the duration of `timeout` or the host of `ssh`); None when it runs nothing."""
-        name = Path(stage[k]).name
-        values = LAUNCHER_VALUE_OPTIONS.get(name, set())
-        counted = 1 if name in ("flock", "ssh") else 0
-        j = k + 1
-        while j < len(stage):
-            t = stage[j]
-            if t == "--":
-                j += 1
-                break
-            if t.startswith("-") and len(t) > 1:
-                j += 2 if t in values else 1
-            elif name in ("env", "sudo", "doas") and re.match(r"^\w+=", t):
-                j += 1
-            elif name in ("timeout", "chrt", "taskset") and re.fullmatch(r"[\d.]+[smhd]?|0x[0-9a-fA-F]+", t):
-                j += 1
-            elif counted:
-                counted -= 1
-                j += 1
-            else:
-                break
-        return j if j < len(stage) else None
-
-    def _dynamic_command(self, command: str, word: str, depth: int = 0) -> bool:
-        """`piigate reverse` / `project approve` may be run by a program built at run time (#26): a substitution,
-        backticks or any `$` in the command word of some stage (also after a launcher, `ssh` or `find -exec`), a
-        substitution among the arguments of a launcher, a `$` or substitution together with the word in the code of
-        `sh -c`, `su -c` or an interpreter's inline code, or in text piped into a shell or an interpreter that reads
-        the script from stdin — also inside a substitution. A variable elsewhere (`echo "$X approve"`) is not a reason.
-        Unparsable — True."""
-        if depth > 8:
-            return True
-        text = self._strip_heredocs(command)
-        spans = self._substitution_spans(text)
-        masked, position = [], 0
-        for start, end, inner in spans:
-            masked += [text[position:start], "\x01"]
-            position = end
-            if self._dynamic_command(inner, word, depth + 1):
-                return True
-        masked.append(text[position:])
-        lex = shlex.shlex("".join(masked), posix=True, punctuation_chars=";&|()\n")
-        lex.whitespace = " \t\r"
-        lex.whitespace_split = True
-        lex.commenters = ""
-        try:
-            tokens = list(lex)
-        except ValueError:
-            return True
-        word_re = re.compile(rf"(?<![\w-]){word}(?![\w-])")
-
-        def dollar(t: str) -> bool:  # a substitution (masked), backticks or a variable
-            return "\x01" in t or "`" in t or "$" in t
-
-        def with_word(t: str) -> bool:
-            return dollar(t) and bool(word_re.search(t))
-
-        def analyze(stage: list[str]) -> tuple[bool, str, list[str]]:
-            """(the command is built at run time, the program finally run, its arguments)"""
-            k = 0
-            while k < len(stage):
-                t = stage[k]
-                if t in SHELL_KEYWORDS or re.match(r"^\w+=", t) or REDIRECT_GLUED.fullmatch(t):
-                    k += 1
-                elif REDIRECT_ALONE.fullmatch(t):
-                    k += 2
-                else:
-                    break
-            for _ in range(8):  # launcher chains: `sudo -u me nice -n 5 env A=1 $x …`
-                if k >= len(stage):
-                    return False, "", []
-                if dollar(stage[k]):
-                    return True, "", []
-                name = Path(stage[k]).name
-                if name == "ssh":
-                    j = self._launched_index(stage, k)
-                    return (j is not None and self._dynamic_command(" ".join(stage[j:]), word, depth + 1)), name, []
-                if name == "find":
-                    for e, t in enumerate(stage):
-                        if t in ("-exec", "-execdir", "-ok", "-okdir") and analyze(stage[e + 1 :])[0]:
-                            return True, name, []
-                    return False, name, stage[k + 1 :]
-                if name not in LAUNCHERS or name in NO_COMMAND_LAUNCHERS:
-                    return False, name, stage[k + 1 :]
-                if any(dollar(t) for t in stage[k + 1 :]) and (
-                    name in CODE_LAUNCHERS or any("\x01" in t or "`" in t or "${" in t for t in stage[k + 1 :])
-                ):
-                    return True, name, []
-                j = self._launched_index(stage, k)
-                if j is None or name in SHELLS:
-                    return False, name, stage[k + 1 :]
-                k = j
-            return True, "", []  # chain too long
-
-        def reads_stdin(name: str, args: list[str]) -> bool:
-            shell_like = name in SHELLS or name == "su" or INTERPRETER.fullmatch(name)
-            return bool(shell_like) and all(a in ("-", "-s", "-i", "-l", "-") or a.startswith(("<", ">")) for a in args)
-
-        def inline(name: str, args: list[str]) -> bool:
-            """The code given to a shell or an interpreter on the command line."""
-            if name in SHELLS or name == "su":
-                flags = r"-[A-Za-z]*c|--command"
-            elif INTERPRETER.fullmatch(name):
-                flags = INLINE_FLAGS[re.sub(r"[\d.]+$", "", name)]
-            else:
-                return False
-            for i, a in enumerate(args[:-1]):
-                if re.fullmatch(flags, a):
-                    code = args[i + 1]
-                    if name in SHELLS or name == "su":
-                        if self._dynamic_command(code, word, depth + 1):
-                            return True
-                    elif with_word(code):
-                        return True
-            return False
-
-        stages: list[list[str]] = [[]]
-        group: list[int] = [0]
-        for t in tokens:
-            if re.fullmatch(r"[;&|()\n]+", t):
-                group.append(group[-1] if t in ("|", "|&") else group[-1] + 1)
-                stages.append([])
-            else:
-                stages[-1].append(t)
-        results = [analyze(stage) for stage in stages]
-        for dynamic, name, args in results:
-            if dynamic or inline(name, args):
-                return True
-            if "<<<" in args and reads_stdin(name, args[: args.index("<<<")]):  # sh <<< "$x reverse"
-                if any(with_word(t) for t in args[args.index("<<<") + 1 :]):
-                    return True
-        for i, (dynamic, name, args) in enumerate(results):
-            if reads_stdin(name, args) and any(
-                with_word(t) for j in range(i) if group[j] == group[i] for t in stages[j]
-            ):
-                return True
-        return False
-
-    def _sensitive_exists(self) -> bool:
-        """A sensitive source exists: a directory of the configuration or of the project is there on disk."""
-        return any(os.path.isdir(d) for d in [*self.sensitive, *self.project_sensitive])
-
-    @staticmethod
-    def _heredoc_dest(stage: list[str]) -> list[str]:
-        """Files written by `cat > f <<EOF` / `tee f <<EOF` (stage = its words)."""
-        if not stage:
-            return []
-        if stage[0] == "cat":
-            return [stage[i + 1] if t in (">", ">>") and i + 1 < len(stage) else t.lstrip(">")
-                    for i, t in enumerate(stage) if t.startswith(">")]
-        if stage[0] == "tee":
-            return [t for t in stage[1:] if not t.startswith(("-", "<"))]
-        return []
-
-    def _script_bodies(self, command: str) -> list[str]:
-        """Bodies of quoted heredocs written to a file that the same command uses again (`cat > s.sh <<'SH' … SH` then
-        `bash s.sh`): the text is a script that runs, so what it holds is judged like a command (#22)."""
-        bodies: list[str] = []
-        lines = command.split("\n")
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-            i += 1
-            for m in HEREDOC.finditer(line):
-                if not m.group(1):
-                    continue  # an unquoted heredoc: its substitutions run when the file is written, not later
-                stage = re.split(r"\||;|&&|\|\||\(|\)", line)
-                stage = next((e for e in stage if m.group() in e), "").split()
-                dests = [c.strip("'\"") for c in self._heredoc_dest(stage) if c]
-                body: list[str] = []
-                j = i
-                while j < len(lines) and lines[j].strip() != m.group(2):
-                    body.append(lines[j])
-                    j += 1
-                if j < len(lines) and dests and any(command.count(Path(c).name) > 1 for c in dests):
-                    bodies.append("\n".join(body))
-        return bodies
-
-    def _unwrap(self, stage: list[str]) -> list[str]:
-        """The stage without shell keywords (`{`, `if`, `then`, `else`, `do`, `!`…), assignments and launchers (`exec`,
-        `sudo -u x`, `command`, `env A=1`, `nice -n 5`…): what is left starts with the program that runs."""
-        k = 0
-        for _ in range(8):
-            while k < len(stage) and (stage[k] in SHELL_KEYWORDS or re.match(r"^\w+=", stage[k])):
-                k += 1
-            if k < len(stage) and Path(stage[k]).name in UNWRAP_LAUNCHERS:
-                j = self._launched_index(stage, k)
-                if j is None:
-                    return []
-                k = j
-                continue
-            break
-        return stage[k:]
-
-    def _computed_operand(self, command: str, depth: int = 0) -> bool:
-        """A command that reads files gets an operand built by a substitution (`cat $(echo …)`, `cat "$(…)"`, backticks,
-        `<(…)`, `< $(…)`) or through `xargs` (`… | xargs cat`) — a path the gate cannot know, like a variable path.
-        Also inside `sh -c '…'`, behind launchers and shell keywords, in `find $(…) -exec <reader>`, in `dd if=`,
-        `curl -T` and `curl -d @`, and in a quoted heredoc written to a file that the same command runs. Only when a
-        sensitive source exists (#22); text arguments and patterns (`grep "$(date)" x`) are not operands. Not followed:
-        a variable as the operand (`cat $x`)."""
-        if depth > 8 or not self._sensitive_exists():
-            return False
-        if depth == 0 and any(self._computed_operand(body, depth + 1) for body in self._script_bodies(command)):
-            return True
-        text = self._strip_heredocs(command)
-        masked, position = [], 0
-        for start, end, inner in self._substitution_spans(text):
-            masked += [text[position:start], "\x01"]
-            position = end
-            if self._computed_operand(inner, depth + 1):
-                return True
-        masked.append(text[position:])
-        lex = shlex.shlex("".join(masked), posix=True, punctuation_chars=";&|()\n")
-        lex.whitespace = " \t\r"
-        lex.whitespace_split = True
-        lex.commenters = ""
-        try:
-            tokens = list(lex)
-        except ValueError:
-            return False  # unparsable quotes are denied elsewhere
-        stages: list[list[str]] = [[]]
-        for t in tokens:
-            if re.fullmatch(r"[;&|()\n]+", t):
-                stages.append([])
-            else:
-                stages[-1].append(t)
-        for stage in stages:
-            if not stage:
-                continue
-            # an input redirection from a substitution, for any command: `wc -l < $(echo …)`, `jq . <$(…)`
-            for i, t in enumerate(stage):
-                if re.fullmatch(r"\d*<\x01.*", t) or (re.fullmatch(r"\d*<", t) and i + 1 < len(stage) and "\x01" in stage[i + 1]):
-                    return True
-            for core in self._strip_prefixes([self._unwrap(stage)]):
-                if not core:
-                    continue
-                cmd = Path(core[0]).name
-                if cmd in SHELLS:  # sh -c '…': the code is a command line of its own
-                    for i, t in enumerate(core[1:-1], 1):
-                        if re.fullmatch(r"-[A-Za-z]*c", t) and self._computed_operand(core[i + 1], depth + 1):
-                            return True
-                    core = [c for i, c in enumerate(core) if i == 0 or not re.fullmatch(r"-[A-Za-z]*c", core[i - 1])]
-                if cmd == "find":
-                    if any("\x01" in t for t in core) and any(
-                        t in ("-exec", "-execdir", "-ok", "-okdir") and Path(core[i + 1]).name in READERS
-                        for i, t in enumerate(core[:-1])
-                    ):
-                        return True
-                    continue
-                if cmd == "dd":
-                    if any(t.startswith("if=") and "\x01" in t for t in core[1:]):
-                        return True
-                    continue
-                if cmd == "curl":
-                    for i, t in enumerate(core[1:], 1):
-                        previous = core[i - 1]
-                        if "\x01" not in t:
-                            continue
-                        if previous in ("-T", "--upload-file") or re.match(r"-T.|--upload-file=", t):
-                            return True
-                        if previous in CURL_DATA_OPTIONS and t.startswith("@"):
-                            return True
-                        if re.match(r"(?:-d|--data(?:-binary|-raw|-urlencode|-ascii)?=?|-F|--form=?)\S*@", t) and "@\x01" in t:
-                            return True
-                    continue
-                if cmd == "xargs":
-                    rest, k = core[1:], 0
-                    while k < len(rest) and rest[k].startswith("-"):
-                        k += 2 if rest[k] in XARGS_WITH_VALUE else 1
-                    if k < len(rest) and Path(rest[k]).name in READERS:
-                        return True
-                    continue
-                if cmd not in READERS:
-                    continue
-                options = {t for t in core[1:] if t in ("-e", "-f", "--regexp", "--file")}
-                pattern_first = cmd in PATTERN_FIRST and not options
-                values = VALUE_OPTIONS.get(cmd, set())
-                for i, t in enumerate(core[1:], 1):
-                    if re.fullmatch(r"\d*(?:>>?|>\||&>>?)", core[i - 1]) or core[i - 1] in values:
-                        continue  # a write target, or the value of an option (a count, a pattern)
-                    if t.startswith("-") and "=" not in t:
-                        continue
-                    if pattern_first and not t.startswith("-"):
-                        pattern_first = False
-                        continue
-                    if "\x01" in t:
-                        return True
-        return False
 
     @staticmethod
     def _runs_piigate(stage: list[str]) -> int | None:
@@ -3192,18 +2808,6 @@ class Gate:
         reason = self._piigate_safe(command, tokens)
         if reason is None:
             return None
-        if kind == "sensitive" and what == UNVETTABLE:  # no sensitive path is named: the script's text cannot be read
-            return (
-                f"piigate: command denied — {UNVETTABLE}: its text is not a literal, so it cannot be checked for a "
-                "sensitive path built at run time. Write the script from a quoted heredoc (<<'EOF') or run it in "
-                f"a separate command. {HINT}"
-            )
-        if kind == "sensitive" and what == COMPUTED:  # no path is named: the operand's value is not known here
-            return (
-                f"piigate: command denied — {COMPUTED} (`cat $(…)`, `… | xargs cat`): the gate cannot tell which files it "
-                "reads, and a sensitive data directory exists. Name the files literally, or read them through the "
-                f"piigate tools. {HINT}"
-            )
         p = _path(what, self.cwd) if kind == "sensitive" else ""
         if p and not _inside(p, self.sensitive):
             below = [k for k in self.sensitive if _inside(k, [p]) and os.path.lexists(k)]

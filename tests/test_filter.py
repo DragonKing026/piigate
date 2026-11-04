@@ -2726,116 +2726,26 @@ class TestFalseAlarms(unittest.TestCase):
             with self.subTest(command):
                 self.assertIsNotNone(b.bash(command))
 
-    def test_computed_operands_pass_without_a_sensitive_source(self):
-        """Issue #22: without a sensitive directory a substitution as a file operand and `… | xargs <reader>` pass."""
-        for where in (self.public, self.phi):
-            b = self.gate(where)
-            for command in (
-                "cat $(echo packages.tsv)", "grep x $(git ls-files)", "echo $(date)", "git ls-files | xargs grep -l x",
-                'cat "$(echo compose.yml)"', "echo compose.yml | xargs cat", "wc -l $(ls)",
-            ):
-                with self.subTest(where=where.name, command=command):
-                    self.assertIsNone(b.bash(command))
-
-    def test_human_only_built_program_name_in_every_position(self):
-        """Issue #26 (review): a program name held in a variable or a substitution is a call in every position — as a
-        command word, under a launcher, in `sh -c` / `su -c` / an interpreter's inline code, fed to a shell through a
-        pipe — while a variable elsewhere (a text argument) stays harmless."""
-        word = "rev" + "erse"
-        appr = "appr" + "ove"
-        pre = "x=$(echo pii)gate; "
-        denied = []
-        for w in (f"{word}", f"project {appr}"):
-            denied += [
-                f"{pre}$x {w}", f'{pre}"$x" {w}', f"{pre}{{ $x {w}; }}", f"{pre}( $x {w} )",
-                f"{pre}if $x {w}; then :; fi", f"{pre}for i in 1 2; do $x {w}; done",
-                f"{pre}while $x {w}; do :; done", f"{pre}! $x {w}",
-                f"{pre}env $x {w}", f"{pre}env -u FOO A=1 $x {w}", f"{pre}command $x {w}", f"{pre}exec $x {w}",
-                f"{pre}nice -n 5 $x {w}", f"{pre}setsid $x {w}", f"{pre}sudo -u me $x {w}", f"{pre}timeout 5 $x {w}",
-                f"{pre}ssh localhost $x {w}", f'{pre}ssh -p 22 localhost "$x {w}"',
-                f'{pre}su -c "$x {w}"', f'{pre}sh -c "$x {w}"', f'{pre}bash -lc "$x {w}"',
-                f'{pre}echo "$x {w}" | sh', f'{pre}echo "$x {w}" | bash -s', f'{pre}printf "%s" "$x {w}" | python3',
-                f'{pre}sh <<< "$x {w}"', f"{pre}sh <<EOF\n$x {w}\nEOF",
-                f'{pre}find . -maxdepth 0 -exec $x {w} \\;',
-                f"{pre}python3 -c \"import os;os.system('$x {w}')\"",
-                f"{pre}node -e \"require('child_process').execSync('$x {w}')\"",
-                f"{pre}perl -e \"system('$x {w}')\"", f"{pre}ruby -e \"system('$x {w}')\"",
-                f"{pre}php -r \"system('$x {w}');\"",
-                f"{pre}xargs $x {w}",
-            ]
-        for command in denied:
-            for where in (self.public, self.phi):
-                with self.subTest(where=where.name, command=command):
-                    self.assertIsNotNone(self.gate(where).decision("Bash", {"command": command}))
-        for where in (self.public, self.phi):
-            b = self.gate(where)
-            for command in (
-                f'X=$(echo hi); echo "$X https://example.test/api/orders/1/{appr}"',
-                f'X=$(echo hi); echo "$X"; grep -c -E "a|{appr}" /dev/null',
-                f"X=$(echo hi); python3 -c 'print(sorted([1, 2], {word}=True))'",
-                f'echo "$(date) {appr}"', f'echo "${{HOME}} {appr}"',
-                f'for f in $(ls); do grep -c {appr} "$f"; done',
-                f'export X=$(echo hi); grep {appr} a.txt',
-                f'X=$(echo hi) && sudo -n echo "$X {appr}"',
-                f'X=1; env A=1 nice -n 5 echo "$X {appr}"',
-                f"X=1; sh -c 'echo \"$X {appr}\"'",
-                f'X=1; echo "$X {appr}" | wc -l',
-                f'X=1; echo "$X {appr}" | grep -c a',
-            ):
-                with self.subTest(where=where.name, command=command):
-                    self.assertIsNone(b.decision("Bash", {"command": command}))
-
-    def test_human_only_word_after_a_substitution(self):
-        """Issue #26: a command substitution elsewhere does not turn the word into a call; a call stays denied
-        wherever `piigate` runs (also in or after a substitution, built at run time, under a launcher)."""
+    def test_built_program_names_and_scripts_stay_denied(self):
+        """Still denied (as on main): a program name built at run time, and a script written through a variable and
+        run under another name; the shell parser planned in issue #22 will judge these precisely."""
         word = "rev" + "erse"
         appr = "appr" + "ove"
         for where in (self.public, self.phi):
             b = self.gate(where)
             for command in (
-                f'X=$(echo hi); echo "$X https://example.test/api/orders/1/{appr}"',
-                f'X=$(echo hi); echo "$X"; grep -c -E "a|{appr}" /dev/null',
-                f"X=$(echo hi); python3 -c 'print(sorted([1, 2], {word}=True))'",
-                f"X=`echo hi`; echo \"$X {appr}\"",
-                f'echo "$(date) {appr}"',
-                f'echo "${{HOME}} {appr}"',
-                f'for f in $(ls); do grep -c {appr} "$f"; done',
-                f'N=$(wc -l < a.txt); git log --{word} -n "$N" --oneline',
-                f'X=$(echo hi) && sudo -n echo "$X {appr}"',
-                f'export X=$(echo hi); grep {appr} a.txt',
-                f'echo "$(echo a) {appr}" | wc -l',
-                f"gh issue list -R o/piigate --search \"$(date +%Y) {appr}\"",
+                f"x=$(echo pii)gate; $x {word}",
+                f"x=$(echo pii)gate; $x project {appr}",
+                f'x=$(echo pii)gate; "$x" {word} a',
+                f"f=/tmp/x/a.sh; cat > \"$f\" <<'SH'\npiigate {word} x\nSH\nbash \"$f\"",
+                f"f=/tmp/x/a.sh; cat > $f <<'SH'\npiigate project {appr}\nSH\nsh $f",
+                f"f=/tmp/x/a.sh; cat > \"$f\" <<SH\npiigate {word} x\nSH\nzsh \"$f\"",
+                f"f=/tmp/x/a.sh; cat > \"$f\" <<'SH'\npiigate {word} x\nSH\nsource \"$f\"",
+                f"f=/tmp/x/a.sh; cat > \"$f\" <<'SH'\npiigate {word} x\nSH\nchmod +x \"$f\"; \"$f\"",
+                f"f=/tmp/x/a.sh; printf 'piigate {word} x' > \"$f\"; bash \"$f\"",
             ):
                 with self.subTest(where=where.name, command=command):
-                    self.assertIsNone(b.bash(command))
-        b = self.gate(self.phi)
-        for command in (
-            f"X=$(echo hi); piigate {word} x",
-            f"X=$(echo hi); echo \"$X\"; piigate project {appr}",
-            f"echo hi; $(piigate project {appr})",
-            f"X=$(piigate project {appr}); echo $X",
-            f"echo `piigate {word} x`",
-            f"echo \"$(piigate {word} x)\"",
-            f"X=$(echo hi); /usr/local/bin/piigate project {appr}",
-            f"X=$(echo hi); bash -c 'piigate project {appr}'",
-            f"X=$(echo hi); sh -c \"piigate {word} x\"",
-            f"echo hi | piigate project {appr}",
-            f"true && piigate project {appr}",
-            f"X=$(echo hi); python3 lib/cli.py {word} report.md",
-            f"X=$(echo hi); sudo piigate project {appr}",
-            f"$(echo pii)gate project {appr}",
-            f"`echo pii`gate {word} x",
-            f"X=$(echo pii); ${{X}}gate project {appr}",
-            f"X=$(echo hi); \"$(echo pii)gate\" {word} x",
-            f"X=$(echo hi); eval \"$(echo pii)gate project {appr}\"",
-            f"X=$(echo hi); bash -c \"$(echo pii)gate project {appr}\"",
-            f"X=$(echo hi); echo x | xargs $(echo pii)gate {word}",
-            f"echo $($(echo pii)gate project {appr})",
-            f"X=piigate; echo hi; $X project {appr}",
-            f"X=$(echo hi); eval piigate project {appr}",
-        ):
-            with self.subTest(command):
-                self.assertIsNotNone(b.bash(command))
+                    self.assertIsNotNone(b.bash(command))
 
     def test_relative_paths_against_tool_cwd(self):
         """The hook resolves relative paths against the tool call's cwd, not its own working directory."""
@@ -3474,131 +3384,6 @@ class TestContentNotNames(unittest.TestCase):
             with self.subTest(command):
                 self.assertIsNotNone(b.bash(command))
         self.assertIsNone(b.bash(f"git commit -m 'mentions {S}' && ./build.sh"))
-
-    def test_computed_operands_of_readers_with_a_sensitive_source(self):
-        """Issue #22: a word built by a substitution is an unknown path for a command that reads files, `… | xargs
-        <reader>` likewise — denied while a sensitive directory exists; text arguments and patterns pass."""
-        b = self.gate()
-        S = "Sensitive-data"
-        for command in (
-            "cat $(echo Sens*/x.txt)", 'cat "$(echo Sens*/x.txt)"', "cat `echo Sens*/x.txt`", "echo Sens*/x.txt | xargs cat",
-            f"cat $(echo {S}/x.txt)", f"cat $(printf %s {S}/x.txt)", f"cat \"$(echo {S})/x.txt\"", f"head -n 2 $(echo {S}/x.txt)",
-            f"cat < $(echo {S}/x.txt)", f"cp $(echo {S}/x.txt) /tmp/y", f"cat $(echo $(echo {S}/x.txt))",
-            f"grep secret $(echo {S}/x.txt)", "grep -e secret $(git ls-files)", f"env X=1 cat $(echo {S}/x.txt)",
-            f"echo {S}/x.txt | xargs -I{{}} cat {{}}", "git ls-files | xargs grep secret", "echo a | xargs -n1 -P2 wc -l",
-            f"echo hi; cat $(echo {S}/x.txt)", "ls | xargs -0 cat", f"cat <(echo {S}/x.txt)",
-        ):
-            with self.subTest(command):
-                self.assertIsNotNone(b.bash(command))
-        reason = b.bash("cat $(echo Sens*/x.txt)")
-        self.assertIn("a file operand built by a command substitution", reason)
-        self.assertNotIn("multi-line", reason)
-        for command in (  # not a file operand, or no reader
-            "echo $(date)", 'echo "$(date) $(whoami)"', 'grep "$(echo needle)" clean/a.csv', "grep -c \"$(date +%Y)\" clean/a.csv",
-            "git commit -q -m \"$(date)\"", "git commit -m \"$(cat <<'EOF'\nmessage\nEOF\n)\"", "mkdir $(date +%s)",
-            "echo hi | xargs echo", "echo hi | xargs -n1 printf %s", 'sed -e "s/$(echo a)/b/" clean/a.csv',
-            "cat clean/a.csv > \"$(echo /tmp/o)\"", "X=$(date); echo \"$X\"", "cat 'a$(b'", "cat clean/a.csv | head -n $(echo 2)",
-        ):
-            with self.subTest(command):
-                self.assertIsNone(b.bash(command), b.bash(command))
-        # no regression of the older rules: a literal path and a quoted heredoc
-        self.assertIsNotNone(b.bash(f"cat {S}/x.txt"))
-        self.assertIsNone(b.bash("f=/tmp/x/a.sh; cat > \"$f\" <<'SH'\necho ok\nSH\nbash \"$f\""))
-
-    COMPUTED_MORE = (  # #22 (review): the cheap, common shapes around a substitution used as a file operand
-        "{ cat $(echo S/x.txt); }", "if cat $(echo S/x.txt); then :; fi", "for i in 1 2; do cat $(echo S/x.txt); done",
-        "! cat $(echo S/x.txt)", "while cat $(echo S/x.txt); do :; done", "exec cat $(echo S/x.txt)",
-        "sudo cat $(echo S/x.txt)", "sudo -u me cat $(echo S/x.txt)", "command cat $(echo S/x.txt)",
-        "env -u A B=1 cat $(echo S/x.txt)", "nice -n 5 sudo cat $(echo S/x.txt)", "( cat $(echo S/x.txt) )",
-        "sh -c 'cat $(echo S/x.txt)'", "bash -c 'cat $(echo S/x.txt)'", "bash -lc 'wc -l $(echo S/x.txt)'",
-        "sudo bash -c 'cat $(echo S/x.txt)'", "echo hi; sh -c 'echo ok; cat `echo S/x.txt`'",
-        "find $(echo S) -type f -exec cat {} \\;", "find $(echo S) -type f -execdir grep x {} +", "find `echo S` -exec head -n 1 {} \\;",
-        "wc -l < $(echo S/x.txt)", "jq . < $(echo S/x.json)", "sort <$(echo S/x.txt)", "python3 -c 'import sys' 0< $(echo S/x.txt)",
-        "tr a b < $(echo S/x.txt)", "bash < $(echo S/x.txt)",
-        "base64 $(echo S/x.txt)", "base64 -w 0 $(echo S/x.txt)", "shuf -n 3 $(echo S/x.txt)", "expand -t 4 $(echo S/x.txt)",
-        "pr $(echo S/x.txt)", "pr -h title $(echo S/x.txt)", "dd if=$(echo S/x.txt) of=/tmp/y", "dd bs=1 if=$(echo S/x.txt)",
-        "curl -T $(echo S/x.txt) http://localhost:1/", "curl --upload-file $(echo S/x.txt) http://localhost:1/",
-        "curl -d @$(echo S/x.txt) http://localhost:1/", "curl --data-binary @$(echo S/x.txt) http://localhost:1/",
-        "curl -d@$(echo S/x.txt) http://localhost:1/", "curl --data=@$(echo S/x.txt) http://localhost:1/",
-        "cat > s.sh <<'SH'\ncat $(echo S/x.txt)\nSH\nbash s.sh", "tee s.sh <<'SH' >/dev/null\nwc -l $(echo S/x.txt)\nSH\nsh s.sh",
-        "f=s.sh; cat > \"$f\" <<'SH'\ncat $(echo S/x.txt)\nSH\nbash \"$f\"",
-    )
-    COMPUTED_FINE = (  # not a file operand, no reader, or not run
-        "sh -c 'echo $(date)'", "bash -c 'echo ok'", "bash -c \"echo $(date)\"", "sudo -u me echo $(date)", "env A=1 echo $(date)",
-        "{ echo $(date); }", "if echo $(date); then :; fi", "wc -l < a.txt", "sort < a.txt | head", "X=$(echo a); cat < clean/a.csv",
-        "dd if=clean/a.csv of=$(echo /tmp/o)", "dd of=$(echo /tmp/o) if=clean/a.csv", "curl -d \"$(date)\" http://localhost:1/",
-        "curl -d @clean/a.json http://localhost:1/", "curl -o $(echo /tmp/o) http://localhost:1/", "curl -T clean/a.csv http://localhost:1/",
-        "base64 clean/a.csv", "shuf -n $(echo 3) clean/a.csv", "pr clean/a.csv", "tr a b < clean/a.csv", "tr $(echo a) b < clean/a.csv",
-        "find clean -name x -exec cat {} +", "find $(date) -name x", "find clean -name x -exec echo $(date) {} \\;",
-        "cat > s.sh <<'SH'\ncat $(echo S/x.txt)\nSH",
-        "cat > s.sh <<'SH'\necho $(date)\nSH\nbash s.sh", "cat > s.sh <<'SH'\ncat clean/a.csv\nSH\nbash s.sh",
-    )
-
-    def test_computed_operands_more_forms_with_a_sensitive_source(self):
-        """#22 (review): launchers and shell keywords in front, `sh -c '…'`, `find … -exec <reader>` with a built start
-        path, an input redirection from a substitution, more readers (base64, shuf, expand, pr, `dd if=`, `curl -T`,
-        `curl -d @`) and a quoted heredoc written to a file that the same command runs. Known limit (README):
-        `cat $x` and `cat ${x}`."""
-        b = self.gate()
-        for command in self.COMPUTED_MORE:
-            command = command.replace("S/", "q/").replace("echo S", "echo q")  # no sensitive name: the operand is computed
-            with self.subTest(command):
-                self.assertIn("a file operand built by a command substitution", b.bash(command) or "")
-        for command in self.COMPUTED_FINE:
-            command = command.replace("S/", "q/").replace("echo S", "echo q")  # no sensitive name: the operand is computed
-            with self.subTest(command):
-                self.assertIsNone(b.bash(command), b.bash(command))
-        for command in ("cat $x", "cat ${x}", 'cat "$x"'):  # documented as not followed yet
-            with self.subTest(command):
-                self.assertIsNone(b.bash(command))
-
-    def test_computed_operands_more_forms_pass_without_a_sensitive_source(self):
-        shutil.rmtree(self.repo / "Sensitive-data", ignore_errors=True)
-        b = self.gate()
-        self.assertFalse(b._sensitive_exists())
-        for command in self.COMPUTED_MORE:
-            command = command.replace("S/", "q/").replace("echo S", "echo q")  # no sensitive name: the operand is computed
-            with self.subTest(command):
-                self.assertNotIn("a file operand built by a command substitution", b.bash(command) or "")
-
-    def test_script_from_a_quoted_heredoc_is_read_by_its_body(self):
-        """Issue #27: the target of a redirection is not text built at run time; a quoted heredoc is judged by its body,
-        the same for `"$f"` and a literal path. Text the gate cannot read keeps the denial, with its own wording."""
-        b = self.gate()
-        S = "Sensitive-data"
-        for target in ('"$f"', "$f", "/tmp/x/a.sh"):
-            for rest in ('bash "$f"; rm -f "$f"', 'wc -l "$f"', "true", "sh /tmp/x/a.sh"):
-                command = f"f=/tmp/x/a.sh; cat > {target} <<'SH'\necho ok\nSH\n{rest}"
-                with self.subTest(command):
-                    self.assertIsNone(b.bash(command))
-        # the body is read: a sensitive path in it is a read of a sensitive directory
-        for command in (
-            f"f=/tmp/x/a.sh; cat > \"$f\" <<'SH'\ncat {S}/x.txt\nSH\nbash \"$f\"",
-            f"cat > /tmp/x/a.sh <<'SH'\ncat {S}/x.txt\nSH\nbash /tmp/x/a.sh",
-        ):
-            with self.subTest(command):
-                self.assertIn("a sensitive data directory (Sensitive-data/x.txt)", b.bash(command))
-        # text the gate cannot read: an unquoted heredoc with `$`, echo/printf of built text — own wording, no directory
-        for command in (
-            'f=/tmp/x/a.sh; cat > "$f" <<SH\necho $HOME\nSH\nbash "$f"',
-            "cat > /tmp/x/a.sh <<SH\necho $HOME\nSH\nbash /tmp/x/a.sh",
-            'echo "$x" > s.sh; bash s.sh',
-            "printf '%s' x > s.sh; bash s.sh",
-            'f=s.sh; echo "$x" > "$f"; bash "$f"',
-            'f=s.sh; printf "%s" x > "$f"; bash "$f"',
-        ):
-            with self.subTest(command):
-                reason = b.bash(command)
-                self.assertIn("a script written from text built at run time", reason)
-                self.assertNotIn("a sensitive data directory", reason)
-                self.assertNotIn("multi-line command", reason)
-        # a variable target without a heredoc and without built text: as before
-        for command in (
-            'f=a.txt; echo one-line > "$f"; wc -l "$f"; rm -f "$f"', 'f=a.sh; echo one-line > "$f"; wc -l "$f"',
-            'echo "$x" > s.sh && wc -l s.sh',  # nothing runs it
-        ):
-            with self.subTest(command):
-                self.assertIsNone(b.bash(command))
 
     def test_names_and_writes_in_sensitive_directories_pass(self):
         b = self.gate()
