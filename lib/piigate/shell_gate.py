@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import os
 import re
-from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -33,11 +32,12 @@ TEXT_ONLY = {
     "echo", "printf", "true", "false", ":", "test", "[", "[[", "((", "let", "export", "declare", "typeset", "local", "readonly",
     "unset", "set", "shift", "wait", "sleep", "pwd", "for", "select", "case", "exit", "return", "read", "cd", "pushd", "popd",
 }
-SAFE_VALUE = re.compile(r"[\w./@%+:,-]*")  # a static value that may replace `$x` in a word: no space, glob, quote, tilde
-DECLARATIONS = {"declare", "typeset", "local", "readonly", "export"}
-# builtins that assign to the variables named in their arguments (or may): every identifier among the arguments gets a
-# value nobody can read from the line
-ASSIGNING = {"read", "mapfile", "readarray", "getopts", "unset", "coproc"}
+FILE_VALUED = {  # options whose value is a FILE the program reads (or runs): an unknown value is an unknown file
+    "-f", "--file", "--pre", "--hostname-bin", "--ignore-file", "--exclude-from", "--files-from", "--files0-from", "--input",
+    "--body-file", "--template", "--notes-file",
+}
+GH_FILE_VALUED = {"-F", "--body-file", "--input", "--notes-file", "--template", "--file", "-t"}
+GH_FILE_COMMANDS = {("gist", "create"), ("gist", "edit"), ("release", "upload"), ("release", "create"), ("release", "edit")}
 SUBSTITUTION_ORIGINS = ("$(", "`", "<(", ">(")
 NESTED_UNKNOWN = SUBSTITUTION_ORIGINS + ("-c", "eval")  # a call there has arguments the old gate reports as None
 
@@ -58,6 +58,8 @@ class _Parsed:
     stage_calls: list[shell.Call | None]  # one per stage group of `tokens`
     bodies: list[_Body] = field(default_factory=list)
     view: str = ""
+    composed: str = ""  # the line as its WORDS compose it (quotes and variables resolved): `piigate rev''erse` -> `piigate reverse`
+    dynamic_body: str = ""  # why an unquoted heredoc given to an interpreter holds a value nobody can read
     rest: frozenset = frozenset()  # the words of the command itself (without the text bodies of its heredocs)
 
 
@@ -68,6 +70,17 @@ class _Dyn(str):
     unresolved: tuple = ()
     subst: bool = False
     dyn = True
+
+
+class _Set(QuotedToken):
+    """A word that is one of several known values (the variable of a `for` over static words): `alts` are the others. It is
+    a QuotedToken only in the sense of being a plain word (the gate globs it itself)."""
+
+    quoted = False
+    alts: tuple = ()
+
+    def __new__(cls, value: str, quote: str = ""):
+        return super().__new__(cls, value, quote)
 
 
 class _DynQuoted(QuotedToken):
@@ -87,84 +100,58 @@ class AstGate(gate.Gate):
         self.internal_error = ""
         self._cache: dict[str, _Parsed] = {}
         self._index: dict[int, int] = {}
-        self._sites: dict = {}
-        self._unknown: set = set()
-        self._env: dict = {}
+        self._model: shell.VarModel | None = None
+        self._body_dynamic = False
         self._current: _Parsed | None = None
 
     # ------------------------------------------------------------------------------------------------ building
 
-    # -- the value of variables: known only when the ONE assignment of the line is a fully static word
-    def _variables(self, calls: list[shell.Call], assigned_in_expansions) -> None:
-        sites: dict[str, list[tuple[int, str, str]]] = defaultdict(list)
-        unknown: set[str] = set(assigned_in_expansions)
-        for i, c in enumerate(calls):
-            persistent = not c.argv or c.name in DECLARATIONS  # `x=1` alone / `declare x=1`; `x=1 cmd` is only for cmd
-            for a in c.assigns:
-                static = (
-                    persistent and a.value is not None and not a.array and not a.append and a.value.static
-                    and SAFE_VALUE.fullmatch(a.value.text) is not None
-                )
-                sites[a.name].append((i, "static" if static else "dynamic", a.value.text if static else ""))
-            if c.loop_var:  # the variable of `for` / `select` takes each of the items, which are judged as words themselves
-                items = c.argv[1:]
-                ok = all(w.static or (w.kinds - {"glob", "brace"} == set()) for w in items)
-                sites[c.loop_var].append((i, "set" if ok else "dynamic", ""))
-            words = [w.text for w in c.argv[1:] if w.static]
-            if c.name in ASSIGNING:
-                unknown |= {t for t in words if re.fullmatch(r"[A-Za-z_]\w*", t)}
-            elif c.name == "printf" and "-v" in words:
-                unknown |= set(words[words.index("-v") + 1 : words.index("-v") + 2])
-            elif c.name in DECLARATIONS and any(t.startswith("-") and "n" in t for t in words):
-                unknown |= {t.split("=")[0] for t in words if not t.startswith("-")}  # a nameref: `declare -n r=x`
-        self._sites, self._unknown = sites, unknown
-        self._env = {"HOME": os.path.expanduser("~"), "PWD": self.cwd, "TMPDIR": os.environ.get("TMPDIR") or "/tmp"}
+    # -- words: the value is computed from the PIECES the tree gives (`shell.subst_word`), never by reading the text
+    def _pwd(self, c: shell.Call | None) -> str | None:
+        """`$PWD` / `~+` at this command: its directory when that is exactly one known directory."""
+        if c is None:
+            return self.cwd
+        return next(iter(c.cwds)) if c.cwd_known and len(c.cwds) == 1 else None
 
-    def _value(self, name: str, use: int, origin: str) -> tuple[str, str]:
-        """("static", text) | ("set", "") | ("unknown", "")."""
-        if name in self._unknown:
-            return "unknown", ""
-        found = self._sites.get(name)
-        if found:
-            if len(found) != 1:
-                return "unknown", ""
-            i, kind, value = found[0]
-            if kind == "static" and (i < use or origin == "function"):
-                return "static", value
-            return ("set", "") if kind == "set" else ("unknown", "")
-        if name in self._env:  # the environment, said explicitly: where the session is, and the user's home
-            return "static", self._env[name]
-        return "unknown", ""
-
-    def _word_token(self, w: shell.Word, use: int = 0, origin: str = "top") -> str:
+    def _word_tokens(self, w: shell.Word, c: shell.Call | None, use: int, origin: str) -> list[str]:
         if OPERATOR_WORD.fullmatch(w.text):
             # `cat '>' f`, `find -exec x {} \;`: a word that reads like an operator must not become one in the flat list
             # (the classification compares strings: `>` would make `f` a write target)
-            return QuotedToken("\\" + w.text, w.quote or "'")
-        names = [k[1:] for k in w.kinds if k.startswith("$")]
-        values = {n: self._value(n, use, origin) for n in names}
+            return [QuotedToken("\\" + w.text, w.quote or "'")]
+        pwd = self._pwd(c)
+        model = self._model
+        positional = c.positional if c is not None else None
 
-        def substitute(m: re.Match) -> str:  # all names at once: `$b$c` must not become `$bive-data` after `$c` is replaced
-            name = m.group(1) or m.group(2)
-            kind, value = values.get(name, ("unknown", ""))
-            return value if kind == "static" else m.group(0)
+        def lookup(name: str):
+            return model.value(name, use, origin, positional, pwd) if model is not None else ("unknown", None)
 
-        text = re.sub(r"\$\{([A-Za-z_]\w*)\}|\$([A-Za-z_]\w*)", substitute, w.text)
-        unresolved = []
-        for n in names:
-            kind = values[n][0]
-            exact = text in (f"${n}", "${" + n + "}")
-            still = re.search(r"\$\{?" + re.escape(n) + r"(?![A-Za-z0-9_])", text) is not None
-            if kind == "set" and exact:
-                continue
-            if kind != "static" or still:
-                unresolved.append(n)
+        variants, unresolved = shell.subst_word(w, lookup, self.dialect)
+        if w.segs and w.text.startswith("~+") and "tilde" in w.kinds:  # `~+/x` is $PWD/x, `~-` is $OLDPWD
+            if pwd is not None and len(variants) == 1 and len(variants[0]) == 1:
+                variants = [[pwd + variants[0][0][2:]]]
+            else:
+                unresolved.append("PWD")
+        elif w.text.startswith("~-") and "tilde" in w.kinds:
+            unresolved.append("OLDPWD")
         subst = bool({"cmd", "proc"} & w.kinds)
-        if unresolved or subst:
-            tok = _DynQuoted(text, w.quote) if w.quote else _Dyn(text)
-            tok.unresolved, tok.subst = tuple(unresolved), subst
-            return tok
-        return QuotedToken(text, w.quote) if w.quote else text
+        if len(variants) == 1:
+            words = variants[0]
+        elif all(len(v) == 1 for v in variants):
+            words = variants[0]  # a SET: the first is the token, every value is judged (`alts`)
+        else:
+            words, unresolved = [w.text], unresolved + ["(set)"]
+        out: list[str] = []
+        for text in words:
+            if unresolved or subst:
+                tok = _DynQuoted(text, w.quote) if w.quote else _Dyn(text)
+                tok.unresolved, tok.subst = tuple(unresolved), subst
+            else:
+                tok = QuotedToken(text, w.quote) if w.quote else text
+                if len(variants) > 1 and len(words) == 1:
+                    tok = _Set(text, w.quote)
+                    tok.alts = tuple(v[0] for v in variants[1:])
+            out.append(tok)
+        return out
 
     def _call_tokens(self, c: shell.Call) -> list[str]:
         use = self._index.get(id(c), 0)
@@ -176,7 +163,7 @@ class AstGate(gate.Gate):
             if "zsh" in w.kinds and w.text.startswith("(") and w.text.endswith(")") and w.quoting == "none":
                 toks += w.text[1:-1].split()  # zsh `foreach f (a b c)`: a parenthesised word list — each one is a word
             else:
-                toks.append(self._word_token(w, use, c.origin))
+                toks += self._word_tokens(w, c, use, c.origin)
         for r in c.redirects:
             if r.fd:
                 toks.append(r.fd)
@@ -185,7 +172,7 @@ class AstGate(gate.Gate):
             else:
                 toks.append(r.op)
                 if r.target is not None:
-                    toks.append(self._word_token(r.target, use, c.origin))
+                    toks += self._word_tokens(r.target, c, use, c.origin)
         return toks
 
     @staticmethod
@@ -201,6 +188,27 @@ class AstGate(gate.Gate):
         first = c.argv[0]
         names = {os.path.basename(w.text) for w in (first, *words[:1]) if w.static}
         return bool(names & LAUNCHERS) or bool(c.stdin_interpreter and c.stdin_interpreter in SHELLS)
+
+    def _expanded_body(self, h: shell.Heredoc, c: shell.Call) -> str:
+        """The text of an unquoted heredoc as the shell makes it: `${x}` of a variable with a known value replaced. A body
+        that still holds a variable or a command substitution afterwards sets `_body_dynamic`."""
+        self._body_dynamic = False
+        if h.quoted or not (h.names or h.subst):
+            return h.body
+        model = self._model
+        use = self._index.get(id(c), 0)
+
+        def sub(m: re.Match) -> str:
+            kind, value = model.value(m.group(1), use, c.origin, c.positional, self._pwd(c)) if model else ("unknown", None)
+            if kind != "static":
+                self._body_dynamic = True
+                return m.group(0)
+            return value
+
+        text = re.sub(r"\$\{([A-Za-z_]\w*)\}", sub, h.body)
+        if h.subst or re.search(r"\$\{[^}]*\}", text):
+            self._body_dynamic = True
+        return text
 
     @staticmethod
     def _body_words(text: str) -> list[str]:
@@ -229,10 +237,11 @@ class AstGate(gate.Gate):
     def _build(self, command: str) -> _Parsed:
         calls = shell.parse(command, cwd=self.cwd, dialect=self.dialect)
         self._index = {id(c): i for i, c in enumerate(calls)}
-        self._variables(calls, getattr(calls, "assigned_in_expansions", ()))
+        self._model = getattr(calls, "model", None) or shell.build_model(calls, getattr(calls, "assigned_in_expansions", ()), self.cwd)
         # bodies of heredocs read by a shell or launcher are code: parsed like the command itself
         bodies: list[_Body] = []
-        text_bodies: list[str] = []  # stdin text of a non-shell: not shell code, so it has no tree
+        text_bodies: list[str] = []
+        dynamic_body = ""  # stdin text of a non-shell: not shell code, so it has no tree
         seen_text: set[int] = set()
         for c in list(calls):
             for r in c.redirects:
@@ -249,12 +258,15 @@ class AstGate(gate.Gate):
                     else:  # a launcher (xargs, find, env…) or no command: its words are what the body holds
                         bodies.append(_Body(h.body, h.quoted, True, False))
                         if id(h) not in seen_text:
-                            text_bodies.append(h.body)
+                            text_bodies.append(self._expanded_body(h, c))
                 else:
                     stripped = self._file_writer(c) is not None
                     bodies.append(_Body(h.body, h.quoted, False, stripped))
                     if not stripped and id(h) not in seen_text:
-                        text_bodies.append(h.body)
+                        body_text = self._expanded_body(h, c)
+                        text_bodies.append(body_text)
+                        if self._body_dynamic and (c.stdin_interpreter or c.name in shell.INTERPRETERS):
+                            dynamic_body = "an unquoted heredoc given to an interpreter holds a variable or substitution with no known value"
                 seen_text.add(id(h))
         top = shell._toplevel(calls)
         groups: list[tuple[list[str], shell.Call | None, str]] = []
@@ -321,12 +333,14 @@ class AstGate(gate.Gate):
             view = command  # nothing to cut: the checks that read the line as text (recipes, `$` in a tool call) get it as written
         if any("\x00" in str(t) for t in tokens):
             raise shell.ParseError("a NUL byte in a word")
-        return _Parsed(command, calls, tokens, stage_calls, bodies, view, rest)
+        composed = all_text + "".join("\n" + b.text for b in bodies if not b.stripped)
+        return _Parsed(command, calls, tokens, stage_calls, bodies, view, composed, dynamic_body, rest)
 
     def _store(self, command: str) -> _Parsed:
         p = self._build(command)
         self._cache[command] = p
         self._cache[p.view] = p
+        self._cache[p.composed] = p
         return p
 
     def _lookup(self, command: str) -> _Parsed | None:
@@ -343,37 +357,24 @@ class AstGate(gate.Gate):
         return [*c.argv, *(a.value for a in c.assigns if a.value), *(x for a in c.assigns for x in a.array),
                 *(r.target for r in c.redirects if r.target is not None)]
 
-    @staticmethod
-    def _may_change_options(calls: list[shell.Call]) -> bool:
-        """The line can switch shell options (zsh glob qualifiers run code only with BARE_GLOB_QUAL, `(#q…)` with
-        EXTENDED_GLOB; Claude Code's shell has both off): `setopt`, `unsetopt`, `emulate`, `set -o`/`+o`, `options[…]=`, a
-        shell started with `-o`/`-c`, `eval`, `source`."""
-        for c in calls:
-            words = [w.text for w in c.argv[1:]]
-            if c.name in ("setopt", "unsetopt", "emulate", "eval", "source", ".", "coproc"):
-                return True
-            if c.name == "set" and any(re.match(r"[-+][A-Za-z]*[oX]", t) for t in words):
-                return True
-            if c.name in SHELLS and any(re.match(r"[-+][A-Za-z]*[oc]", t) for t in words):
-                return True
-            if c.name in ("typeset", "declare", "local", "readonly", "export") and any(t.startswith("options") for t in words):
-                return True
-            if any(a.name in ("options", "setopt", "unsetopt") for a in c.assigns):
-                return True
-        return False
-
     def _unjudgeable(self, calls: list[shell.Call]) -> str:
         """Why the command cannot be judged at all (empty when it can): code or a command name the tree does not hold.
         Every construct this module does not understand ends here — a new syntax means a denial, never a pass."""
-        options = self._may_change_options(calls)
+        names = {c.name for c in calls}
+        glob_rules_changed = "shopt" in names or any(a.name.lower() == "globignore" for c in calls for a in c.assigns)
+        fpath = any(a.name.lower() == "fpath" for c in calls for a in c.assigns) or any(
+            "fpath" in w.text.lower() for c in calls for w in c.argv
+        )
+        if "autoload" in names and fpath:
+            return "zsh `autoload` together with `fpath`: the body of the function comes from a file the line does not hold"
         for c in calls:
             for w in self._words(c):
                 if "zsh-code" in w.kinds:
-                    return "a zsh parameter flag that runs code (`${(e)x}`, `${(%)x}`)"
+                    return "a zsh glob qualifier or parameter flag that may run code (`(e…)`, `(+…)`, `(#q…)`, `${(e)x}`)"
                 if "exec" in w.kinds:
                     return "an expansion that runs code (`${x@P}`)"
-                if options and "zsh" in w.kinds:
-                    return "a zsh glob qualifier or parameter flag in a command that may change the shell options"
+                if glob_rules_changed and "glob" in w.kinds and re.search(r"(?:^|/)\.[^/]*[*?\[]", w.text):
+                    return "a glob with a leading dot where `shopt` / GLOBIGNORE may change what it matches (`.*` reaching `..`)"
             if c.opaque_code:
                 return "code the parser cannot see (`eval $x`, `bash -c \"$x\"`, `coproc`)"
             if c.argv and {"cmd", "proc"} & c.argv[0].kinds:
@@ -393,8 +394,13 @@ class AstGate(gate.Gate):
             except shell.ParseError as e:
                 self.parse_error = str(e)
                 return f"piigate: command denied — it cannot be parsed with certainty ({e}). {gate.HINT}"
-            if why := self._unjudgeable(self._current.calls):
+            if why := self._unjudgeable(self._current.calls) or self._current.dynamic_body:
                 return f"piigate: command denied — {why}; the gate cannot judge what it runs. {gate.HINT}"
+            composed = self._current.composed
+            if composed != command and re.search(r"\b(?:analyze|anonymize)\b", composed) and any(
+                c is None or c[1:2] in (["analyze"], ["anonymize"]) for c in self._invocations(command, {"piigate"})
+            ):
+                return gate.MCP_PIIGATE  # `piigate ana''lyze x`: the words say it, the raw text does not
             return super().bash(command, files)
         except Exception as e:  # whatever the adapter did not foresee: deny, and say so
             self.internal_error = f"{type(e).__name__}: {e}"[:200]
@@ -405,6 +411,17 @@ class AstGate(gate.Gate):
     def _strip_file_heredocs(self, command: str) -> str:
         cur = self._current
         return cur.view if cur is not None and cur.raw == command else command
+
+    def _human_only(self, command: str, tokens: list[str] | None) -> str | None:
+        """`piigate reverse` / `project approve` — checked on the line as written AND on the line as its words compose it
+        (`piigate rev''erse`, `q=rev; piigate ${q}erse`, `eval "piigate rev""erse"`)."""
+        reason = super()._human_only(command, tokens)
+        if reason:
+            return reason
+        p = self._cache.get(command)
+        if p is not None and p.composed != command:
+            return super()._human_only(p.composed, tokens)
+        return None
 
     def _tokens(self, command: str) -> list[str] | None:
         p = self._lookup(command)
@@ -456,13 +473,32 @@ class AstGate(gate.Gate):
     def _stage_kinds(self, stage, c, text, literal, verbatim, body):
         if self.cwd == UNKNOWN_DIR:  # the stage may have run in a directory the tree cannot name (a `cd` to a glob, to
             return self._unknown_dir_kinds(stage)  # `-`, from a function, from `eval`/`alias`): relative paths mean nothing
-        found = super()._stage_kinds(stage, c, text, literal, verbatim, body)
+        # a word that is one of several known values (a `for` over static words): the stage is judged for each value
+        positions = [i for i, t in enumerate(stage) if getattr(t, "alts", ())]
+        variants = [list(stage)]
+        for i in positions:
+            variants = [v[:i] + [alt] + v[i + 1 :] for v in variants for alt in (stage[i], *stage[i].alts)]
+            if len(variants) > 64:
+                return [("sensitive", "a variable with too many possible values to judge")]
+        found: list[tuple[str, str]] = []
+        for v in variants:
+            found += super()._stage_kinds(v, c, text, literal, verbatim, body)
         return found + self._dynamic_operand_kinds(stage)
+
+    def _stage_class(self, stage: list[str]) -> str:
+        """`rg --files` only prints the names of files: like `ls`/`find` (the gate's own table does not know it)."""
+        cmd = Path(stage[0]).name if stage else ""
+        if cmd == "rg" and stage[0] == cmd and "--files" in stage[1:] and not any(
+            str(t).startswith(("--pre", "--hostname-bin")) for t in stage[1:]
+        ):
+            return "names"
+        return super()._stage_class(stage)
 
     def _operands(self, stage: list[str]) -> list[tuple[int, str]]:
         """The words of the stage that are not its command, an option, a write target, text or a search pattern. Called
         with the dynamic words already replaced by a plain `X`, so that the gate's own helpers see an ordinary word."""
-        skip = self._write_targets(stage) | self._commit_message(stage) | self._searcher_args(stage)[0]
+        listing = bool(stage) and stage[0] == "rg" and "--files" in stage[1:]  # `rg --files DIR`: no pattern, DIR is a path
+        skip = self._write_targets(stage) | self._commit_message(stage) | (set() if listing else self._searcher_args(stage)[0])
         if stage and stage[0] in ("echo", "printf"):
             skip |= set(range(1, len(stage)))
         assignment = stage and stage[0] == "env"  # `NAME=value` words that `_strip_prefixes` put in front of a command
@@ -488,19 +524,42 @@ class AstGate(gate.Gate):
     def _dyn(t) -> bool:
         return bool(getattr(t, "dyn", False)) and not getattr(t, "single", False)
 
+    def _file_valued(self, stage: list[str], i: int, cmd: str) -> bool:
+        """The dynamic word `stage[i]` is the value of an option that names a file, or `--opt=value` of one, or `@file`."""
+        t = str(stage[i])
+        options = GH_FILE_VALUED if cmd == "gh" else FILE_VALUED
+        previous = str(stage[i - 1]) if i else ""
+        m = re.match(r"(--?[\w-]+)=", t)
+        return (
+            previous in options
+            or bool(m and m.group(1) in options)
+            or (cmd == "gh" and (t.startswith("@") or "=@" in t or previous in ("-f", "--field", "--raw-field")))
+        )
+
     def _dynamic_operand_kinds(self, stage: list[str]) -> list[tuple[str, str]]:
         """An operand whose value the line does not hold (a variable with no single static assignment, a command or
         process substitution) is a path nobody can read from the command. For a reader: refused. For a lister: its
-        names count as names of a sensitive directory (they must not flow into a reader). A write target: refused."""
+        names count as names of a sensitive directory (they must not flow into a reader). A write target or a file
+        option (`--file=`, `--pre`, `--body-file`, `@file`): refused."""
         if not stage:
             return []
         deny = [("sensitive", "an operand whose value the command does not hold (a variable or substitution) — the path is unknown")]
         probe = [("X" if self._dyn(t) else str(t)) for t in stage]
         if self._dyn(stage[0]):
             return deny  # the command itself is named by a variable of unknown value
-        if any(self._dyn(stage[i]) for i in self._write_targets(probe) if i < len(stage)):
+        writes = self._write_targets(probe)
+        if any(self._dyn(stage[i]) for i in writes if i < len(stage)):
             return deny  # `tee $(echo P)`, `> "$out"`: where it writes is unknown (it may be a file that runs later)
         cmd = Path(stage[0]).name
+        dyn = [i for i, t in enumerate(stage) if i and self._dyn(t)]
+        if not dyn:
+            return []
+        if any(self._file_valued(stage, i, cmd) for i in dyn):
+            return deny
+        if cmd in ("echo", "printf"):  # text — unless a glob turns it into the list of names that match
+            if any(re.search(r"[*?\[]", str(stage[i])) and not getattr(stage[i], "single", False) and i not in writes for i in dyn):
+                self._names_seen.add(tuple(stage))
+            return []
         if cmd in TEXT_ONLY:
             return []
         operands = [(i, t) for i, t in self._operands(probe) if self._dyn(stage[i])]
@@ -510,7 +569,10 @@ class AstGate(gate.Gate):
         if kind == "names":
             self._names_seen.add(tuple(stage))  # a listing of an unknown place: its names must stay on the screen
             return []
-        if kind == "remote" and cmd == "gh":
+        if cmd == "gh" and kind == "remote":
+            words = [str(t) for t in stage[1:] if not str(t).startswith("-")]
+            if tuple(words[:2]) in GH_FILE_COMMANDS:
+                return deny  # `gh gist create "$f"`, `gh release upload tag "$f"`: the operands are files that get uploaded
             return []
         return deny
 

@@ -156,7 +156,7 @@ class TestHeredocs(Base):
         self.assertEqual(heredoc(call).body, "one\ntwo\n")
         (call,) = parse('bash <<< "ls $HOME"')
         self.assertEqual(call.redirects[0].op, "<<<")
-        self.assertEqual(call.redirects[0].target.text, "ls $HOME")
+        self.assertEqual(call.redirects[0].target.text, "ls ${HOME}")
         self.assertEqual(call.stdin_interpreter, "bash")
 
     def test_two_heredocs_on_one_command_and_inside_substitution(self):

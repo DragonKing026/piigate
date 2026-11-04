@@ -62,6 +62,9 @@ class Word:
     expands: bool  # the value is not known statically: $var, ${}, $(), ``, $(( )), <( ), glob, ~, brace, extglob
     kinds: frozenset[str] = frozenset()  # param cmd arith proc glob tilde brace extglob
     quote: str = ""  # `'` or `"` when the word is ONE quoted fragment (alone or after `--option=`): never globbed or brace-expanded
+    # the pieces of the word as the TREE has them (never re-read from `text`): ("lit", text, quoted) | ("var", name, quoted)
+    # for a plain `$x` / `${x}` | ("opaque", text, names) for any other expansion (names = the variables it reads)
+    segs: tuple = ()
 
     @property
     def static(self) -> bool:
@@ -73,6 +76,8 @@ class Heredoc:
     body: str  # without the delimiter line; `<<-` has leading tabs removed; expansions are placeholders when unquoted
     delimiter: str
     quoted: bool  # `<<'EOF'`, `<<"EOF"`, `<<\EOF`: the shell expands nothing in the body
+    names: tuple = ()  # variables an unquoted body reads (`${x}` in `body`)
+    subst: bool = False  # an unquoted body holds a command substitution
 
 
 @dataclass(frozen=True)
@@ -110,6 +115,7 @@ class Call:
     )
     piped_in: bool = False  # stdin comes from a pipe
     piped_stderr: bool = False  # ... from `|&`: the previous stage's stderr comes with it
+    positional: tuple | None = None  # `$1 $2 …` of the function whose body this is (static arguments of the call), else None
     loop_var: str = ""  # the variable of a `for` / `select` pseudo-call
     pipes_out: bool = False  # its stage feeds a later stage of the pipeline (every command of a `{ a; b; } | c` stage does)
     opaque_code: bool = False  # `bash -c "$x"` / `eval $x`: code the parser cannot see
@@ -284,6 +290,9 @@ def _ansi_c(raw: str) -> str:
     return _ANSI.sub(one, raw)
 
 
+_ZSH_QUALIFIER_CODE = re.compile(r"\([^)]*[e+]|\(#q")  # an `e` or `+` inside the parentheses, or `(#q`: any separator
+
+
 def _has_glob(raw: str) -> bool:
     i, n = 0, len(raw)
     while i < n:
@@ -345,8 +354,6 @@ def _param_text(p: dict, kinds: set[str]) -> str:
     shell substitutes, and a path in it must stay visible to the gate. An unquoted operand with a glob is globbed."""
     name = _text(p.get("Param") or {})
     kinds.add("$" + name)  # the variable this expansion reads: `kinds` carries "$name" (the adapter resolves it)
-    if p.get("Short"):
-        return "$" + name
     inner = name
     if p.get("NestedParam"):  # zsh `${${(e)x}}`, `${(e)${y}}`: the nested expansion is the name
         inner = _expansion_text(p["NestedParam"], kinds)
@@ -380,8 +387,24 @@ def _find_subst(node):
     return found
 
 
+_PLAIN_PARAM_KEYS = {"Type", "Short", "Param", "Pos", "End", "Dollar", "Rbrace", "Position", "ValuePos", "ValueEnd"}
+
+
+def _expansion_seg(p: dict, kinds: set[str], quoted: bool) -> tuple[str, tuple]:
+    """(text, seg) of one expansion part of a word; `kinds` gets what it reads."""
+    if _need(p, "Type") == "ParamExp" and p.keys() <= _PLAIN_PARAM_KEYS:
+        name = _text(p.get("Param") or {})
+        text = _expansion_text(p, kinds)
+        return text, ("var", name, quoted)
+    own: set[str] = set()
+    text = _expansion_text(p, own)
+    kinds |= own
+    return text, ("opaque", text, tuple(sorted(k[1:] for k in own if k.startswith("$"))))
+
+
 def _word(node: dict) -> Word:
     texts: list[str] = []
+    segs: list[tuple] = []
     kinds: set[str] = set()
     quoting: set[str] = set()
     for i, p in enumerate(node.get("Parts") or []):
@@ -390,10 +413,13 @@ def _word(node: dict) -> Word:
             raw = _text(p)
             quoting.add("none")
             texts.append(_unescape(raw))
+            segs.append(("lit", texts[-1], False))
             if re.search(r"(?<!\\)\(", raw):  # an unescaped `(` inside a word (`\(` is a literal paren: `find \( -name x \)`)
                 # zsh only: a glob qualifier `*(.)` / `*(e:code:)` / `*(+func)` is kept by shfmt as plain text, it has no
-                # node (it can run code: `(e:…:)`, `(e/…/)`, `(+func)`, `(#qe…)` — never read from the text)
-                kinds.add("zsh")  # no node for what the qualifier does: the gate decides by the context, not by its text
+                # node. Whether it runs code is never read from its separators: any `e`, any `+`, any `#q` inside counts
+                kinds.add("zsh")
+                if _ZSH_QUALIFIER_CODE.search(raw):
+                    kinds.add("zsh-code")
             if _has_glob(raw):
                 kinds.add("glob")
             if _has_brace(raw):
@@ -403,15 +429,21 @@ def _word(node: dict) -> Word:
         elif t == "SglQuoted":
             quoting.add("single")
             texts.append(_ansi_c(_text(p)) if p.get("Dollar") else _text(p))
+            segs.append(("lit", texts[-1], True))
         elif t == "DblQuoted":
             quoting.add("double")
             for q in p.get("Parts") or []:
                 if _need(q, "Type") == "Lit":
                     texts.append(_unescape_dq(_text(q)))
+                    segs.append(("lit", texts[-1], True))
                 else:
-                    texts.append(_expansion_text(q, kinds))
+                    text, seg = _expansion_seg(q, kinds, True)
+                    texts.append(text)
+                    segs.append(seg)
         else:
-            texts.append(_expansion_text(p, kinds))
+            text, seg = _expansion_seg(p, kinds, False)
+            texts.append(text)
+            segs.append(seg)
     if not quoting:
         label = "none"
     elif len(quoting) == 1:
@@ -426,7 +458,7 @@ def _word(node: dict) -> Word:
             quote = '"'
         elif last["Type"] == "SglQuoted" and not last.get("Dollar"):
             quote = "'"
-    return Word("".join(texts), label, bool(kinds), frozenset(kinds), quote)
+    return Word("".join(texts), label, bool(kinds), frozenset(kinds), quote, tuple(segs))
 
 
 def _expansion_text(p: dict, kinds: set[str]) -> str:
@@ -455,6 +487,8 @@ def _expansion_text(p: dict, kinds: set[str]) -> str:
     if t == "ExtGlob":
         kinds.add("extglob")
         kinds.add("zsh")  # zsh reads `(…)` after a pattern as a glob qualifier; the tree has no node for what is inside
+        if _ZSH_QUALIFIER_CODE.search("(" + _text(p.get("Pattern") or {}) + ")"):
+            kinds.add("zsh-code")
         return _text(p, "Op") + _text(p.get("Pattern") or {}) + ")"
     raise ParseError(f"unsupported word part {t}")
 
@@ -473,7 +507,7 @@ def _heredoc(redir: dict) -> Heredoc:
     body = "".join(pieces)
     if _need(redir, "Op") == "<<-":
         body = re.sub(r"(?m)^\t+", "", body)
-    return Heredoc(body, delimiter, quoted)
+    return Heredoc(body, delimiter, quoted, tuple(sorted(k[1:] for k in kinds if k.startswith("$"))), bool({"cmd", "proc"} & kinds))
 
 
 def _redirect(r: dict, inherited: bool = False) -> Redirect:
@@ -482,6 +516,141 @@ def _redirect(r: dict, inherited: bool = False) -> Redirect:
     if op in ("<<", "<<-"):
         return Redirect(op, None, _heredoc(r), fd, inherited)
     return Redirect(op, _word(_need(r, "Word")), None, fd, inherited)
+
+
+# ------------------------------------------------------------------------------------------------ variables
+#
+# A variable has a known value only when the ONE assignment the line holds is a fully static word (quotes may be in it:
+# the value is what the shell makes of it). Anything else that may assign — `declare -n`, `read`, `mapfile`, `printf -v`,
+# `getopts`, `${x:=…}`, a second assignment, an assignment from another variable or from a substitution, a prefix
+# assignment `x=1 cmd` — makes the value unknown. A `for` / `select` variable takes each of its static items: a SET.
+
+DECLARATIONS = {"declare", "typeset", "local", "readonly", "export"}
+# builtins that assign to the variables named in their arguments: every identifier among the arguments is unknown after
+ASSIGNING = {"read", "mapfile", "readarray", "getopts", "unset", "coproc"}
+
+
+@dataclass
+class VarModel:
+    sites: dict  # name -> [(call index, "static" | "set" | "dynamic", payload)]
+    unknown: set
+    env: dict  # the environment the line may rely on, said explicitly
+
+    def value(self, name: str, use: int, origin: str = "top", positional=None, pwd=None):
+        """("static", text) | ("set", [texts]) | ("list", [texts]) (`$@`) | ("unknown", None)."""
+        if name.isdigit() and name != "0":
+            if positional is None:
+                return "unknown", None
+            n = int(name)
+            return "static", (positional[n - 1] if n <= len(positional) else "")
+        if name in ("@", "*"):
+            return ("list", list(positional)) if positional is not None else ("unknown", None)
+        if name == "#":
+            return ("static", str(len(positional))) if positional is not None else ("unknown", None)
+        if name in self.unknown:
+            return "unknown", None
+        found = self.sites.get(name)
+        if found:
+            if len(found) != 1:
+                return "unknown", None
+            i, kind, payload = found[0]
+            if kind == "static" and (i < use or origin == "function"):
+                return "static", payload
+            if kind == "set" and (i < use or origin == "function"):
+                return "set", payload
+            return "unknown", None
+        if name == "PWD" and pwd is not None:
+            return "static", pwd
+        if name in self.env:
+            return "static", self.env[name]
+        return "unknown", None
+
+
+def build_model(calls: list, assigned_in_expansions=(), session: str = "/") -> VarModel:
+    sites: dict[str, list] = {}
+    unknown: set[str] = set(assigned_in_expansions)
+    for i, c in enumerate(calls):
+        persistent = not c.argv or c.name in DECLARATIONS  # `x=1` alone / `declare x=1`; `x=1 cmd` is only for cmd
+        for a in c.assigns:
+            static = persistent and a.value is not None and not a.array and not a.append and a.value.static
+            sites.setdefault(a.name, []).append((i, "static" if static else "dynamic", a.value.text if static else None))
+        if c.loop_var:
+            items = c.argv[1:]
+            ok = bool(items) and all(w.static or (w.kinds - {"glob", "brace"} == set() and w.segs) for w in items)
+            sites.setdefault(c.loop_var, []).append((i, "set" if ok else "dynamic", [w.text for w in items] if ok else None))
+        words = [w.text for w in c.argv[1:] if w.static]
+        if c.name in ASSIGNING:
+            unknown |= {t for t in words if re.fullmatch(r"[A-Za-z_]\w*", t)}
+        elif c.name == "printf" and "-v" in words:
+            unknown |= set(words[words.index("-v") + 1 : words.index("-v") + 2])
+        elif c.name in DECLARATIONS and any(t.startswith("-") and "n" in t for t in words):
+            unknown |= {t.split("=")[0] for t in words if not t.startswith("-")}  # a nameref: `declare -n r=x`
+    env = {"HOME": os.path.expanduser("~"), "TMPDIR": os.environ.get("TMPDIR") or "/tmp"}
+    return VarModel(sites, unknown, env)
+
+
+MAX_VARIANTS = 64
+_GLOB_CHARS = re.compile(r"[*?\[]")
+
+
+def subst_word(w: Word, lookup, dialect: str = DEFAULT_DIALECT) -> tuple[list[list[str]], list[str]]:
+    """The words a shell makes of `w` when the variables in it are known: (variants, unresolved). Each variant is the list of
+    words (usually one); a SET variable gives one variant per value. `lookup(name)` is `VarModel.value`. Pieces that are
+    not known stay as `${name}` / the expansion's text and their variables are listed as unresolved. Word splitting
+    follows the dialect: bash splits an unquoted value at whitespace (only when the variable is the whole word, else
+    unresolved) and globs it (unresolved), zsh does neither."""
+    if not w.segs:
+        return [[w.text]], []
+    unresolved: list[str] = []
+    options: list[list[str]] = []
+    single = len(w.segs) == 1
+    for seg in w.segs:
+        if seg[0] == "lit":
+            options.append([seg[1]])
+        elif seg[0] == "opaque":
+            options.append([seg[1]])
+            unresolved.extend(seg[2] or ("(expansion)",))
+        else:
+            _, name, quoted = seg
+            kind, val = lookup(name)
+            if kind == "list":
+                if single and name == "@":
+                    return [list(val)], []  # `"$@"`: one word per argument
+                if single and name == "*":
+                    return [[" ".join(val)] if quoted else list(val)], []
+                options.append(["${" + name + "}"])
+                unresolved.append(name)
+                continue
+            if kind not in ("static", "set"):
+                options.append(["${" + name + "}"])
+                unresolved.append(name)
+                continue
+            values = [val] if kind == "static" else list(val)
+            for v in values:
+                if not quoted and dialect == "bash" and (re.search(r"\s", v) and not single or _GLOB_CHARS.search(v)):
+                    options.append(["${" + name + "}"])
+                    unresolved.append(name)
+                    break
+            else:
+                options.append(values)
+    total = 1
+    for o in options:
+        total *= len(o)
+    if total > MAX_VARIANTS:
+        return [[w.text]], [s[1] for s in w.segs if s[0] == "var"] or ["(set)"]
+    variants: list[list[str]] = [[""]]
+    for seg, o in zip(w.segs, options):
+        variants = [[v[0] + t] for v in variants for t in o]
+    out: list[list[str]] = []
+    for (v,) in variants:
+        if single and w.segs[0][0] == "var" and not w.segs[0][2] and not unresolved:
+            if dialect == "bash":
+                out.append(v.split())  # an unquoted whole-word value: split, and gone when empty
+            else:
+                out.append([v] if v else [])
+        else:
+            out.append([v])
+    return out, unresolved
 
 
 # ------------------------------------------------------------------------------------------------ walking
@@ -569,8 +738,10 @@ def _stdin_interpreter(argv: list[Word]) -> str:
 
 
 class _Walker:
-    def __init__(self, session_cwd: str, depth: int = 0, dialect: str = DEFAULT_DIALECT):
+    def __init__(self, session_cwd: str, depth: int = 0, dialect: str = DEFAULT_DIALECT, model: VarModel | None = None):
         self.dialect = dialect
+        self.model = model  # values of variables (second pass only): `cd "$D"` is followed when D is known
+        self.positional: tuple | None = None
         self.loops = 0  # loops open around the statement being walked
         self.functions: dict[str, dict] = {}  # name -> body of the functions declared so far: analysed again at each call
         self.stack: list[str] = []  # functions being walked (a recursive call is refused)
@@ -581,9 +752,20 @@ class _Walker:
 
     # -- emitting
     def emit(self, call: Call) -> Call:
+        call.positional = self.positional
         if not self.dry:
             self.calls.append(call)
         return call
+
+    def lookup(self, name: str):
+        if self.model is None:
+            return "unknown", None
+        return self.model.value(name, len(self.calls), "function" if self.stack else "top", self.positional)
+
+    def words_of(self, w: Word) -> list[list[str]] | None:
+        """The word lists a word makes when everything in it is known (see `subst_word`), else None."""
+        variants, unresolved = subst_word(w, self.lookup, self.dialect)
+        return None if unresolved else variants
 
     # -- substitutions found in some JSON (words, redirects, heredocs…)
     def substs(self, node, st: _State, parent: Call | None) -> None:
@@ -609,7 +791,10 @@ class _Walker:
         if background:
             self.cmd(s.get("Cmd"), st, True, redirs, origin, s, own)
             return st
-        return self.cmd(s.get("Cmd"), st, sub, redirs, origin, s, own)
+        out = self.cmd(s.get("Cmd"), st, sub, redirs, origin, s, own)
+        if s.get("Negated"):  # `! cd x && cat`: what follows runs when the command FAILED — wherever it got
+            out = self.unknown_dir(out)
+        return out
 
     def cmd(self, c, st, sub, redirs, origin, stmt, own) -> _State:
         t = _need(c, "Type") if c else None
@@ -634,16 +819,13 @@ class _Walker:
         if t == "IfClause":
             return self.if_clause(c, st, sub, inherited, origin)
         if t == "WhileClause":
-            return self.loop(
-                lambda s0: self.stmts(
-                    c.get("Do") or [],
-                    self.stmts(c.get("Cond") or [], s0, sub, inherited, origin),
-                    sub,
-                    inherited,
-                    origin,
-                ),
-                st,
-            )
+            def while_body(s0):
+                cond = self.stmts(c.get("Cond") or [], s0, sub, inherited, origin)
+                if c.get("Until"):  # `until cd x; do …`: the body runs while the condition FAILS
+                    cond = self.unknown_dir(cond)
+                return self.stmts(c.get("Do") or [], cond, sub, inherited, origin)
+
+            return self.loop(while_body, st)
         if t == "ForClause":
             # the words of `for f in WORDS` / `select f in WORDS` are arguments like any other: a path there is judged
             words = [Word("select" if c.get("Select") else "for", "none", False), *(_word(n) for n in _find_words(c.get("Loop")))]
@@ -771,6 +953,13 @@ class _Walker:
         after = self.nested_script(call, st)  # `eval cd ..` runs in this shell: its directory carries on
         self.chdir_wrapper(call, st)
         name = argv[0].text if argv and argv[0].static else ""
+        if argv and not argv[0].static and argv[0].kinds & {"param", "cmd", "proc"}:
+            # the command is named by an expansion: a variable that holds a function's name (`ff=f; $ff`) may `cd`
+            variants = self.words_of(argv[0])
+            if variants and len(variants) == 1 and len(variants[0]) == 1:
+                name = variants[0][0]
+            else:
+                return self.unknown_dir(after or st)
         if name in self.functions:
             return self.call_function(name, call, after or st, sub, redirs, origin)
         return self.after_call(call, after or st)
@@ -783,11 +972,21 @@ class _Walker:
         if len(self.stack) >= MAX_CALL_DEPTH:
             raise ParseError("functions called too deeply")
         inherited = tuple(Redirect(r.op, r.target, r.heredoc, r.fd, True) for r in redirs)
+        # `$1 $2 "$@"` of the body are the arguments of this call when each of them is known
+        args: list[str] | None = []
+        for w in call.argv[1:]:
+            variants = self.words_of(w)
+            if variants is None or len(variants) != 1:
+                args = None
+                break
+            args += variants[0]
+        saved, self.positional = self.positional, (tuple(args) if args is not None else None)
         self.stack.append(name)
         try:
             return self.stmt(self.functions[name], st, sub, inherited, "function")
         finally:
             self.stack.pop()
+            self.positional = saved
 
     def assign(self, a: dict) -> Assign:
         array: list[Word] = []
@@ -869,7 +1068,9 @@ class _Walker:
         if self.depth >= MAX_DEPTH:
             raise ParseError("scripts nested too deeply")
         text = " ".join(w.text for w in words)
-        inner = _Walker(self.session, self.depth + 1, self.dialect)
+        inner = _Walker(self.session, self.depth + 1, self.dialect, self.model)
+        if kind == "eval":  # `eval` runs in this shell: it knows the functions (and the arguments) of the line
+            inner.functions, inner.positional = self.functions, self.positional
         inner.dry = self.dry
         out = inner.stmts(ast(text, self.dialect).get("Stmts") or [], st, True, (), origin)
         call.substitutions.extend(_toplevel(inner.calls))
@@ -902,6 +1103,15 @@ class _Walker:
         if len(args) > 1:
             return self.unknown_dir(st)
         tilde = True
+        resolved = None
+        if args and args[0].kinds - {"param"} and not (args[0].kinds & {"tilde", "glob", "brace", "cmd", "proc", "arith", "zsh"}):
+            variants = self.words_of(args[0]) if self.model is not None else None
+            if variants and all(len(v) == 1 for v in variants):
+                resolved = [v[0] for v in variants]
+        if resolved is not None:
+            moved = frozenset(_resolve(t, d, False) for t in resolved for d in st.sure)
+            absolute = all(os.path.isabs(t) for t in resolved)
+            return _State(moved, st.seen | moved, st.known or absolute, st.any_known)
         if not args:
             target = "~" if name == "cd" else None
         elif (
@@ -967,6 +1177,7 @@ class CallList(list):
     """The calls of a line, plus `assigned_in_expansions`: variables that a `${x:=…}` / `${x=…}` may assign."""
 
     assigned_in_expansions: frozenset[str] = frozenset()
+    model: VarModel | None = None
 
 
 def _expansion_assignments(node) -> set[str]:
@@ -997,6 +1208,12 @@ def parse(command: str, *, cwd: str, dialect: str = DEFAULT_DIALECT) -> list[Cal
         tree = ast(command, dialect)
         walker.stmts(tree.get("Stmts") or [], _State(start, start), False, (), "top")
         result.assigned_in_expansions = frozenset(_expansion_assignments(tree))
+        model = build_model(walker.calls, result.assigned_in_expansions, walker.session)
+        if model.sites:  # a second walk that follows `cd "$D"` and function arguments by the values of the variables
+            walker = _Walker(cwd, dialect=dialect, model=model)
+            walker.stmts(tree.get("Stmts") or [], _State(start, start), False, (), "top")
+            model = build_model(walker.calls, result.assigned_in_expansions, walker.session)
+        result.model = model
     except ParseError:
         raise
     except (RecursionError, KeyError, TypeError, ValueError, IndexError, AttributeError) as e:
