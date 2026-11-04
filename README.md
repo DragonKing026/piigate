@@ -233,7 +233,10 @@ the session's and the working directory's own project. piigate puts two things i
 marker, which the gate recreates on every command while the directory exists, and, during `piigate_analyze`, a temporary
 `.piigate-work/analysis-…` directory that is removed when the analysis ends (an empty `.piigate-work/` remains). Because of
 the marker, `rmdir Sensitive-data` fails with "Directory not empty" (the gate says so instead of letting it fail); remove
-the directory with its marker in one command (when nothing else is in it): `rm -r Sensitive-data`.
+the empty directory with `rm Sensitive-data/.gitignore && rmdir Sensitive-data` — the gate lets exactly this command
+through, and `rmdir` refuses to remove anything else that has appeared in the directory in the meantime. A recursive
+search from a directory above a `Sensitive-data` (also in a worktree) is denied; the gate walks up to three directory
+levels (at most 20000 directories) and denies a tree that is too large to check.
 
 ## Configuration
 
