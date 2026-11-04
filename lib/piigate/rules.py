@@ -344,8 +344,14 @@ def _group(m: re.Match) -> tuple[int, int]:
     return (m.start(1), m.end(1)) if m.re.groups and m.group(1) else (m.start(), m.end())
 
 
+# four or more groups of three digits in a row are a list of numbers (HTTP codes `200 302 404 500`), not a phone
+NUMBER_LIST_RE = re.compile(r"(?<![\w+.-])\d{3}(?:[\s-]\d{3}){3,}(?!\w)")
+BARE_PHONE_RE = re.compile(r"\d{3}[\s-]\d{3}[\s-]\d{3}")
+
+
 def detect(text: str, *, dates: str = "all", drugs: bool = True) -> list[Fragment]:
     result: list[Fragment] = []
+    lists = [m.span() for m in NUMBER_LIST_RE.finditer(text)]
     for type_, regex, weight in PATTERNS:
         if type_ == "DATE" and dates == "none":
             continue
@@ -356,6 +362,8 @@ def detect(text: str, *, dates: str = "all", drugs: bool = True) -> list[Fragmen
                 if not re.search(r"ur\.|urodz|dob|birth", before):
                     continue
             if type_ == "EMAIL" and not email_valid(m.group()):
+                continue
+            if type_ == "PHONE" and BARE_PHONE_RE.fullmatch(m.group()) and any(a <= s and k <= b for a, b in lists):
                 continue
             result.append(Fragment(s, k, type_, weight))
 

@@ -3968,6 +3968,28 @@ class TestChecksumNumbers(unittest.TestCase):
         result, _ = text.filter_text("karta 4111 1111 1111 1111", CONFIG)
         self.assertNotIn("4111", result)
 
+    @unittest.skipUnless(PRESIDIO, PRESIDIO_SKIP)
+    def test_http_code_lists_are_not_phones(self):
+        """Issue #30: four or more groups of three digits are a list of numbers; a phone stays a phone."""
+        from piigate import rules
+
+        for lst in ("200 302 200 200 200", "kody: 200 302 404 500 200", "200 302 404 500", "200-302-404-500"):
+            with self.subTest(lst):
+                self.assertEqual([f for f in rules.detect(lst) if f.type_ == "PHONE"], [])
+                result, _ = text.filter_text(lst, CONFIG)
+                self.assertNotIn("PHONE_", result)
+                self.assertEqual(sensors_mask(lst)[1], 0)
+        for phone in ("600 302 200", "tel. 600 302 200", "+48 600 302 200", "22 630 10 10", "600-302-200"):
+            with self.subTest(phone):
+                self.assertTrue([f for f in rules.detect(f"Zadzwoń: {phone}.") if f.type_ == "PHONE"])
+        # a phone in a line with other numbers, and next to a list of codes
+        line = "kody 200 302 404 500 oraz tel. 600 302 200 i 22 630 10 10"
+        found = [line[f.start : f.end] for f in rules.detect(line) if f.type_ == "PHONE"]
+        self.assertEqual(sorted(set(found)), ["22 630 10 10", "600 302 200"])
+        result, _ = text.filter_text("tel 600 302 200, kody 200 302 200 200 200", CONFIG)
+        self.assertNotIn("600 302 200", result)
+        self.assertIn("200 302 200 200 200", result)
+
 
 def sensors_mask(value: str) -> tuple[str, int]:
     from piigate import sensors
