@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 TESTS_DIR = Path(__file__).resolve().parent
@@ -50,6 +51,7 @@ def set_config(changes: dict | None) -> None:
 
 set_config(None)
 import fixtures as dt
+import hook as hook_module
 from piigate import FilterError, analysis, anonymization, gate, config, files, table, text, verdict, engines
 from piigate.pseudonym_map import PseudonymMap
 
@@ -3595,6 +3597,596 @@ class TestContentNotNames(unittest.TestCase):
             with self.subTest(command):
                 self.assertIsNotNone(b.bash(command))
         self.assertIsNone(b.bash("git commit -m 'about PIIGATE_DATA_DIR and piigate/map'"))
+
+
+class TestWorktreeDataDirs(unittest.TestCase):
+    """issue #7: the in-project sensitive directory of EVERY git worktree of the repo is protected, whatever the session
+    and the working directory; one definition of "sensitive" for the gate and the MCP tools; `rmdir` of a directory that
+    holds only the piigate marker."""
+
+    def setUp(self):
+        self.base = TMP / f"worktree-dirs-{self._testMethodName}"
+        shutil.rmtree(self.base, ignore_errors=True)
+        self.session = os.environ.pop("CLAUDE_PROJECT_DIR", None)
+        self.main = self.base / "repo"
+        self.main.mkdir(parents=True)
+        self.git("init", "-q", "-b", "main", str(self.main), cwd=self.base)
+        self.git("commit", "-q", "--allow-empty", "-m", "init")
+        (self.main / ".gitignore").write_text(".claude/worktrees/\n", encoding="utf-8")
+        (self.main / "README.md").write_text("# readme\n", encoding="utf-8")
+        (self.main / "notes.md").write_text("notes\n", encoding="utf-8")
+        (self.main / "src").mkdir()
+        (self.main / "src" / "a.py").write_text("x = 1\n", encoding="utf-8")
+        self.git("add", ".gitignore", "README.md", "notes.md", "src/a.py")
+        self.git("commit", "-q", "-m", "files")
+        self.wt1 = self.add_worktree("w1")
+        self.wt2 = self.add_worktree("w2")
+        for k in (self.main, self.wt1, self.wt2):
+            (k / "Sensitive-data").mkdir()
+            (k / "Sensitive-data" / "x.txt").write_text("secret\n", encoding="utf-8")
+
+    def tearDown(self):
+        os.environ.pop("CLAUDE_PROJECT_DIR", None)
+        if self.session is not None:
+            os.environ["CLAUDE_PROJECT_DIR"] = self.session
+
+    def git(self, *arguments: str, cwd: Path | None = None) -> None:
+        subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", *arguments],
+            cwd=cwd or self.main, check=True, capture_output=True,
+        )
+
+    def add_worktree(self, name: str) -> Path:
+        path = self.main / ".claude" / "worktrees" / name
+        self.git("worktree", "add", "-q", "-b", name, str(path))
+        return path
+
+    def cfg(self, session: Path | None, cwd: Path) -> dict:
+        if session:
+            os.environ["CLAUDE_PROJECT_DIR"] = str(session)
+        else:
+            os.environ.pop("CLAUDE_PROJECT_DIR", None)
+        k = config.load(str(cwd))
+        k["sources"]["non_public"] = []
+        k["sources"]["public_repo_min_age_h"] = 0
+        return k
+
+    def gate(self, session: Path | None, cwd: Path) -> gate.Gate:
+        return gate.Gate(self.cfg(session, cwd), str(cwd))
+
+    def combinations(self):
+        return [(self.main, self.wt1), (self.wt1, self.main), (self.wt1, self.wt2), (None, self.wt1), (None, self.main)]
+
+    # --- worktree_roots -------------------------------------------------------------------------
+
+    def test_worktree_roots(self):
+        real = lambda k: os.path.realpath(k)  # noqa: E731
+        want = {real(self.main), real(self.wt1), real(self.wt2)}
+        for k in (self.main, self.wt1, self.wt2):
+            with self.subTest(k):
+                roots = config.worktree_roots(str(k))
+                self.assertEqual(roots[0], real(k))
+                self.assertEqual(set(roots), want)
+        self.assertEqual(config.worktree_roots(str(self.main / "src")), [real(self.main / "src")])  # no `.git`: just itself
+
+    def test_worktree_roots_edge_cases(self):
+        real = os.path.realpath
+        # a stale entry (the worktree directory is gone) and garbage in `gitdir` are skipped without an exception
+        entries = self.main / ".git" / "worktrees"
+        (entries / "gone").mkdir()
+        (entries / "gone" / "gitdir").write_text(str(self.base / "nowhere" / ".git") + "\n", encoding="utf-8")
+        (entries / "junk").mkdir()
+        (entries / "junk" / "gitdir").write_bytes(b"\xff\xfe\x00 not a path")
+        (entries / "huge").mkdir()
+        (entries / "huge" / "gitdir").write_text("/" * 100000, encoding="utf-8")
+        (entries / "notgit").mkdir()
+        (entries / "notgit" / "gitdir").write_text(str(self.base / "elsewhere") + "\n", encoding="utf-8")
+        (self.base / "elsewhere").mkdir()
+        self.assertEqual(set(config.worktree_roots(str(self.main))), {real(self.main), real(self.wt1), real(self.wt2)})
+        # a relative `.git` pointer and a relative `gitdir` of a worktree entry
+        (entries / "w1" / "gitdir").write_text("../../../.claude/worktrees/w1/.git\n", encoding="utf-8")
+        self.assertIn(real(self.wt1), config.worktree_roots(str(self.main)))
+        (self.wt1 / ".git").write_text("gitdir: ../../../.git/worktrees/w1\n", encoding="utf-8")
+        self.assertEqual(set(config.worktree_roots(str(self.wt1))), {real(self.main), real(self.wt1), real(self.wt2)})
+        # a submodule (no `commondir`) is just itself
+        module = self.base / "module"
+        (self.base / "modgit").mkdir()
+        module.mkdir()
+        (module / ".git").write_text(f"gitdir: {self.base / 'modgit'}\n", encoding="utf-8")
+        self.assertEqual(config.worktree_roots(str(module)), [real(module)])
+        # a bare repository: no main directory, the linked worktrees are still found
+        bare = self.base / "bare.git"
+        self.git("clone", "-q", "--bare", str(self.main), str(bare), cwd=self.base)
+        self.git("--git-dir", str(bare), "worktree", "add", "-q", str(self.base / "bw"), "w1", cwd=self.base)
+        self.assertEqual(config.worktree_roots(str(self.base / "bw")), [real(self.base / "bw")])
+
+    # --- one set of directories for the gate and the MCP tools ----------------------------------
+
+    def test_every_worktree_directory_is_sensitive_everywhere(self):
+        for session, cwd in self.combinations():
+            cfg = self.cfg(session, cwd)
+            for k in (self.main, self.wt1, self.wt2):
+                with self.subTest(session=session, cwd=cwd, dir=k):
+                    d = os.path.realpath(k / "Sensitive-data")
+                    self.assertIn(d, config.sensitive_dirs(cfg))
+                    self.assertEqual(files.source(d, cfg, directory=True), Path(d))
+                    self.assertIsNotNone(self.gate(session, cwd).decision("Read", {"file_path": f"{d}/x.txt"}))
+        first = self.cfg(self.wt1, self.main)["in_project"]["sensitive"]
+        self.assertEqual(first[0], os.path.join(os.path.realpath(self.wt1), "Sensitive-data"))  # the session holds the copies
+        self.assertEqual(self.cfg(self.wt1, self.main)["in_project"]["anonymized"], [
+            os.path.join(os.path.realpath(self.wt1), "Anonymized-data"), os.path.join(os.path.realpath(self.main), "Anonymized-data")
+        ])
+
+    def test_directory_of_another_project_is_listable(self):
+        other = self.base / "other" / "Sensitive-data"
+        other.mkdir(parents=True)
+        (other / "y.txt").write_text("secret\n", encoding="utf-8")
+        cfg = self.cfg(self.main, self.wt1)
+        self.assertEqual(files.source(str(other), cfg, directory=True), Path(os.path.realpath(other)))
+        self.assertIsNotNone(self.gate(self.main, self.wt1).decision("Read", {"file_path": str(other / "y.txt")}))
+        with self.assertRaises(FilterError):  # a directory of another name stays outside
+            files.source(str(self.main / "src"), cfg, directory=True)
+
+    def test_symlink_out_of_a_sensitive_directory_loses_the_permission(self):
+        outside = self.base / "outside"
+        outside.mkdir()
+        (outside / "z.txt").write_text("plain\n", encoding="utf-8")
+        for k in (self.main, self.wt1):
+            (k / "Sensitive-data" / "link").symlink_to(outside)
+            for session, cwd in self.combinations():
+                with self.subTest(session=session, cwd=cwd, dir=k):
+                    with self.assertRaises(FilterError):
+                        files.source(str(k / "Sensitive-data" / "link"), self.cfg(session, cwd), directory=True)
+
+    def test_anonymized_directories_do_not_grow(self):
+        """A `gitdir` file can be planted by the agent: it may widen what is protected, never what is read without checks."""
+        foreign = self.base / "foreign"
+        (foreign / "Anonymized-data").mkdir(parents=True)
+        (foreign / "Sensitive-data").mkdir()
+        (foreign / ".git").mkdir()
+        planted = self.main / ".git" / "worktrees" / "planted"
+        planted.mkdir()
+        (planted / "gitdir").write_text(f"{foreign}/.git\n", encoding="utf-8")
+        cfg = self.cfg(self.main, self.main)
+        self.assertIn(os.path.realpath(foreign / "Sensitive-data"), config.sensitive_dirs(cfg))
+        fa = os.path.realpath(foreign / "Anonymized-data")
+        self.assertNotIn(fa, config.anonymized_dirs(cfg))
+        self.assertNotIn(fa, cfg["in_project"]["anonymized"])
+        self.assertNotIn(os.path.realpath(self.wt2 / "Anonymized-data"), config.anonymized_dirs(cfg))
+        (foreign / "Anonymized-data" / "a.csv").write_text("id;pesel\n1;2\n", encoding="utf-8")
+        self.assertNotIn(fa, self.gate(self.main, self.main).anonymized)
+
+    # --- a recursive search from the repository root ----------------------------------------------
+
+    def test_recursion_from_the_root_reaches_worktree_data(self):
+        for session in (None, self.main):
+            b = self.gate(session, self.main)
+            for command in (
+                "grep -r x .",
+                "grep -rn secret .",
+                "find . -type f -exec cat {} +",
+                "cat .claude/worktrees/w1/Sensitive-data/x.txt",
+                "grep -r x .claude",
+                "grep -r x .claude/worktrees/w1",
+            ):
+                with self.subTest(command, session=session):
+                    self.assertIsNotNone(b.bash(command))
+        shutil.rmtree(self.main / "Sensitive-data")
+        shutil.rmtree(self.wt2 / "Sensitive-data")
+        for command in ("grep -r x .", "find . -type f -exec cat {} +"):  # the leak: only a worktree holds data
+            with self.subTest("only w1", command=command):
+                self.assertIsNotNone(self.gate(None, self.main).bash(command))
+        shutil.rmtree(self.wt1 / "Sensitive-data")
+        b = self.gate(None, self.main)
+        for command in ("grep -r x .", "find . -type f -exec cat {} +", "grep -r x src", "cat README.md", "rg x"):
+            with self.subTest("without data", command=command):
+                self.assertIsNone(b.bash(command))
+
+    def test_search_tools_skip_the_hidden_worktree_directories(self):
+        b = self.gate(None, self.main)
+        self.assertIsNone(b.bash("rg x"))
+        self.assertIsNone(b.bash("grep -r x src"))
+        self.assertIsNone(b.decision("Grep", {"pattern": "x", "path": str(self.main)}))  # `.gitignore` of the directories
+        self.assertIsNone(b.decision("Grep", {"pattern": "x", "path": str(self.main / "src")}))
+        self.assertIsNotNone(b.decision("Grep", {"pattern": "x", "path": str(self.wt1 / "Sensitive-data")}))
+
+    def test_exclusion_suggested_in_the_denial_works(self):
+        """The denial names every sensitive directory below the search root; an .ignore with exactly those entries is
+        what rg/fd honour (one entry out of three is not enough)."""
+        for k in (self.main, self.wt1, self.wt2):
+            (k / "Sensitive-data" / ".gitignore").write_text("# no marker\n", encoding="utf-8")  # not hidden by `*`
+        reason = self.gate(None, self.main).bash("grep -r x .")
+        entries = ["/Sensitive-data/", "/.claude/worktrees/w1/Sensitive-data/", "/.claude/worktrees/w2/Sensitive-data/"]
+        for entry in entries:
+            self.assertIn(f"`{entry}`", reason)
+        for k in (self.main, self.wt1, self.wt2):  # the gate restores the markers on every run: remove them again
+            (k / "Sensitive-data" / ".gitignore").unlink(missing_ok=True)
+        (self.main / ".ignore").write_text("\n".join(entries[:1]) + "\n", encoding="utf-8")
+        with unittest.mock.patch.object(config, "ensure_project_gitignore"):
+            self.assertIsNotNone(self.gate(None, self.main).bash("rg x ."))
+            (self.main / ".ignore").write_text("\n".join(entries) + "\n", encoding="utf-8")
+            self.assertIsNone(self.gate(None, self.main).bash("rg x ."))
+
+    def test_git_and_ordinary_commands_are_unchanged(self):
+        b = self.gate(self.main, self.wt1)
+        for command in ("git worktree add -b w3 .claude/worktrees/w3 main", "git status", "git merge --ff-only w1", "ls", "ls -R", "find .", "ls Sensitive-data"):
+            with self.subTest(command):
+                self.assertIsNone(b.bash(command))
+
+    # --- names in the worktree --------------------------------------------------------------------
+
+    def test_names_and_text_in_a_worktree(self):
+        b = self.gate(self.main, self.wt1)
+        (self.wt1 / "notes.md").write_text("notes\n", encoding="utf-8")
+        for command in (
+            "cat README.md",
+            "cat ./notes.md",
+            "python3 - README.md <<'EOF'\nimport sys\nopen(sys.argv[1], 'a').write('more\\n')\nEOF",
+            "gh issue create --title t --body 'mentions Sensitive-data here'",
+            "echo 'Sensitive-data'",
+            "rm Sensitive-data/.gitignore",
+            "rm -r Sensitive-data/.piigate-work",
+        ):
+            with self.subTest(command):
+                self.assertIsNone(b.bash(command))
+        for command in (
+            "cat Sensitive-data/x.txt",
+            "cat README.md Sensitive-data/x.txt",
+            "cp Sensitive-data/x.txt /tmp/y",
+            "grep -r x Sensitive-data",
+        ):
+            with self.subTest(command):
+                self.assertIsNotNone(b.bash(command))
+
+    # --- rmdir ------------------------------------------------------------------------------------
+
+    def empty(self, name: str = "Sensitive-data") -> Path:
+        d = self.wt1 / name
+        shutil.rmtree(d, ignore_errors=True)
+        d.mkdir()
+        return d
+
+    def test_rmdir_of_a_directory_with_only_the_marker(self):
+        for name in ("Sensitive-data", "Anonymized-data"):
+            d = self.empty(name)
+            b = self.gate(self.main, self.wt1)  # the gate writes the marker
+            self.assertEqual(os.listdir(d), [".gitignore"])
+            for command in (f"rmdir {name}", f"rmdir {name}/", f"rmdir -v {name}", f"rmdir {d}", f"rmdir ./{name}"):
+                with self.subTest(command):
+                    reason = b.bash(command)
+                    self.assertIn(f"`rm {name}/.gitignore && rmdir {name}`", reason.replace(str(self.wt1) + "/", "").replace("./", "").replace("-v ", ""))
+                    self.assertNotIn("rm -r", reason)
+                    self.assertEqual(hook_module.denial_kind(reason), "marker-dir")
+
+    def test_rmdir_left_to_rmdir(self):
+        d = self.empty()
+        b = self.gate(self.main, self.wt1)
+        (d / "x.txt").write_text("secret\n", encoding="utf-8")
+        for command, note in (
+            ("rmdir Sensitive-data", "another file"),
+            ("rmdir src", "not a data directory"),
+            ("rmdir missing", "missing"),
+        ):
+            with self.subTest(note):
+                self.assertIsNone(b.bash(command))
+        (d / "x.txt").unlink()
+        (d / ".gitignore").write_text("*\n# edited by the user\n", encoding="utf-8")
+        self.assertIsNone(b.bash("rmdir Sensitive-data"))  # an edited marker
+        (d / ".gitignore").write_text(config.GITIGNORE, encoding="utf-8")
+        for command in (
+            "rmdir Sensitive-data && echo done",
+            "cd . ; rmdir Sensitive-data",
+            "echo a | rmdir Sensitive-data",
+            "rmdir Sensitive-data src",
+            "rmdir 'Sens*'",
+        ):
+            with self.subTest(command):
+                reason = b.bash(command)
+                self.assertTrue(reason is None or "holds only the piigate marker" not in reason)
+        self.assertIsNone(b.bash("rmdir src"))
+
+    # --- hostile pointer files (the agent can write them) ------------------------------------------
+
+    @staticmethod
+    def limited(seconds: int = 20):
+        """A hang fails the test instead of the whole suite."""
+        import contextlib
+        import signal
+
+        @contextlib.contextmanager
+        def guard():
+            def stop(*_):
+                raise AssertionError(f"hang: no answer within {seconds} s")
+
+            old = signal.signal(signal.SIGALRM, stop)
+            signal.alarm(seconds)
+            try:
+                yield
+            finally:
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, old)
+
+        return guard()
+
+    def hostile(self, name: str):
+        entries = self.main / ".git" / "worktrees"
+        entry = entries / "w1"
+        if name == "fifo-gitdir":
+            (entry / "gitdir").unlink()
+            os.mkfifo(entry / "gitdir")
+        elif name == "fifo-commondir":
+            (entry / "commondir").unlink()
+            os.mkfifo(entry / "commondir")
+        elif name == "fifo-dot-git":
+            (self.wt1 / ".git").unlink()
+            os.mkfifo(self.wt1 / ".git")
+        elif name == "zero-gitdir":
+            (entry / "gitdir").unlink()
+            (entry / "gitdir").symlink_to("/dev/zero")
+        elif name == "zero-commondir":
+            (entry / "commondir").unlink()
+            (entry / "commondir").symlink_to("/dev/zero")
+        elif name == "nul-gitdir":
+            (entry / "gitdir").write_bytes(b"/tmp/a\x00b/.git\n")
+        elif name == "nul-commondir":
+            (entry / "commondir").write_bytes(b"../..\x00\n")
+        elif name == "nul-dot-git":
+            (self.wt1 / ".git").write_bytes(b"gitdir: /tmp/a\x00b\n")
+
+    HOSTILE = ("fifo-gitdir", "fifo-commondir", "fifo-dot-git", "zero-gitdir", "zero-commondir", "nul-gitdir", "nul-commondir", "nul-dot-git")
+
+    PROBE = (
+        "import os, resource, sys\n"
+        "resource.setrlimit(resource.RLIMIT_AS, (2 << 30, 2 << 30))\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "from piigate import config, gate\n"
+        "main, wt = sys.argv[2], sys.argv[3]\n"
+        "os.environ['CLAUDE_PROJECT_DIR'] = main\n"
+        "for k in (main, wt):\n"
+        "    config.worktree_roots(k)\n"
+        "cfg = config.load(wt)\n"
+        "cfg['sources']['non_public'] = []\n"
+        "print(gate.Gate(cfg, wt).bash('ls'))\n"
+    )
+
+    def test_hostile_pointer_files_do_not_hang_or_crash(self):
+        """Run in a child process with a memory cap and a timeout: a regression fails the test, it neither eats the RAM
+        nor hangs the suite."""
+        for name in self.HOSTILE:
+            with self.subTest(name):
+                self.setUp()
+                self.hostile(name)
+                try:
+                    done = subprocess.run(
+                        [sys.executable, "-I", "-c", self.PROBE, str(ROOT / "lib"), str(self.main), str(self.wt1)],
+                        capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL,
+                    )
+                except subprocess.TimeoutExpired:
+                    self.fail("hang")
+                self.assertEqual(done.returncode, 0, done.stderr[-500:])
+                self.assertEqual(done.stdout.strip(), "None")
+
+    # --- the protection does not depend on the registry ---------------------------------------------
+
+    def only_w1(self):
+        shutil.rmtree(self.main / "Sensitive-data")
+        shutil.rmtree(self.wt2 / "Sensitive-data")
+
+    def break_registry(self, how: str):
+        entries = self.main / ".git" / "worktrees"
+        if how == "removed":
+            shutil.rmtree(entries)
+        elif how == "garbage":
+            for e in entries.iterdir():
+                (e / "gitdir").write_bytes(b"\xff\x00junk")
+        elif how == "empty-entries":
+            for i in range(80):
+                (entries / f"a{i:02d}").mkdir()
+        elif how == "fifo":
+            for e in entries.iterdir():
+                (e / "gitdir").unlink()
+                os.mkfifo(e / "gitdir")
+
+    def test_recursion_is_denied_whatever_the_registry_says(self):
+        for how in ("removed", "garbage", "empty-entries", "fifo"):
+            self.setUp()
+            self.only_w1()
+            self.break_registry(how)
+            for cwd, command in (
+                (self.main, "grep -r secret ."),
+                (self.main, "grep -r secret .claude"),
+                (self.main, "find . -type f -exec cat {} +"),
+                (self.main / ".claude", "grep -r secret ."),
+                (self.main / ".claude" / "worktrees", "grep -r secret ."),
+            ):
+                with self.subTest(how=how, cwd=cwd.name, command=command), self.limited():
+                    self.assertIsNotNone(self.gate(None, cwd).bash(command))
+        self.setUp()
+        self.only_w1()
+        self.break_registry("removed")
+        shutil.rmtree(self.wt1 / "Sensitive-data")
+        for command in ("grep -r secret .", "grep -r secret .claude", "grep -r x src", "rg x"):
+            with self.subTest("no data", command=command):
+                self.assertIsNone(self.gate(None, self.main).bash(command))
+
+    def test_empty_registry_entries_do_not_displace_real_ones(self):
+        entries = self.main / ".git" / "worktrees"
+        for i in range(80):
+            (entries / f"a{i:02d}").mkdir()
+        self.assertEqual(
+            set(config.worktree_roots(str(self.main))),
+            {os.path.realpath(k) for k in (self.main, self.wt1, self.wt2)},
+        )
+
+    def test_tree_too_large_to_check_is_denied(self):
+        self.only_w1()
+        shutil.rmtree(self.wt1 / "Sensitive-data")
+        for i in range(30):
+            (self.main / "src" / f"d{i}").mkdir()
+        with unittest.mock.patch.object(gate, "TREE_BUDGET", 5):
+            reason = self.gate(None, self.main).bash("grep -r x .")
+        self.assertIsNotNone(reason)
+        self.assertIn("too large to check", reason)
+        self.assertIn("piigate_search", reason)
+        self.assertNotIn("contains a sensitive directory:", reason)
+
+    def test_tree_walk_skips_git_and_node_modules_and_is_fast(self):
+        import time
+
+        self.only_w1()
+        shutil.rmtree(self.wt1 / "Sensitive-data")
+        (self.main / "node_modules" / "pkg" / "x" / "Sensitive-data").mkdir(parents=True)
+        (self.main / ".git" / "modules" / "m" / "Sensitive-data").mkdir(parents=True)
+        for i in range(3000):
+            (self.main / "src" / f"d{i}").mkdir()
+        b = self.gate(None, self.main)
+        start = time.monotonic()
+        self.assertIsNone(b.bash("grep -r x ."))
+        elapsed = time.monotonic() - start
+        print(f"\n[tree walk, 3000 subdirectories: {elapsed:.3f} s]", file=sys.stderr)
+        self.assertLess(elapsed, 5)
+
+    # --- the marker-only rmdir and its recipe ---------------------------------------------------------
+
+    def test_rmdir_options(self):
+        self.empty()
+        b = self.gate(self.main, self.wt1)
+        for command in ("rmdir --ignore-fail-on-non-empty Sensitive-data", "rmdir -x Sensitive-data", "rmdir --foo Sensitive-data"):
+            with self.subTest(command):
+                self.assertIsNone(b.bash(command))
+        for command in ("rmdir -p Sensitive-data", "rmdir -pv Sensitive-data", "rmdir --parents --verbose Sensitive-data", "rmdir -- Sensitive-data"):
+            with self.subTest(command):
+                self.assertIn("holds only the piigate marker", b.bash(command) or "")
+
+    def test_recipe_is_the_only_shape_let_through(self):
+        d = self.empty()
+        (self.wt1 / "Anonymized-data").mkdir()
+        b = self.gate(self.main, self.wt1)
+        self.assertIsNone(b.bash("rm Sensitive-data/.gitignore && rmdir Sensitive-data"))
+        self.assertIn("rm Sensitive-data/.gitignore && rmdir Sensitive-data", b.bash("rmdir Sensitive-data"))
+        self.assertNotIn("rm -r", b.bash("rmdir Sensitive-data"))
+        for command in (
+            "rm -r Sensitive-data/.gitignore && rmdir Sensitive-data",
+            "rm -rf Sensitive-data/.gitignore && rmdir Sensitive-data",
+            "rm -f Sensitive-data/.gitignore && rmdir Sensitive-data",
+            "rm Sensitive-data/.gitignore Sensitive-data/x && rmdir Sensitive-data",
+            "rm Sensitive-data/.gitignore && rmdir Anonymized-data",
+            "rm Sensitive-data/.gitignore && rmdir Sensitive-data src",
+            "rm Sensitive-data/.gitignore || rmdir Sensitive-data",
+            "rm Sensitive-data/.gitignore ; rmdir Sensitive-data",
+            "rm Sensitive-data/.gitignore && rmdir Sensitive-data && echo x",
+            "rm Sensitive-data/.gitignore && rmdir -p Sensitive-data",
+            "rm Sensitive-data/.gitignore && rmdir ./Sensitive-data",
+            "rm Sensitive-data/.gitignore && rmdir Sensitive-data/",
+            "rm ./Sensitive-data/.gitignore && rmdir Sensitive-data",
+            "rm Sensitive-data/.gitignore && rmdir Sensitive-data > /tmp/o",
+            "rm Sensitive-data/.gitignore && rmdir $PWD/Sensitive-data",
+        ):
+            with self.subTest(command):
+                self.assertIsNotNone(b.bash(command))
+        # an edited marker or another file: no exception, the ordinary decision
+        (d / "x.txt").write_text("secret\n", encoding="utf-8")
+        self.assertIsNotNone(self.gate(self.main, self.wt1).bash("rm Sensitive-data/.gitignore && rmdir Sensitive-data"))
+        (d / "x.txt").unlink()
+        (d / ".gitignore").write_text("*\n# edited\n", encoding="utf-8")
+        self.assertIsNotNone(self.gate(self.main, self.wt1).bash("rm Sensitive-data/.gitignore && rmdir Sensitive-data"))
+        # a symlink in place of the directory (even to a directory holding only a marker) is no exception
+        target = self.base / "marker-only"
+        target.mkdir()
+        (target / ".gitignore").write_text(config.GITIGNORE, encoding="utf-8")
+        shutil.rmtree(self.wt1 / "Sensitive-data", ignore_errors=True)
+        (self.wt1 / "Sensitive-data").symlink_to(target)
+        self.assertFalse(b._marker_recipe("rm Sensitive-data/.gitignore && rmdir Sensitive-data", True))
+
+    def test_recipe_output_survives_the_filter_hook(self):
+        """gate -> run -> filter: after the recipe the directory is gone, the PostToolUse check must not hide the output."""
+        d = self.empty()
+        self.gate(self.main, self.wt1)
+        recipe = "rm Sensitive-data/.gitignore && rmdir Sensitive-data"
+        env = {"CLAUDE_PROJECT_DIR": str(self.main)}
+        call = {"cwd": str(self.wt1), "tool_name": "Bash", "tool_input": {"command": recipe}}
+        self.assertIsNone(hook("gate", {**call, "hook_event_name": "PreToolUse"}, env))
+        subprocess.run(["bash", "-c", recipe], cwd=self.wt1, check=True)
+        self.assertFalse(d.exists())
+        response = {"stdout": "removed", "stderr": "", "interrupted": False, "isImage": False, "noOutputExpected": False}
+        self.assertIsNone(hook("filter", {**call, "hook_event_name": "PostToolUse", "tool_response": response}, env))
+        # the exception is not wider after the fact
+        b = self.gate(self.main, self.wt1)
+        self.assertIsNotNone(b.bash("rm Sensitive-data/.gitignore && rmdir Sensitive-data x", files=False))
+        self.assertIsNotNone(b.bash("rm Sensitive-data/.gitignore || rmdir Sensitive-data", files=False))
+        self.assertIsNone(b.bash(recipe, files=False))
+        # PreToolUse stays strict: a missing directory is no exception there
+        self.assertIsNotNone(b.bash(recipe))
+
+    def test_recipe_must_be_literal(self):
+        d = self.empty()
+        b = self.gate(self.main, self.wt1)
+        for command in (
+            "rm Sensitive-data/.gitignore '&&' rmdir Sensitive-data",
+            'rm Sensitive-data/.gitignore "&&" rmdir Sensitive-data',
+            "rm Sensitive-data/.gitignore \\&\\& rmdir Sensitive-data",
+            "rm  Sensitive-data/.gitignore && rmdir Sensitive-data",
+            "rm Sensitive-data/.gitignore &&  rmdir Sensitive-data",
+            "rm Sensitive-data/.gitignore && rmdir Sensitive-data\r",
+            "rm Sensitive-data/.gitignore\r && rmdir Sensitive-data",
+            "rm 'Sensitive-data'/.gitignore && rmdir Sensitive-data",
+        ):
+            with self.subTest(command):
+                self.assertIsNotNone(b.bash(command))
+        self.assertIsNone(b.bash("rmdir Sensitive-data\r"))  # not claimed by the marker rule, left to rmdir
+        self.assertIsNone(b.bash("rmdir 'Sensitive-data\r'"))
+        self.assertTrue(d.is_dir())
+
+    PROBE_MARKER = (
+        "import os, resource, sys\n"
+        "resource.setrlimit(resource.RLIMIT_AS, (2 << 30, 2 << 30))\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "from piigate import config, gate\n"
+        "main, wt, kind = sys.argv[2], sys.argv[3], sys.argv[4]\n"
+        "os.environ['CLAUDE_PROJECT_DIR'] = main\n"
+        "d = os.path.join(wt, 'Sensitive-data')\n"
+        "m = os.path.join(d, '.gitignore')\n"
+        "if os.path.lexists(m): os.unlink(m)\n"
+        "os.makedirs(d, exist_ok=True)\n"
+        "if kind == 'fifo': os.mkfifo(m)\n"
+        "else:\n"
+        "    with open(m, 'wb') as f: f.truncate(300 << 20)\n"
+        "cfg = config.load(wt); cfg['sources']['non_public'] = []\n"
+        "g = gate.Gate(cfg, wt)\n"
+        "print(g.bash('rmdir Sensitive-data'))\n"
+        "print(g.bash('cat Sensitive-data/x') is not None)\n"
+        "print(os.path.getsize(m) if kind == 'big' else 'fifo')\n"
+    )
+
+    def test_marker_that_is_a_fifo_or_huge_does_not_hang(self):
+        for kind in ("fifo", "big"):
+            with self.subTest(kind):
+                done = subprocess.run(
+                    [sys.executable, "-I", "-c", self.PROBE_MARKER, str(ROOT / "lib"), str(self.main), str(self.wt1), kind],
+                    capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL,
+                )
+                self.assertEqual(done.returncode, 0, done.stderr[-500:])
+                lines = done.stdout.split("\n")
+                self.assertEqual(lines[0], "None")  # nothing claimed about a marker that is not the plain file
+                self.assertEqual(lines[1], "True")  # the directory stays protected by name
+                if kind == "big":
+                    self.assertEqual(lines[2], str(300 << 20))  # nothing appended
+
+    def test_recipe_e2e(self):
+        d = self.empty()
+        self.gate(self.main, self.wt1)
+        recipe = "rm Sensitive-data/.gitignore && rmdir Sensitive-data"
+        self.assertIsNone(self.gate(self.main, self.wt1).bash(recipe))
+        self.assertEqual(subprocess.run(["bash", "-c", recipe], cwd=self.wt1, capture_output=True).returncode, 0)
+        self.assertFalse(d.exists())
+        self.gate(self.main, self.wt1)
+        self.assertFalse(d.exists())
+        d = self.empty()
+        self.gate(self.main, self.wt1)
+        (d / "late.txt").write_text("arrived in between\n", encoding="utf-8")  # a parallel session
+        result = subprocess.run(["bash", "-c", recipe], cwd=self.wt1, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue((d / "late.txt").exists())
 
 
 class TestHumanApproval(unittest.TestCase):

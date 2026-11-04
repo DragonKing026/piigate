@@ -226,6 +226,25 @@ After `piigate` in a pipeline only `grep`, `head`, `tail`, `wc`, `sort`, `uniq`,
 Outside a project: `{documents}/piigate/Sensitive-data` and `{documents}/piigate/Anonymized-data`, where `{documents}` is
 your XDG documents directory. They are created only when something is written.
 
+The `Sensitive-data` directory of every git worktree of the repository is protected, whichever worktree the session or
+the working directory is in, and `piigate_list` / `piigate_show` accept any directory the gate treats as sensitive (the
+configured ones, those of all worktrees, and any directory named `Sensitive-data`). `Anonymized-data` stays limited to
+the session's and the working directory's own project. piigate puts two things in these directories: the `.gitignore`
+marker, which the gate recreates on every command while the directory exists, and, during `piigate_analyze`, a temporary
+`.piigate-work/analysis-…` directory that is removed when the analysis ends (an empty `.piigate-work/` remains). Because of
+the marker, `rmdir Sensitive-data` fails with "Directory not empty" (the gate says so instead of letting it fail); remove
+the empty directory with `rm Sensitive-data/.gitignore && rmdir Sensitive-data` — the gate lets exactly this command
+through (typed with single spaces, nothing else), and `rmdir` refuses to remove anything else that has appeared in the
+directory in the meantime. After `piigate_analyze` the directory also holds an empty `.piigate-work/`; remove it first
+(`rmdir Sensitive-data/.piigate-work`), otherwise the recipe does not apply.
+
+A recursive search from a directory above a `Sensitive-data` (also in a worktree) is denied. The check walks the
+directory tree: up to three levels of directories between the searched directory and `Sensitive-data`, without following
+symlinks and without entering `.git` or `node_modules`; a tree of more than 20000 directories is denied as too large to
+check. It matters for tools that do not honour `.gitignore` (`grep -r`, `find`, `tar`…); `rg`, `fd` and `ag` rely on the
+marker `.gitignore` in the directory. A `Sensitive-data` deeper than that, behind a symlink or inside `node_modules` is not
+found by this check.
+
 ## Configuration
 
 Defaults: [config.json](config.json). Yours (merged; lists replace): `~/.config/piigate/config.json` — edited by a human

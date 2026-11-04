@@ -86,6 +86,10 @@ def _flat(text: str) -> str:
 
 HEREDOC = re.compile(r"(?<!<)<<-?(?!<)\s*(['\"]?)([\w.-]+)\1")
 RG_IGNORE_FILES = (".ignore", ".rgignore", ".fdignore")
+# directory walk for a sensitive directory below a search root: intermediate directories, visited-directory budget, skipped names
+TREE_DEPTH = 3
+TREE_BUDGET = 20000
+TREE_SKIP = {".git", "node_modules"}
 SUBSTITUTION = re.compile(r"\$\(|`|\$\{|<\(|>\(|\$[A-Za-z_]")
 FIND_WITH_ARG = {"-type", "-name", "-iname", "-path", "-ipath", "-wholename", "-iwholename", "-maxdepth", "-mindepth"}
 # a repo here does not make files public (downloads, temporary files)
@@ -554,7 +558,7 @@ class Gate:
         # in-project data directories: `.gitignore` restored on every run (the directory may have been created by hand)
         config.ensure_project_gitignore(cfg)
         # `Sensitive-data` of any project (not only the session's and the cwd repo's) — by path component name
-        self.sensitive_name = (cfg.get("project_directories") or {}).get("sensitive") or None
+        self.sensitive_name = config.sensitive_name(cfg)
         self.project_sensitive = [config.expand(k) for k in cfg.get("in_project", {}).get("sensitive", [])]
         self.extensions = tuple(e.casefold() for e in cfg["sources"]["extensions"])
         # an extension outside the sensitive directories is only a reason to check the content
@@ -573,6 +577,9 @@ class Gate:
         self.only_phi_projects = cfg["sources"].get("only_phi_projects", True)
         self._public_dirs: dict[str, bool] = {}
         self._phi_under: dict[str, bool] = {}
+        self._tree: dict[tuple[str, bool], tuple[list[str], bool]] = {}  # directory walks (_contains_project_sensitive)
+        self._found: dict[str, list[str]] = {}  # directory → sensitive directories found below it by the walk
+        self._oversized: set[str] = set()  # directories whose tree was too large to walk
         self._text = ""  # current Bash command (_touches)
         self._raw = ""  # the Bash command as given (before heredoc bodies written to files are cut out)
         self._textual = True  # text arguments are only text (False: the command executes text it prints)
@@ -1236,18 +1243,47 @@ class Gate:
         return not (searching and self._hidden_by_gitignore(k) and not self._negations_on_path(base, k))
 
     def _contains_project_sensitive(self, p: str, searching: bool = False) -> bool:
-        """A search of a parent directory (a directory of projects) would reach `<project>/Sensitive-data` — two levels
-        down are checked (the project directory and a directory of projects); deeper only the configured list."""
+        """A recursive search of `p` would reach a directory named `project_directories.sensitive` below it — in a
+        project, a directory of projects, `.claude/worktrees/<name>/`… Found by walking the tree (breadth first, at most
+        TREE_DEPTH directories deep, no symlinks, not `.git` or `node_modules`), because the git worktree registry and
+        the configured list are files the agent can change. A tree of more than TREE_BUDGET directories cannot be
+        checked: denied (fail closed — otherwise a planted pile of directories would exhaust the budget)."""
         n = self.sensitive_name
         if not n or not os.path.isdir(p):
             return False
-        try:
-            candidates = [os.path.join(p, n)] + [
-                os.path.join(p, d.name, n) for d in os.scandir(p) if d.is_dir(follow_symlinks=False)
-            ]
-        except OSError:
-            return False
-        return any(os.path.isdir(k) and not (searching and self._hidden_by_gitignore(k, anywhere=True)) for k in candidates)
+        key = (p, searching)
+        if key not in self._tree:
+            self._tree[key] = self._walk_for_sensitive(p, n, searching)
+        found, too_large = self._tree[key]
+        if too_large:
+            self._oversized.add(p)
+        elif found:
+            self._found[p] = found
+        return too_large or bool(found)
+
+    def _walk_for_sensitive(self, p: str, n: str, searching: bool) -> tuple[list[str], bool]:
+        found: list[str] = []
+        level = [p]
+        visited = 0
+        for depth in range(TREE_DEPTH + 1):
+            following: list[str] = []
+            for directory in level:
+                visited += 1
+                if visited > TREE_BUDGET:
+                    return found, True
+                try:
+                    with os.scandir(directory) as entries:
+                        names = [(e.name, e.path) for e in entries if e.is_dir(follow_symlinks=False)]
+                except OSError:
+                    continue
+                for name, path in names:
+                    if name == n:
+                        if not (searching and self._hidden_by_gitignore(path, anywhere=True)):
+                            found.append(path)
+                    elif name not in TREE_SKIP and depth < TREE_DEPTH:
+                        following.append(path)
+            level = following
+        return found, False
 
     def path_kind(
         self, s: str, *, ancestor: bool = False, content: bool = True, searching: bool = False, protected: bool = True
@@ -2663,6 +2699,61 @@ class Gate:
             return command  # an unterminated heredoc or the written file used later (`bash s.sh`) — unchanged
         return text
 
+    def _marker_only_dir(self, operand: str, missing_ok: bool = False) -> str | None:
+        """The operand (no shell metacharacters) names a piigate data directory — not a symlink — that holds nothing but
+        the untouched `.gitignore` marker: its real path, else None. missing_ok: the directory may be gone already (the
+        PostToolUse check after the recipe) — then only the name or the configured location is checked."""
+        if re.search(r"[;&|()<>\n\r$`*?\[{~\\]", operand) or not operand:
+            return None
+        given = os.path.join(self.cwd, operand)
+        real = os.path.realpath(given)
+        names = {n for n in ((self.cfg.get("project_directories") or {}).values()) if n}
+        data = {*self.project_sensitive, *(config.expand(k) for k in self.cfg.get("in_project", {}).get("anonymized", []))}
+        if os.path.islink(given.rstrip("/")) or not (real in data or os.path.basename(real) in names):
+            return None
+        if not os.path.lexists(real):
+            return real if missing_ok else None
+        if not os.path.isdir(real):
+            return None
+        marker = os.path.join(real, ".gitignore")
+        try:
+            if os.listdir(real) != [".gitignore"] or config.read_small(marker) != config.GITIGNORE.strip():
+                return None
+        except OSError:
+            return None
+        return real
+
+    def _marker_only_rmdir(self, tokens: list[str] | None) -> str | None:
+        """The whole command is one `rmdir` of a piigate data directory that holds nothing but the `.gitignore` marker
+        (#7): it would fail with "Directory not empty", because the gate recreates the marker on every run. Denied with
+        the one-command recipe — the command could not succeed anyway. Anything else (more files, an edited marker, a
+        compound command, an option other than -p/-v) is left to rmdir itself."""
+        if not tokens or tokens[0] != "rmdir" or "\r" in self._raw or any(re.search(r"[;&|()<>\n\r]", t) for t in tokens):
+            return None
+        options = [t for t in tokens[1:] if t.startswith("-")]
+        if any(not (t == "--" or t in ("--parents", "--verbose") or re.fullmatch(r"-[pv]+", t)) for t in options):
+            return None
+        operands = [t for t in tokens[1:] if not t.startswith("-") or t == "--"]
+        operands = [t for t in operands if t != "--"]
+        if len(operands) != 1 or self._marker_only_dir(operands[0]) is None:
+            return None
+        d = shlex.quote(operands[0].rstrip("/") or operands[0])
+        return (
+            f"piigate: `rmdir {d}` would fail with \"Directory not empty\" — the directory holds only the piigate marker "
+            "`.gitignore`, which the gate recreates on every command. Remove the marker and the directory in one command "
+            f"(rmdir refuses if anything else is in it): `rm {d}/.gitignore && rmdir {d}`."
+        )
+
+    def _marker_recipe(self, command: str, files: bool) -> bool:
+        """The whole command is, character for character, `rm <dir>/.gitignore && rmdir <dir>` (single spaces, the same
+        unquoted <dir>, no options) for a directory that holds only the untouched marker — the one compound command the
+        gate lets through next to a data directory. Nothing else qualifies. files=False (PostToolUse) also accepts the
+        directory already gone, because the recipe has just removed it; PreToolUse never does."""
+        m = re.fullmatch(r"rm (\S+)/\.gitignore && rmdir (\S+)", command)
+        if not m or m.group(1) != m.group(2) or shlex.quote(m.group(1)) != m.group(1) or m.group(1).startswith("-"):
+            return False
+        return self._marker_only_dir(m.group(1), missing_ok=not files) is not None
+
     def bash(self, command: str, files: bool = True) -> str | None:
         """None = allow, otherwise the denial reason. files=False (the PostToolUse safety net): data files are not judged
         again — a file the command created is checked through its output instead."""
@@ -2673,6 +2764,10 @@ class Gate:
         tokens = self._tokens(command)
         if reason := self._human_only(command, tokens):
             return reason
+        if reason := self._marker_only_rmdir(tokens):
+            return reason
+        if self._marker_recipe(command, files):
+            return None
         if re.search(r"\b(?:analyze|anonymize)\b", command) and any(
             c is None or c[1:2] in (["analyze"], ["anonymize"]) for c in self._invocations(command, {"piigate"})
         ):
@@ -2710,12 +2805,22 @@ class Gate:
         if reason is None:
             return None
         p = _path(what, self.cwd) if kind == "sensitive" else ""
-        if p and not _inside(p, self.sensitive) and _ancestor(p, self.sensitive):
-            sub = ", ".join(os.path.relpath(k, p) for k in self.sensitive if _inside(k, [p]))
-            what = (
-                f"{what} — contains a sensitive directory: {sub}; search the code subdirectory, use piigate_search (MCP) or "
-                f"exclude it with the entry `/{sub.split(', ')[0]}/` in an .ignore file (honoured by rg, fd, ag; not grep)"
-            )
+        if p and not _inside(p, self.sensitive):
+            below = [k for k in self.sensitive if _inside(k, [p]) and os.path.lexists(k)]
+            below += [k for k in self._found.get(p, []) if k not in below]
+            if below:
+                sub = ", ".join(os.path.relpath(k, p) for k in below)
+                entries = ", ".join(f"`/{x}/`" for x in sub.split(", "))
+                what = (
+                    f"{what} — contains a sensitive directory: {sub}; search the code subdirectory, use piigate_search (MCP) or "
+                    f"exclude {'them' if ',' in sub else 'it'} with the {'entries' if ',' in sub else 'entry'} {entries} in an .ignore "
+                    "file (honoured by rg, fd, ag; not grep)"
+                )
+            elif p in self._oversized:
+                what = (
+                    f"{what} — the directory tree is too large to check for sensitive directories (over {TREE_BUDGET} "
+                    "directories); search a narrower directory or use piigate_search (MCP)"
+                )
         description = {
             "sensitive": f"a sensitive data directory ({what})",
             "command": "output of a database query on a server (production data)",

@@ -104,6 +104,7 @@ def denial_kind(reason: str) -> str:
         ("pseudonym map", "filter-files"),
         ("filter file", "filter-files"),
         ("disabled in Bash", "mcp-piigate"),
+        ("holds only the piigate marker", "marker-dir"),
     )
     category = next((k for regex, k in categories if regex in reason), "data-file")
     rule = reason.split(";", 1)[1].split(". Instead", 1)[0] if ";" in reason else ""
