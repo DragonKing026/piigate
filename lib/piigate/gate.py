@@ -1554,8 +1554,8 @@ class Gate:
 
     @staticmethod
     def _without_text_bodies(command: str) -> str:
-        """The command without the bodies of heredocs that are not scripts: the program that reads the body is not a shell
-        (`python3 - <<EOF`, `timeout 5 python3 - <<EOF`, `cat <<EOF`), so no glob in it is expanded."""
+        """The command without the bodies of its heredocs. Used only for a line in which nothing runs text as shell code
+        (`_runs_text`): then no body is a script and no glob in it is expanded."""
         out: list[str] = []
         end: list[str] = []
         for line in command.split("\n"):
@@ -1565,16 +1565,60 @@ class Gate:
                     out.append(line)
                 continue
             out.append(line)
-            for m in HEREDOC.finditer(line):
-                words = re.split(r"[|;&()]", line[: m.start()])[-1].split()
-                words = [w for w in words if w not in SHELL_KEYWORDS and not re.match(r"^\w+=", w)]
-                while words and (
-                    Path(words[0]).name in DIRECT_LAUNCHERS or words[0].startswith("-") or re.fullmatch(r"[\d.]+[smhd]?", words[0])
-                ):
-                    words.pop(0)
-                if words and Path(words[0]).name not in {*SHELLS, "eval", "source", "."} | LAUNCHERS:
-                    end.append(m.group(2))
+            end.extend(m.group(2) for m in HEREDOC.finditer(line))
         return "\n".join(out)
+
+    @staticmethod
+    def _runs_text(tokens: list[str] | None) -> bool:
+        """Can the line run TEXT as shell code: a shell (`zsh`, `bash`, `sh`…), `eval` or `source` as a word anywhere, `.` or
+        a word that starts with `$` or a backtick where a command stands (`$SHELL`, `$c`), or a file the line writes
+        (`> f`, `tee f`) and then runs as a command. Tokens that cannot be read: yes (fail closed)."""
+        if tokens is None:
+            return True
+        names = {*SHELLS, "eval", "source"}
+        if any(Path(str(t)).name in names for t in tokens):
+            return True
+        stages: list[list[str]] = []
+        stage: list[str] = []
+        for t in tokens:
+            if t in FORBIDDEN_OPERATORS or t in ("|", "|&") or re.fullmatch(r"[;&|()]+", str(t)):
+                stages.append(stage)
+                stage = []
+            else:
+                stage.append(str(t))
+        stages.append(stage)
+        firsts: set[str] = set()
+        written: set[str] = set()
+        for words in stages:
+            while words and (
+                words[0] in SHELL_KEYWORDS or re.match(r"^\w+=", words[0]) or Path(words[0]).name in DIRECT_LAUNCHERS
+                or (words[0].startswith("-") and len(words) > 1) or re.fullmatch(r"[\d.]+[smhd]?", words[0])
+            ):
+                words = words[1:]
+            if not words:
+                continue
+            if words[0] == "." or words[0].startswith(("$", "`")):
+                return True
+            firsts.add(Path(words[0]).name)
+            for k, w in enumerate(words):
+                if w in (">", ">>", ">|", "&>") and k + 1 < len(words):
+                    written.add(Path(words[k + 1]).name)
+            if Path(words[0]).name == "tee":
+                written |= {Path(w).name for w in words[1:] if not w.startswith("-")}
+        return bool(firsts & written)
+
+    @staticmethod
+    def _zsh_code_raw(text: str) -> str | None:
+        """The same syntax looked for in the raw text — quotes, comments and heredoc bodies included — for a line that can
+        run text as shell code (a script in a heredoc or in `-c '…'` is code, not data)."""
+        m = next((m for m in ZSH_FLAGS.finditer(text) if re.search(r"[e%]", m.group(1))), None)
+        if m:
+            return "a zsh parameter flag that runs code (`${(e)…}`, `${(%)…}`)"
+        for m in re.finditer(r"\(", text):
+            i = m.start()
+            if i and text[i - 1] not in " \t\n;&|(<>=$`\\" and ZSH_QUALIFIER.match(text, i):
+                return "a zsh glob qualifier that runs code (`(e:…:)`, `(+func)`, `(#q…)`)"
+        return None
 
     def _cd_matches(self, stage: list[str], bases: list[str], variables: dict | None = None) -> list[str]:
         """The directories a `cd`/`pushd` with a pattern (`cd ../Sens*`, `cd ../Sens[i]tive-data`, `cd ../{a,b}`,
@@ -2904,8 +2948,12 @@ class Gate:
         tokens = self._tokens(command)
         if reason := self._human_only(command, tokens):
             return reason
-        # parameters are expanded in an unquoted heredoc body, globs never; a body fed to a shell is a script
-        found = self._zsh_code(self._heredoc_text(command)[0]) or self._zsh_code(self._without_text_bodies(command), flags=False)
+        # Where nothing can run text as shell code, quotes and heredoc bodies are data (parameters are still expanded in an
+        # unquoted body, globs never); where something can, the whole raw line is looked at.
+        if self._runs_text(Gate._tokens(self._without_text_bodies(self._raw))):  # a body is run only by a shell outside it
+            found = self._zsh_code_raw(self._raw)
+        else:
+            found = self._zsh_code(self._heredoc_text(command)[0]) or self._zsh_code(self._without_text_bodies(command), flags=False)
         if found:
             return f"piigate: command denied — {found}; the gate cannot see what it would read. {HINT}"
         if reason := self._marker_only_rmdir(tokens):

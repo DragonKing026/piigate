@@ -591,6 +591,59 @@ class TestOldGateZshCode(Base):
                 self.assertIsNotNone(gate.Gate.bash(self.old(), line, True))
 
 
+    def test_a_line_that_can_run_text_is_judged_on_its_raw_text(self):
+        """Where a shell, `eval`, `source`, `$VAR` or a file written by the line runs text, quotes and heredoc bodies are
+        code: each of these lines really makes the marker file in zsh, and both gates refuse it."""
+        import shutil
+
+        import shell_zsh_cases as zc
+
+        if not shutil.which("zsh"):
+            self.skipTest("zsh not installed")
+        q = "ls *(oe:'touch M':)"
+        lines = {
+            "$SHELL <<EOF": f"$SHELL <<EOF\n{q}\nEOF",
+            "c=zsh; $c <<EOF": f"c=zsh; $c <<EOF\n{q}\nEOF",
+            "cat <<EOF | zsh": f"cat <<EOF | zsh\n{q}\nEOF",
+            "cat <<'EOF' | zsh": f"cat <<'EOF' | zsh\n{q}\nEOF",
+            "tee x <<EOF | zsh": f"tee x <<EOF | zsh\n{q}\nEOF",
+            "eval cat heredoc": f'eval "$(cat <<EOF\n{q}\nEOF\n)"',
+            "file written, then run": f"cat <<EOF >s.zsh\n{q}\nEOF\nzsh s.zsh",
+            "two heredocs": f"zsh <<A; cat <<B\n{q}\nA\nhi\nB",
+            "zsh -c": f'zsh -f -c "{q}"',
+            "here-string": f'zsh <<< "{q}"',
+            "source": f"source /dev/stdin <<EOF\n{q}\nEOF",
+        }
+        for name, line in lines.items():
+            with self.subTest(name):
+                folder = TMP / ("raw-" + str(abs(hash(name))))
+                (folder / "w").mkdir(parents=True, exist_ok=True)
+                for f in "abM":
+                    (folder / "w" / f).unlink(missing_ok=True)
+                for f in "ab":
+                    (folder / "w" / f).write_text("x")
+                self.assertFalse(zc.refusal(line, folder / "w"), zc.refusal(line, folder / "w"))
+                zc.run_limited(["zsh", "-f", "-c", line], folder / "w", {"PATH": "/usr/bin:/bin", "SHELL": "/usr/bin/zsh"})
+                self.assertTrue((folder / "w" / "M").exists(), "the line must really run the code")
+                self.assertIsNotNone(gate.Gate.bash(self.old(), line, True))
+                for dialect in ("bash", "zsh"):
+                    self.assertIsNotNone(self.ast(dialect).bash(line))
+
+    def test_without_a_way_to_run_text_quotes_and_bodies_are_data(self):
+        b = self.old()
+        for command in ("python3 - <<EOF\nprint(c.name, 1)\nEOF", "cat <<EOF\nf(e: x)\nEOF", "git commit -m 'f(e: x)'",
+                        "python3 -c 'print(c.name, e)'", "cat <<A; cat <<B\nf(e: 1)\nA\nf(e: 2)\nB"):
+            with self.subTest(command=command):
+                self.assertIsNone(gate.Gate.bash(b, command, True))
+
+    def test_code_in_a_variable_is_the_tree_gates_not_the_old_ones(self):
+        """The tree gate refuses a pattern with a qualifier held in a variable and expanded as a glob; report only."""
+        for dialect in ("bash", "zsh"):
+            for command in ("x='*(e:ls:)'; ls ${~x}", "x='*(e:ls:)'; setopt globsubst; ls $x"):
+                with self.subTest(command=command, dialect=dialect):
+                    self.assertIsNotNone(self.ast(dialect).bash(command))
+
+
 class TestMonotonicity(Base):
     """What the old gate denies, the AST gate denies — except the listed structural classes (tests/shell_monotone.py)."""
 

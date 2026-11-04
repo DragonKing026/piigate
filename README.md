@@ -317,6 +317,9 @@ through the full text filter.
   A `cd` is followed to its directory when the target is literal, a pattern or brace list expanded on disk (up to 64 matches,
   more is refused), or a variable assigned once in the line to a plain value; a target built any other way (a variable set
   by a command, `printf -v`, a substitution) is not followed.
+  A path or code put together while the command runs is not followed: a value read, computed or assigned more than once
+  (`read`, a command substitution, `export`/`declare`, a branch, a second assignment), and code held in the value of a
+  variable that the shell later expands as a pattern or runs.
   The gate is a seat belt against mistakes and shortcuts, not a sandbox.
 - **The syntax-tree front-end (shadow mode only, not the gate).** A second Bash front-end, built on the syntax tree of the
   bundled `shfmt`, judges commands next to the gate in [shadow mode](#shadow-mode); it decides nothing. It reads the
