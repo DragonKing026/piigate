@@ -5092,6 +5092,36 @@ class TestSqlScripts(unittest.TestCase):
             with self.subTest(name):
                 self.assertEqual(sql.drop_identifiers(script, hit), [])
 
+    def test_a_name_in_a_value_position_keeps_its_hit(self):
+        """A name written without quotes right after `=` or inside `VALUES (…)` is a value, not an identifier; a table or
+        column name in an identifier position is still dropped."""
+        for script in (
+            "UPDATE pacjenci SET nazwisko = Kowalski;",
+            "UPDATE pacjenci SET nazwisko=Kowalski;",
+            "INSERT INTO t VALUES (Wiśniewska);",
+            "UPDATE t SET a=`Kowalski`;",
+            'UPDATE t SET a = "Kowalski";',
+            "UPDATE pacjenci SET imie = Jan, nazwisko = Kowalski WHERE id = 1;",
+            "UPDATE t SET a = 1 WHERE nazwisko = Kowalski;",
+            "INSERT INTO t (a, b) VALUES (Jan, Kowalski);",
+            "INSERT INTO t VALUES (1, Kowalski), (2, Nowak);",
+            "INSERT INTO t VALUES (1, 'x'),\n  (2, Kowalski);",
+            "INSERT INTO t VALUES (1, f(Kowalski));",
+            "INSERT INTO t VALUE (Kowalski);",
+        ):
+            with self.subTest(script):
+                self.assertEqual(verdict.check_text(script + "\n", CONFIG).get("PERSON", 0) > 0, True, script)
+        for script in (
+            "UPDATE wp_users SET user_email = 'x'",
+            "DELETE FROM wp_users",
+            "UPDATE Kowalski SET a = 1;",
+            "INSERT INTO Kowalski (a) VALUES (1);",
+            "INSERT INTO t (Kowalski, Nowak) VALUES (1, 2);",
+            "UPDATE t SET Kowalski = 1, Nowak = 2;",
+        ):
+            with self.subTest(script):
+                self.assertEqual(verdict.check_text(script + "\n", CONFIG).get("PERSON", 0), 0, script)
+
     @unittest.skipUnless(PRESIDIO, PRESIDIO_SKIP)
     def test_text_filter_on_a_script(self):
         result, counter = text.filter_text(self.SCRIPT, CONFIG)

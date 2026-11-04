@@ -7,7 +7,8 @@ Two questions, both answered from the content, never from the file name:
   judged (too large, binary or compressed, not text) is treated as a dump: fail closed.
 - `drop_identifiers(text, fragments)`: in a text that is a SQL script, table and column names (`wp_users`,
   `user_email`) are not names of people or places. A hit of type PERSON / ADDRESS / ORG is kept only where it lies in
-  a string literal or a comment — that is where the data of a script is.
+  a string literal or a comment — that is where the data of a script is — or in a position of a value: right after `=`
+  and inside `VALUES (…)`.
 
 Standard library only; no import of the rules (fragments are rebuilt with `dataclasses.replace`).
 """
@@ -146,6 +147,38 @@ def looks_like_script(text: str) -> bool:
 
 _IDENTIFIER = re.compile(r"[\w.$`]+")
 _EDGE = " \t\r\n=,()<>;"  # whitespace and operators around an identifier
+_PAREN_OR_VALUES = re.compile(r"[()]|\bVALUES?\b\s*(?:ROW\s*)?\(", re.IGNORECASE)
+_AFTER_EQUALS = re.compile(r"=\s*`?\s*\Z")
+
+
+def _values_groups(text: str, spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Ranges `VALUES (` … `)`, also the groups that follow (`VALUES (1, 2), (3, 4)`) and whatever is nested in them: a
+    value list, where a name is a value. One pass; parentheses inside literals and comments do not count; a group that
+    is not closed runs to the end of the text."""
+    starts, ends = [s for s, _ in spans], [k for _, k in spans]
+    groups: list[tuple[int, int]] = []
+    stack: list[bool] = []  # per open parenthesis: part of a value list
+    open_values = 0
+    group_start = last_close = -1
+    for m in _PAREN_OR_VALUES.finditer(text):
+        j = bisect.bisect_right(starts, m.start()) - 1
+        if j >= 0 and m.start() < ends[j]:
+            continue  # inside a literal or a comment
+        if m.group() == ")":
+            if stack and stack.pop():
+                open_values -= 1
+                if open_values == 0:
+                    groups.append((group_start, m.end()))
+                    last_close = m.end()
+            continue
+        in_list = m.group() != "(" or open_values > 0 or (last_close >= 0 and text[last_close : m.start()].strip() == ",")
+        if in_list and open_values == 0:
+            group_start = m.start()
+        stack.append(in_list)
+        open_values += in_list
+    if open_values:
+        groups.append((group_start, len(text)))
+    return groups
 
 
 def drop_identifiers(text: str, fragments: list) -> list:
@@ -161,7 +194,13 @@ def drop_identifiers(text: str, fragments: list) -> list:
     ends = [k for _, k in spans]
     chosen = {id(f) for f in candidates}
     result = [f for f in fragments if id(f) not in chosen]
+    groups = _values_groups(text, spans)
+    group_starts, group_ends = [s for s, _ in groups], [k for _, k in groups]
     for f in candidates:
+        g = bisect.bisect_right(group_starts, f.start) - 1
+        if (g >= 0 and f.start < group_ends[g]) or _AFTER_EQUALS.search(text, max(0, f.start - 64), f.start):
+            result.append(f)  # a value: right after `=` or inside VALUES (…)
+            continue
         inside: list[tuple[int, int]] = []
         outside: list[tuple[int, int]] = []
         position = f.start
