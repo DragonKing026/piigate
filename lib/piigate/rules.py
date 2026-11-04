@@ -317,12 +317,17 @@ TIMESTAMP_RE = re.compile(
 )
 
 
+BIRTH_MARKER_RE = re.compile(r"ur\.|urodz|dob|birth")  # in the 30 characters before a date: a birth date
+
+
 def timestamp_spans(text: str) -> list[tuple[int, int]]:
-    """Spans of timestamps with a real time of day (see TIMESTAMP_RE)."""
+    """Spans of timestamps with a real time of day (see TIMESTAMP_RE), except those right after a birth marker
+    (`ur. 1985-03-14 08:15:00` is a birth date written with a time)."""
     return [
         (m.start(), m.end())
         for m in TIMESTAMP_RE.finditer(text)
         if re.search(r"[1-9]", re.sub(r"[Z+-]\d{2}(?::?\d{2})?$|^.{10}", "", m.group()))
+        and not BIRTH_MARKER_RE.search(text[max(0, m.start() - 30) : m.start()].casefold())
     ]
 
 
@@ -367,7 +372,7 @@ def detect(text: str, *, dates: str = "all", drugs: bool = True) -> list[Fragmen
             s, k = _group(m)
             if type_ == "DATE" and dates == "birth":
                 before = text[max(0, s - 30) : s].casefold()
-                if not re.search(r"ur\.|urodz|dob|birth", before):
+                if not BIRTH_MARKER_RE.search(before):
                     continue
             if type_ == "EMAIL" and not email_valid(m.group()):
                 continue

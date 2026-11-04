@@ -4554,6 +4554,38 @@ class TestLineSafety(unittest.TestCase):
         for value in ("2026-11-02", "2026-11-02T00:00:00Z", "2026-11-02T00:00", "2026-11-02 00:00:00.000", "2026-11-02 20:11"):
             self.assertEqual(rules.timestamp_spans(f"x {value} y"), [], value)
 
+    BIRTH_STAMPS = ("ur. 1985-03-14 08:15:00", "data urodzenia: 1985-03-14T08:15:00Z", "Urodzony 1985-03-14 08:15:00",
+                    "DOB: 1985-03-14T08:15", "birth date 1985-03-14 08:15:00+01:00")
+
+    def test_timestamp_after_a_birth_marker_stays_a_date(self):
+        """#25 (review): `ur. 1985-03-14 08:15:00` is a birth date written with a time — only a timestamp without such a
+        marker in the 30 characters before it is a technical value."""
+        from piigate import rules
+
+        for sample in self.BIRTH_STAMPS:
+            with self.subTest(sample):
+                self.assertEqual(rules.timestamp_spans(sample), [], sample)
+        for sample in ("ur. 1985-03-14 08:15:00", "Urodzony 1985-03-14 08:15:00", "birth date 1985-03-14 08:15:00+01:00"):
+            with self.subTest(sample):  # the rules alone (no NER) find the date when the time is separated by a space
+                self.assertTrue([f for f in rules.detect(sample) if f.type_ == "DATE"], sample)
+                result, _ = text.filter_text(sample, CONFIG, rules_only=True)
+                self.assertIn("DATE_", result)
+                self.assertNotIn("1985-03-14", result)
+        # the marker too far back, or none: a timestamp as before
+        far = "ur. " + "x" * 40 + " 2026-11-02T20:11:01Z"
+        self.assertEqual(len(rules.timestamp_spans(far)), 1)
+        self.assertEqual(len(rules.timestamp_spans("pushed_at 2026-11-02T20:11:01Z")), 1)
+
+    @unittest.skipUnless(PRESIDIO, PRESIDIO_SKIP)
+    def test_timestamp_after_a_birth_marker_is_masked_with_presidio(self):
+        for sample in self.BIRTH_STAMPS:
+            with self.subTest(sample):
+                result, _ = text.filter_text(sample, CONFIG)
+                self.assertIn("DATE_", result)
+                self.assertNotIn("1985-03-14", result)
+        result, _ = text.filter_text("pushed_at 2026-11-02T20:11:01Z done", CONFIG)
+        self.assertEqual(result, "pushed_at 2026-11-02T20:11:01Z done")
+
     def test_hits_never_cut_a_version(self):
         from piigate import rules
 
