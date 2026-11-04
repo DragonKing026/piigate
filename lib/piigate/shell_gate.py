@@ -272,7 +272,8 @@ class AstGate(gate.Gate):
         # bodies of heredocs read by a shell or launcher are code: parsed like the command itself
         bodies: list[_Body] = []
         text_bodies: list[str] = []
-        dynamic_body = ""  # stdin text of a non-shell: not shell code, so it has no tree
+        dynamic_body = ""
+        writer_dynamic = False  # stdin text of a non-shell: not shell code, so it has no tree
         seen_text: set[int] = set()
         for c in list(calls):
             for r in c.redirects:
@@ -293,6 +294,9 @@ class AstGate(gate.Gate):
                 else:
                     stripped = self._file_writer(c) is not None
                     bodies.append(_Body(h.body, h.quoted, False, stripped))
+                    if stripped:
+                        self._expanded_body(h, c)
+                        writer_dynamic = writer_dynamic or self._body_dynamic  # text built at run time, written to a file
                     if not stripped and id(h) not in seen_text:
                         body_text = self._expanded_body(h, c)
                         text_bodies.append(body_text)
@@ -337,6 +341,8 @@ class AstGate(gate.Gate):
         all_text = " ".join(tokens)
         dests = {os.path.basename(d) for c in calls for d in (self._file_writer(c) or [])}
         reused = any(all_text.count(d) > 1 for d in dests if d)
+        if writer_dynamic and reused:  # the old gate's rule, kept: a script made of run-time text, then run in the same line
+            dynamic_body = "a script written from text built at run time (a variable or substitution of unknown value) and run in the same command"
         rest = frozenset(map(str, tokens))
         keep = []
         for b in bodies:
@@ -425,6 +431,15 @@ class AstGate(gate.Gate):
             except shell.ParseError as e:
                 self.parse_error = str(e)
                 return f"piigate: command denied — it cannot be parsed with certainty ({e}). {gate.HINT}"
+            for b in self._current.bodies:  # a body written to a file may be run by another call: its text is checked for the
+                if b.stripped and re.search(r"PIIGATE_\w+|XDG_DOCUMENTS_DIR", b.text) or any(  # filter's own files whether or not
+                    m in b.text for m in self.protected_markers if b.stripped  # the same line runs it
+                ):
+                    return (
+                        "piigate: the command touches a filter file (PIIGATE_* / XDG_DOCUMENTS_DIR / the map, key or "
+                        "engine paths) in a script it writes — the pseudonym map, key and filter configuration are "
+                        "off-limits to the model."
+                    )
             if why := self._unjudgeable(self._current.calls) or self._current.dynamic_body:
                 return f"piigate: command denied — {why}; the gate cannot judge what it runs. {gate.HINT}"
             composed = self._current.composed
