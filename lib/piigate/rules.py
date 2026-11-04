@@ -276,15 +276,20 @@ REGON_RE = re.compile(r"(?i)\bREGON\s*[:.]?\s*(\d{9}(?:\d{5})?)\b")
 KRS_RE = re.compile(r"(?i)\bKRS\s*[:.]?\s*(?:nr\.?\s*)?(\d{10})\b")
 # IPv6: candidate with ≥ 2 colons and a digit, then validation (time 12:45:30, MAC, `std::x` are rejected)
 IPV6_RE = re.compile(r"(?<![\w:.])(?=[0-9A-Fa-f:]*\d)(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?![\w:])")
-# PESEL: eleven contiguous digits. Digit groups joined by spaces or hyphens are not one number (`bak-20261023-046`
-# holds eleven digits split by a hyphen); with a "PESEL" label the usual separators are tolerated.
+# PESEL: eleven contiguous digits, or the printed layouts 6+5 and 2-2-2-5 (a space or a hyphen) with a valid
+# checksum; other digit groups are not one number (`bak-20261023-046` holds eleven digits split by a hyphen). With a
+# "PESEL" label the usual separators are tolerated anywhere.
 PESEL_RE = re.compile(r"(?<!\d)\d{11}(?!\d)")
+PESEL_LAYOUT_RE = re.compile(r"(?<![\w.-])(?:\d{6}[ -]\d{5}|\d{2}[ -]\d{2}[ -]\d{2}[ -]\d{5})(?![\w-]|\.\w|-\d)")
 PESEL_LABELLED_RE = re.compile(r"(?i)\bpesel\b[^\d\n]{0,15}(\d(?:[ -]?\d){10})(?!\d)")
-# payment card: 13-19 contiguous digits, or the printed layouts 4-4-4-4 and 4-6-5 / 4-6-4 (Amex, Diners) with one
-# kind of separator; numbers that merely sit next to each other (HTTP codes `200 302 200 200 200`) are not one card
+# payment card: 13-19 contiguous digits, or the printed layouts 4-4-4-4, 4-6-5 / 4-6-4 (Amex, Diners) and 4-8-4 with a
+# hyphen, a space or two spaces between the groups (they may differ); numbers that merely sit next to each other (HTTP
+# codes `200 302 200 200 200`) are not one card
+_CARD_SEP = r"(?: {1,2}|-)"
 CARD_RE = re.compile(
     r"(?<!\d)\d{13,19}(?!\d)"
-    r"|(?<!\w)(?<!\w-)(?:\d{4}([ -])\d{4}\1\d{4}\1\d{4}|\d{4}([ -])\d{6}\2\d{4,5})(?!\w|-\w)"
+    rf"|(?<!\w)(?<!\w-)(?:\d{{4}}(?:{_CARD_SEP}\d{{4}}){{3}}|\d{{4}}{_CARD_SEP}\d{{6}}{_CARD_SEP}\d{{4,5}}"
+    rf"|\d{{4}}{_CARD_SEP}\d{{8}}{_CARD_SEP}\d{{4}})(?!\w|-\w)"
 )
 WORD_RE = re.compile(rf"{NAME}")
 # capital letters glued to a name and not starting another capitalized word (MariaDB, JanSQL — unlike JanKowalski)
@@ -344,9 +349,10 @@ def _group(m: re.Match) -> tuple[int, int]:
     return (m.start(1), m.end(1)) if m.re.groups and m.group(1) else (m.start(), m.end())
 
 
-# four or more groups of three digits in one line, with one kind of separator, are a list of numbers (HTTP codes
-# `200 302 404 500`), not a phone; a line break never joins them (a column of phones), nor does a phone label
-NUMBER_LIST_RE = re.compile(r"(?<![\w+.-])\d{3}([ \t-])\d{3}(?:\1\d{3}){2,}(?!\w)")
+# four or more HTTP status codes in one line, with one kind of separator, are a list of numbers (`200 302 404 500`),
+# not a phone — groups that are not all status codes (`600 700 800 900`) stay phones; a line break never joins them (a column of phones), nor does a phone label
+_HTTP_CODE = r"(?:10[0-3]|20[0-8]|226|30[0-8]|4[0-2]\d|431|451|50\d|51[01])"
+NUMBER_LIST_RE = re.compile(rf"(?<![\w+.-]){_HTTP_CODE}([ \t-]){_HTTP_CODE}(?:\1{_HTTP_CODE}){{2,}}(?!\w)")
 BARE_PHONE_RE = re.compile(r"\d{3}[ \t-]\d{3}[ \t-]\d{3}")
 PHONE_LABEL_RE = re.compile(r"(?i)\b(?:tel|telefon\w*|kom|komórk\w*)\.?\s*[:.]?\s*$")
 
@@ -374,6 +380,9 @@ def detect(text: str, *, dates: str = "all", drugs: bool = True) -> list[Fragmen
             result.append(Fragment(m.start(), m.end(), "PESEL", 3))
         else:  # 11 digits without a valid checksum — still a personal number
             result.append(Fragment(m.start(), m.end(), "NUMBER", 2))
+    for m in PESEL_LAYOUT_RE.finditer(text):
+        if pesel_valid(re.sub(r"\D", "", m.group())):
+            result.append(Fragment(m.start(), m.end(), "PESEL", 3))
     for m in PESEL_LABELLED_RE.finditer(text):
         if not PESEL_RE.fullmatch(m.group(1)) and pesel_valid(re.sub(r"\D", "", m.group(1))):
             result.append(Fragment(m.start(1), m.end(1), "PESEL", 3))

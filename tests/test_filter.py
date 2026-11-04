@@ -4745,13 +4745,80 @@ class TestChecksumNumbers(unittest.TestCase):
                     self.assertIn("PESEL", self.kinds(value), value)
                 self.assertEqual(verdict.check_text(f"PESEL {number}", CONFIG), {"PESEL": 1})
                 self.assertEqual(sensors_mask(f"PESEL {number}"), ("PESEL [PESEL hidden by piigate]", 1))
-                # a label allows the usual separators; without it separated groups are not a number
+                # a label allows the usual separators; without it only the printed layouts 6+5 and 2-2-2-5 are a number
                 spaced = f"{number[:6]} {number[6:]}"
                 self.assertIn("PESEL", self.kinds(f"PESEL: {spaced}"))
                 self.assertIn("PESEL", self.kinds(f"Nr PESEL {number[:6]}-{number[6:]}"))
-                self.assertNotIn("PESEL", self.kinds(f"kod {spaced}"))
+                self.assertIn("PESEL", self.kinds(f"kod {spaced}"))  # the layout 6+5 (#30 review: unlabelled PESEL)
+                self.assertNotIn("PESEL", self.kinds(f"kod {number[:5]} {number[5:]}"))  # other groupings are not
         # eleven digits without a valid checksum stay a (weaker) personal number
         self.assertEqual(self.kinds("12345678901"), {"NUMBER"})
+
+    def test_pesel_in_the_printed_layouts_without_a_label(self):
+        """#30 (review): `44 05 14 01458` and `440514-01458` are a PESEL without the word PESEL, by the checksum."""
+        from piigate import rules
+
+        self.assertTrue(rules.pesel_valid("44051401458"))
+        for value in ("Pacjent: 44 05 14 01458 wizyta", "440514-01458", "440514 01458", "44-05-14-01458", "(44 05 14 01458)",
+                      "x 44-05 14-01458."):
+            with self.subTest(value):
+                self.assertIn("PESEL", self.kinds(value))
+                self.assertEqual(verdict.check_text(value, CONFIG), {"PESEL": 1}, value)
+        for p in dt.PATIENTS:
+            n = p["pesel"]
+            for value in (f"{n[:6]} {n[6:]}", f"{n[:6]}-{n[6:]}", f"{n[:2]} {n[2:4]} {n[4:6]} {n[6:]}", f"{n[:2]}-{n[2:4]}-{n[4:6]}-{n[6:]}"):
+                self.assertIn("PESEL", self.kinds(f"Pacjent: {value} wizyta"), value)
+        # not a number: a wrong checksum, glued to a word, a file name, other groupings
+        for value in ("Pacjent: 44 05 14 01459 wizyta", "x440514-01458", "440514-01458x", "v1.440514-01458", "440514-01458-3",
+                      "compose.yaml.bak-20261023-046", "backup 20261023 046", "440514 0145", "4405140 1458"):
+            with self.subTest(value):
+                self.assertNotIn("PESEL", self.kinds(value))
+                self.assertEqual(verdict.check_text(value + "\n", CONFIG), {}, value)
+        if PRESIDIO:
+            result, _ = text.filter_text("Pacjent: 44 05 14 01458 wizyta, plik compose.yaml.bak-20261023-046", CONFIG)
+            self.assertNotIn("44 05 14", result)
+            self.assertIn("compose.yaml.bak-20261023-046", result)
+
+    def test_card_layouts_with_mixed_separators(self):
+        """#30 (review): `4111 1111-1111 1111`, a double space and `4111 11111111 1111` are a card; HTTP codes are not."""
+        for number in ("4111 1111-1111 1111", "4111-1111 1111-1111", "4111  1111  1111  1111", "4111 1111  1111 1111",
+                       "4111 11111111 1111", "4111-11111111-1111", "3782 822463 10005", "3782-822463 10005"):
+            with self.subTest(number):
+                self.assertIn("CARD", self.kinds(f"karta {number}, ważna"))
+                self.assertEqual(verdict.check_text(f"karta {number}.", CONFIG), {"CARD": 1})
+                self.assertEqual(sensors_mask(f"Karta {number} ok"), ("Karta [CARD hidden by piigate] ok", 1))
+        for number in ("4111 1111-1111 1112", "4111  1111  1111  1112", "4111 11111111 1112", "200 302 200 200 200",
+                       "x4111 1111-1111 1111", "4111 1111-1111 1111x", "4111   1111   1111   1111"):
+            with self.subTest(number):
+                self.assertNotIn("CARD", self.kinds(number), number)
+                self.assertEqual(sensors_mask(number)[1], 0, number)
+        if PRESIDIO:
+            result, _ = text.filter_text("karta 4111 1111-1111 1111 i kody 200 302 200 200 200", CONFIG)
+            self.assertNotIn("4111", result)
+            self.assertIn("200 302 200 200 200", result)
+
+    def test_only_real_http_codes_make_a_list_of_numbers(self):
+        """#30 (review): `600 700 800 900` and a phone among other numbers stay phones; a list of status codes is not."""
+        from piigate import rules
+
+        def phones(sample: str) -> list[str]:
+            return [sample[f.start : f.end] for f in rules.detect(sample) if f.type_ == "PHONE"]
+
+        for sample in ("600 700 800 900", "numery: 600 700 800 601 701 801", "600 700 800 600 700 800",
+                       "Jan Kowalski mieszkanie 123 600 700 800 Warszawa"):
+            with self.subTest(sample):
+                self.assertTrue(phones(sample), sample)
+                if PRESIDIO:
+                    result, _ = text.filter_text(sample, CONFIG)
+                    self.assertNotIn("600 700", result)
+                    self.assertNotIn("600-700", result)
+        for sample in ("200 302 404 500 200", "kody: 200 302 200 200 200", "100 101 102 103", "503 504 511 451 431 226 208",
+                       "200-302-404-500"):
+            with self.subTest(sample):
+                self.assertEqual(phones(sample), [], sample)
+        # one number that is not a status code makes it a sequence of phones again
+        self.assertTrue(phones("200 302 404 599 200"))
+        self.assertTrue(phones("200 302 404 209 200"))
 
     @unittest.skipUnless(PRESIDIO, PRESIDIO_SKIP)
     def test_text_filter(self):
