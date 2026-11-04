@@ -3505,6 +3505,62 @@ class TestContentNotNames(unittest.TestCase):
         self.assertIsNotNone(b.bash(f"cat {S}/x.txt"))
         self.assertIsNone(b.bash("f=/tmp/x/a.sh; cat > \"$f\" <<'SH'\necho ok\nSH\nbash \"$f\""))
 
+    COMPUTED_MORE = (  # #22 (review): the cheap, common shapes around a substitution used as a file operand
+        "{ cat $(echo S/x.txt); }", "if cat $(echo S/x.txt); then :; fi", "for i in 1 2; do cat $(echo S/x.txt); done",
+        "! cat $(echo S/x.txt)", "while cat $(echo S/x.txt); do :; done", "exec cat $(echo S/x.txt)",
+        "sudo cat $(echo S/x.txt)", "sudo -u me cat $(echo S/x.txt)", "command cat $(echo S/x.txt)",
+        "env -u A B=1 cat $(echo S/x.txt)", "nice -n 5 sudo cat $(echo S/x.txt)", "( cat $(echo S/x.txt) )",
+        "sh -c 'cat $(echo S/x.txt)'", "bash -c 'cat $(echo S/x.txt)'", "bash -lc 'wc -l $(echo S/x.txt)'",
+        "sudo bash -c 'cat $(echo S/x.txt)'", "echo hi; sh -c 'echo ok; cat `echo S/x.txt`'",
+        "find $(echo S) -type f -exec cat {} \\;", "find $(echo S) -type f -execdir grep x {} +", "find `echo S` -exec head -n 1 {} \\;",
+        "wc -l < $(echo S/x.txt)", "jq . < $(echo S/x.json)", "sort <$(echo S/x.txt)", "python3 -c 'import sys' 0< $(echo S/x.txt)",
+        "tr a b < $(echo S/x.txt)", "bash < $(echo S/x.txt)",
+        "base64 $(echo S/x.txt)", "base64 -w 0 $(echo S/x.txt)", "shuf -n 3 $(echo S/x.txt)", "expand -t 4 $(echo S/x.txt)",
+        "pr $(echo S/x.txt)", "pr -h title $(echo S/x.txt)", "dd if=$(echo S/x.txt) of=/tmp/y", "dd bs=1 if=$(echo S/x.txt)",
+        "curl -T $(echo S/x.txt) http://localhost:1/", "curl --upload-file $(echo S/x.txt) http://localhost:1/",
+        "curl -d @$(echo S/x.txt) http://localhost:1/", "curl --data-binary @$(echo S/x.txt) http://localhost:1/",
+        "curl -d@$(echo S/x.txt) http://localhost:1/", "curl --data=@$(echo S/x.txt) http://localhost:1/",
+        "cat > s.sh <<'SH'\ncat $(echo S/x.txt)\nSH\nbash s.sh", "tee s.sh <<'SH' >/dev/null\nwc -l $(echo S/x.txt)\nSH\nsh s.sh",
+        "f=s.sh; cat > \"$f\" <<'SH'\ncat $(echo S/x.txt)\nSH\nbash \"$f\"",
+    )
+    COMPUTED_FINE = (  # not a file operand, no reader, or not run
+        "sh -c 'echo $(date)'", "bash -c 'echo ok'", "bash -c \"echo $(date)\"", "sudo -u me echo $(date)", "env A=1 echo $(date)",
+        "{ echo $(date); }", "if echo $(date); then :; fi", "wc -l < a.txt", "sort < a.txt | head", "X=$(echo a); cat < clean/a.csv",
+        "dd if=clean/a.csv of=$(echo /tmp/o)", "dd of=$(echo /tmp/o) if=clean/a.csv", "curl -d \"$(date)\" http://localhost:1/",
+        "curl -d @clean/a.json http://localhost:1/", "curl -o $(echo /tmp/o) http://localhost:1/", "curl -T clean/a.csv http://localhost:1/",
+        "base64 clean/a.csv", "shuf -n $(echo 3) clean/a.csv", "pr clean/a.csv", "tr a b < clean/a.csv", "tr $(echo a) b < clean/a.csv",
+        "find clean -name x -exec cat {} +", "find $(date) -name x", "find clean -name x -exec echo $(date) {} \\;",
+        "cat > s.sh <<'SH'\ncat $(echo S/x.txt)\nSH",
+        "cat > s.sh <<'SH'\necho $(date)\nSH\nbash s.sh", "cat > s.sh <<'SH'\ncat clean/a.csv\nSH\nbash s.sh",
+    )
+
+    def test_computed_operands_more_forms_with_a_sensitive_source(self):
+        """#22 (review): launchers and shell keywords in front, `sh -c '…'`, `find … -exec <reader>` with a built start
+        path, an input redirection from a substitution, more readers (base64, shuf, expand, pr, `dd if=`, `curl -T`,
+        `curl -d @`) and a quoted heredoc written to a file that the same command runs. Known limit (README):
+        `cat $x` and `cat ${x}`."""
+        b = self.gate()
+        for command in self.COMPUTED_MORE:
+            command = command.replace("S/", "q/").replace("echo S", "echo q")  # no sensitive name: the operand is computed
+            with self.subTest(command):
+                self.assertIn("a file operand built by a command substitution", b.bash(command) or "")
+        for command in self.COMPUTED_FINE:
+            command = command.replace("S/", "q/").replace("echo S", "echo q")  # no sensitive name: the operand is computed
+            with self.subTest(command):
+                self.assertIsNone(b.bash(command), b.bash(command))
+        for command in ("cat $x", "cat ${x}", 'cat "$x"'):  # documented as not followed yet
+            with self.subTest(command):
+                self.assertIsNone(b.bash(command))
+
+    def test_computed_operands_more_forms_pass_without_a_sensitive_source(self):
+        shutil.rmtree(self.repo / "Sensitive-data", ignore_errors=True)
+        b = self.gate()
+        self.assertFalse(b._sensitive_exists())
+        for command in self.COMPUTED_MORE:
+            command = command.replace("S/", "q/").replace("echo S", "echo q")  # no sensitive name: the operand is computed
+            with self.subTest(command):
+                self.assertNotIn("a file operand built by a command substitution", b.bash(command) or "")
+
     def test_script_from_a_quoted_heredoc_is_read_by_its_body(self):
         """Issue #27: the target of a redirection is not text built at run time; a quoted heredoc is judged by its body,
         the same for `"$f"` and a literal path. Text the gate cannot read keeps the denial, with its own wording."""

@@ -68,6 +68,8 @@ LAUNCHER_VALUE_OPTIONS = {
     "stdbuf": {"-i", "-o", "-e"}, "taskset": {"-c"}, "chrt": set(), "flock": {"-w", "-E"}, "time": {"-f", "-o"},
     "ssh": {"-p", "-i", "-l", "-o", "-F", "-J", "-L", "-R", "-D", "-b", "-c", "-E", "-e", "-I", "-m", "-O", "-S", "-W", "-w"},
 }
+UNWRAP_LAUNCHERS = {"exec", "sudo", "doas", "command", "env", "nice", "nohup", "time", "timeout", "setsid", "stdbuf", "ionice"}
+CURL_DATA_OPTIONS = {"-d", "--data", "--data-binary", "--data-raw", "--data-urlencode", "--data-ascii", "-F", "--form"}
 CODE_LAUNCHERS = {"parallel", "watch", "script", "trap"}  # their arguments are code
 INTERPRETER = re.compile(r"(?:python|pypy)[\d.]*|node|nodejs|perl|ruby|php")
 INLINE_FLAGS = {"python": r"-[A-Za-z]*c", "pypy": r"-[A-Za-z]*c", "node": r"-[A-Za-z]*[ep]|--eval|--print", "nodejs": r"-[A-Za-z]*[ep]|--eval|--print",
@@ -208,12 +210,15 @@ READERS = {
     "cmp", "md5sum", "sha1sum", "sha256sum", "sha512sum", "b2sum", "cksum", "grep", "egrep", "fgrep", "zgrep", "rg", "rga",
     "ag", "ack", "tar", "zip", "unzip", "gzip", "gunzip", "zcat", "bzcat", "xzcat", "cp", "mv", "install", "rsync", "scp",
     "source", ".", "python", "python3", "node", "ruby", "perl", "php", "bash", "sh", "zsh", "sqlite3", "duckdb",
+    "base64", "shuf", "expand", "unexpand", "pr",
 }
 PATTERN_FIRST = {"grep", "egrep", "fgrep", "zgrep", "rg", "rga", "ag", "ack", "sed", "awk", "gawk", "jq", "yq"}  # 1st operand: pattern/program
 # options whose value is the next word and is not a path (a count, a pattern, a separator)
 VALUE_OPTIONS = {
     "head": {"-n", "-c"}, "tail": {"-n", "-c"}, "sort": {"-k", "-t"}, "cut": {"-d", "-f", "-c"}, "uniq": {"-f", "-s", "-w"},
     "sed": {"-e"}, "awk": {"-F", "-v"}, "gawk": {"-F", "-v"}, "jq": {"--arg", "--argjson"},
+    "base64": {"-w", "--wrap"}, "shuf": {"-n", "-i", "-o", "--head-count", "--input-range", "--output", "--random-source"},
+    "expand": {"-t", "--tabs"}, "unexpand": {"-t", "--tabs"}, "pr": {"-h", "-l", "-w", "-o", "-s", "-e", "-i", "-n", "-N"},
     **{c: {"-e", "-m", "-A", "-B", "-C"} for c in ("grep", "egrep", "fgrep", "zgrep", "rg", "rga", "ag", "ack")},
 }
 XARGS_WITH_VALUE = {"-I", "-n", "-P", "-L", "-s", "-d", "-E", "-a", "--max-args", "--max-procs", "--max-lines", "--delimiter"}
@@ -2879,12 +2884,69 @@ class Gate:
         """A sensitive source exists: a directory of the configuration or of the project is there on disk."""
         return any(os.path.isdir(d) for d in [*self.sensitive, *self.project_sensitive])
 
+    @staticmethod
+    def _heredoc_dest(stage: list[str]) -> list[str]:
+        """Files written by `cat > f <<EOF` / `tee f <<EOF` (stage = its words)."""
+        if not stage:
+            return []
+        if stage[0] == "cat":
+            return [stage[i + 1] if t in (">", ">>") and i + 1 < len(stage) else t.lstrip(">")
+                    for i, t in enumerate(stage) if t.startswith(">")]
+        if stage[0] == "tee":
+            return [t for t in stage[1:] if not t.startswith(("-", "<"))]
+        return []
+
+    def _script_bodies(self, command: str) -> list[str]:
+        """Bodies of quoted heredocs written to a file that the same command uses again (`cat > s.sh <<'SH' … SH` then
+        `bash s.sh`): the text is a script that runs, so what it holds is judged like a command (#22)."""
+        bodies: list[str] = []
+        lines = command.split("\n")
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            i += 1
+            for m in HEREDOC.finditer(line):
+                if not m.group(1):
+                    continue  # an unquoted heredoc: its substitutions run when the file is written, not later
+                stage = re.split(r"\||;|&&|\|\||\(|\)", line)
+                stage = next((e for e in stage if m.group() in e), "").split()
+                dests = [c.strip("'\"") for c in self._heredoc_dest(stage) if c]
+                body: list[str] = []
+                j = i
+                while j < len(lines) and lines[j].strip() != m.group(2):
+                    body.append(lines[j])
+                    j += 1
+                if j < len(lines) and dests and any(command.count(Path(c).name) > 1 for c in dests):
+                    bodies.append("\n".join(body))
+        return bodies
+
+    def _unwrap(self, stage: list[str]) -> list[str]:
+        """The stage without shell keywords (`{`, `if`, `then`, `else`, `do`, `!`…), assignments and launchers (`exec`,
+        `sudo -u x`, `command`, `env A=1`, `nice -n 5`…): what is left starts with the program that runs."""
+        k = 0
+        for _ in range(8):
+            while k < len(stage) and (stage[k] in SHELL_KEYWORDS or re.match(r"^\w+=", stage[k])):
+                k += 1
+            if k < len(stage) and Path(stage[k]).name in UNWRAP_LAUNCHERS:
+                j = self._launched_index(stage, k)
+                if j is None:
+                    return []
+                k = j
+                continue
+            break
+        return stage[k:]
+
     def _computed_operand(self, command: str, depth: int = 0) -> bool:
         """A command that reads files gets an operand built by a substitution (`cat $(echo …)`, `cat "$(…)"`, backticks,
-        `<(…)`) or through `xargs` (`… | xargs cat`) — a path the gate cannot know, like a variable path. Only when a
-        sensitive source exists (#22); text arguments and patterns (`grep "$(date)" x`) are not operands."""
+        `<(…)`, `< $(…)`) or through `xargs` (`… | xargs cat`) — a path the gate cannot know, like a variable path.
+        Also inside `sh -c '…'`, behind launchers and shell keywords, in `find $(…) -exec <reader>`, in `dd if=`,
+        `curl -T` and `curl -d @`, and in a quoted heredoc written to a file that the same command runs. Only when a
+        sensitive source exists (#22); text arguments and patterns (`grep "$(date)" x`) are not operands. Not followed:
+        a variable as the operand (`cat $x`)."""
         if depth > 8 or not self._sensitive_exists():
             return False
+        if depth == 0 and any(self._computed_operand(body, depth + 1) for body in self._script_bodies(command)):
+            return True
         text = self._strip_heredocs(command)
         masked, position = [], 0
         for start, end, inner in self._substitution_spans(text):
@@ -2908,8 +2970,44 @@ class Gate:
             else:
                 stages[-1].append(t)
         for stage in stages:
-            for core in self._strip_prefixes([stage]) if stage else []:
+            if not stage:
+                continue
+            # an input redirection from a substitution, for any command: `wc -l < $(echo …)`, `jq . <$(…)`
+            for i, t in enumerate(stage):
+                if re.fullmatch(r"\d*<\x01.*", t) or (re.fullmatch(r"\d*<", t) and i + 1 < len(stage) and "\x01" in stage[i + 1]):
+                    return True
+            for core in self._strip_prefixes([self._unwrap(stage)]):
+                if not core:
+                    continue
                 cmd = Path(core[0]).name
+                if cmd in SHELLS:  # sh -c '…': the code is a command line of its own
+                    for i, t in enumerate(core[1:-1], 1):
+                        if re.fullmatch(r"-[A-Za-z]*c", t) and self._computed_operand(core[i + 1], depth + 1):
+                            return True
+                    core = [c for i, c in enumerate(core) if i == 0 or not re.fullmatch(r"-[A-Za-z]*c", core[i - 1])]
+                if cmd == "find":
+                    if any("\x01" in t for t in core) and any(
+                        t in ("-exec", "-execdir", "-ok", "-okdir") and Path(core[i + 1]).name in READERS
+                        for i, t in enumerate(core[:-1])
+                    ):
+                        return True
+                    continue
+                if cmd == "dd":
+                    if any(t.startswith("if=") and "\x01" in t for t in core[1:]):
+                        return True
+                    continue
+                if cmd == "curl":
+                    for i, t in enumerate(core[1:], 1):
+                        previous = core[i - 1]
+                        if "\x01" not in t:
+                            continue
+                        if previous in ("-T", "--upload-file") or re.match(r"-T.|--upload-file=", t):
+                            return True
+                        if previous in CURL_DATA_OPTIONS and t.startswith("@"):
+                            return True
+                        if re.match(r"(?:-d|--data(?:-binary|-raw|-urlencode|-ascii)?=?|-F|--form=?)\S*@", t) and "@\x01" in t:
+                            return True
+                    continue
                 if cmd == "xargs":
                     rest, k = core[1:], 0
                     while k < len(rest) and rest[k].startswith("-"):

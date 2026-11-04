@@ -306,8 +306,15 @@ through the full text filter.
   a word that is wholly one quoted string is a program (sed/awk/jq/yq, `gh -q/--jq/--template`) checked as a plain
   path. After `cd DIR &&` relative paths are resolved against DIR only along a chain of literal `cd`s and plain readers
   (`ls`, `cat`, `grep`, `rg`, `find` without actions…) joined by `&&`; after any other operator or command a stage is
-  checked in the session directory and in every directory reached. The output of a command substitution used as an operand (`cat $(echo …)`) is not
-  followed yet (issue #22).
+  checked in the session directory and in every directory reached. The output of a command substitution used as an
+  operand (`cat $(echo …)`, `< $(…)`, `dd if=$(…)`, `curl -T $(…)`, `curl -d @$(…)`, `find $(…) -exec cat`, `… | xargs cat`,
+  also behind `sudo`/`env`/`exec`, shell keywords and inside `sh -c '…'`, and in a quoted heredoc written to a file that
+  the same command runs) is not followed — it is a path the gate cannot know, so while a sensitive directory exists
+  (in the configuration, the project or a worktree) such an operand is **denied even when it would have read a harmless
+  file**; without a sensitive directory on disk nothing changes. Left out until the gate has a real shell parser: a
+  variable as the operand (`cat $x`, `cat ${x}`), `$(…)` inside an interpreter's code (`python3 -c`, `node -e`),
+  a file written by one command and run by a later one, `xargs` with a shell, `tr` (it reads only stdin — use the
+  redirection form), and any program that opens a path it builds itself (issue #22).
   A project repository that TRACKS its sensitive directory is not protected against reading the history without naming
   a path (`git log -U1`, `git cat-file --batch`, `git config --blob` in the root).
   Code written earlier and run later is not followed between commands (`Makefile`, `package.json`, `conftest.py`,
