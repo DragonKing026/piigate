@@ -1433,6 +1433,8 @@ class _Walker:
             return self.unknown_dir(st)
         moved = frozenset(_resolve(target, d, tilde) for d in st.sure)
         absolute = os.path.isabs(os.path.expanduser(target) if tilde else target)
+        if absolute and "absolute-cd" in ABLATE:
+            moved |= st.seen  # the old gate: after a `cd` it could not follow, an absolute `cd` does not bring the line back
         # `cd` may fail: the directories before it stay possible (`seen`), and `known` is only restored for what follows
         # `&&` — after `;` it is `any_known` that counts, and a `cd /abs` does not repair that
         return _State(moved, st.seen | moved, st.known or absolute, st.any_known)

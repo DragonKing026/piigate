@@ -34,7 +34,7 @@ CATEGORIES = (
     "same-allow", "same-deny", "old-deny-new-allow", "old-allow-new-deny", "parse-error", "shadow-error", "shadow-timeout",
 )
 # the cause of an old-deny-new-allow: the feature of the syntax-tree gate that, switched off, makes it deny again
-FEATURES = ("subshell-cd", "pipeline-cd", "known-value-resolution")
+FEATURES = ("subshell-cd", "pipeline-cd", "known-value-resolution", "absolute-cd")
 CAUSES = (*FEATURES, "other")
 REASON_LABELS = (
     "sensitive-dir", "filter-files", "unfiltered-tool", "data-file", "ssh-query", "mcp-piigate", "marker-dir", "human-only",
@@ -111,6 +111,7 @@ def clean(loaded) -> dict:
     return {"version": 1, "days": days}
 
 
+_TMP: str | None = None  # the temporary file between mkstemp and os.replace: the alarm handler removes it
 _HOLDING = False  # this process holds the lock: the alarm handler must not come back into `_update`
 LOCK_WAIT_S = 0.3
 
@@ -133,7 +134,7 @@ def _lock(folder: str):
 def _update(change) -> bool:
     """Applies `change(data)` to the counters under an exclusive lock; False when the lock is busy (nothing is written —
     the shadow only counts, a lost count is acceptable, a wait is not)."""
-    global _HOLDING
+    global _HOLDING, _TMP
     folder = str(config.data_dir())
     os.makedirs(folder, mode=0o700, exist_ok=True)
     fd = _lock(folder)
@@ -153,10 +154,11 @@ def _update(change) -> bool:
         for old in sorted(days)[:-KEEP_DAYS]:
             del days[old]
         out, tmp = tempfile.mkstemp(prefix=FILE + ".", dir=folder)  # 0600, an unpredictable name in the same directory
+        _TMP = tmp
         with os.fdopen(out, "w", encoding="utf-8") as f:
             json.dump(data, f, sort_keys=True)
         os.replace(tmp, os.path.join(folder, FILE))
-        tmp = None
+        tmp = _TMP = None
         return True
     finally:
         if tmp:
@@ -164,7 +166,7 @@ def _update(change) -> bool:
                 os.unlink(tmp)
             except OSError:
                 pass
-        _HOLDING = False
+        _HOLDING, _TMP = False, None
         os.close(fd)
 
 
@@ -224,6 +226,15 @@ def judge(cfg: dict, cwd: str, command: str, files: bool, old_reason: str | None
     return "old-allow-new-deny", ms, None, None, _label(new_reason)
 
 
+def _drop_tmp() -> None:
+    """The alarm came between mkstemp and os.replace: do not leave the temporary file behind."""
+    if _TMP:
+        try:
+            os.unlink(_TMP)
+        except OSError:
+            pass
+
+
 def _harden() -> None:
     """The child holds the command in memory (it may hold personal data): no core dump, not ptrace-able; and a CPU limit that
     does not depend on Python (the kernel kills it) next to the wall-clock alarm."""
@@ -240,11 +251,13 @@ def _harden() -> None:
 
 def _child(cfg: dict, cwd: str, command: str, files: bool, old_reason: str | None) -> None:
     def die(signum, frame):  # the last word: whatever the child was doing, it ends now
+        _drop_tmp()
         os._exit(0)
 
     def too_slow(signum, frame):  # the budget is over (a hung shfmt, a pathological line)
         signal.signal(signal.SIGALRM, die)
         signal.setitimer(signal.ITIMER_REAL, 0.5)  # recording must fit in this
+        _drop_tmp()
         if not _HOLDING:  # inside `_update` the lock is ours already: do not come back into it
             try:
                 record("shadow-timeout")

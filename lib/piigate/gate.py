@@ -106,7 +106,11 @@ FIND_ACTIONS = {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fp
 # output from the network / a server / a database — not a public place, even with a relative file name
 NETWORK_COMMANDS = {"ssh", "scp", "rsync", "sftp", "curl", "wget", "http", "https", "mysql", "mariadb", "psql", "docker", "kubectl"}
 FORBIDDEN_OPERATORS = {";", "&&", "||", "&", ";;", "(", ")", "<<<", "\n", "&|", ";&", "|&&"}
+ZSH_FLAGS = re.compile(r"\$\{[#^~=+]*\(([^)]*)\)")  # `${(flags)name}`
+ZSH_QUALIFIER = re.compile(r"\((?:#q|[N.^/@*%=-]{0,3}(?:e[^\w|)\s(]|\+\w))")  # `(e:…:)`, `(N.e/…/)`, `(+f)`, `(#q…)`
+CD_MATCHES = 64  # directories a `cd PATTERN` is followed into
 REDIRECTS = {">", ">>", ">&", "&>", "&>>", ">|", "<", "<<", "<>", "<&"}
+QUOTED_REDIRECT = re.compile(r"\d*[<>]+[&|]?\d*|&>>?")  # a quoted/escaped word of this shape is not a redirection
 PIIGATE_SUBCOMMANDS = {"show", "list", "table", "text", "status", "shadow", "help", "--help", "-h"}  # `shadow`: counts only
 # earlier pipeline stages before piigate: reading commands only (allow-list), no writing to files
 # (no psql/mysql/mlr/docker — they can run code or write a file locally; database queries go through ssh,
@@ -1519,6 +1523,55 @@ class Gate:
             i += 1
         return "".join(result)
 
+    @staticmethod
+    def _zsh_code(command: str, flags: bool = True) -> str | None:
+        """Syntax by which zsh RUNS code from a word: a parameter flag `e` or `%` (`${(e)x}`, nested or in a default,
+        also in double quotes) and a glob qualifier `(e…)`, `(+…)`, `(#q…)` that is neither quoted nor escaped (`*(e:…:)`,
+        `*(+f)`). The text is read as the shell reads it: nothing inside single quotes, no qualifier inside double quotes
+        or after a backslash, `$(…)`, `((`, `+(a|b)` and `*(.)` are not it. Returns what was found or None."""
+        text, n, i, single, double = command, len(command), 0, False, False
+        while i < n:
+            z = text[i]
+            if single:
+                single = z != "'"
+            elif z == "\\":
+                i += 1
+            elif z == "'" and not double:
+                single = True
+            elif z == '"':
+                double = not double
+            elif flags and z == "$" and text.startswith("{", i + 1):
+                m = ZSH_FLAGS.match(text, i)
+                if m and re.search(r"[e%]", m.group(1)):
+                    return "a zsh parameter flag that runs code (`${(e)…}`, `${(%)…}`)"
+            elif z == "(" and not flags and not double and i and text[i - 1] not in " \t\n;&|(<>=$`" and ZSH_QUALIFIER.match(text, i):
+                return "a zsh glob qualifier that runs code (`(e:…:)`, `(+func)`, `(#q…)`)"
+            i += 1
+        return None
+
+    def _cd_matches(self, stage: list[str], bases: list[str]) -> list[str]:
+        """The directories a `cd`/`pushd` with a pattern (`cd ../Sens*`, `cd ../Sens[i]tive-data`, `cd ../{a,b}`,
+        `cd ~+/..`) may reach from each base directory: the pattern is expanded on disk (at most CD_MATCHES). []
+        for anything that is not a pattern (a literal target is `_cd_target`'s)."""
+        if stage[0] not in ("cd", "pushd") or self._cd_target(stage) is not None:
+            return []
+        args = [a for a in stage[1:] if not a.startswith("-") or a == "-"]
+        if len(args) != 1:
+            return []
+        target = args[0]
+        plus = target.startswith("~+/") or target == "~+"  # $PWD
+        if plus:
+            target = "." + target[2:]
+        if not target or target[0] in "-+" or re.search(r"[$`\\()!]", target) or not (plus or re.search(r"[*?\[{]", target)):
+            return []
+        found: list[str] = []
+        for base in bases:
+            for variant in expand_braces(target):
+                for hit in sorted(glob.glob(_path(variant, base)))[:CD_MATCHES]:
+                    if os.path.isdir(hit) and hit not in found:
+                        found.append(hit)
+        return found[:CD_MATCHES]
+
     def _invocations(self, command: str, names: set[str], depth: int = 0) -> list[list[str] | None]:
         """Where the command RUNS one of `names` (matched by the base name, also glued from quotes): the argv of each
         call (from the name on), or None for a call whose arguments the gate cannot determine — inside a substitution,
@@ -1682,7 +1735,15 @@ class Gate:
         flags = Gate._quoted_words(text)
         if flags is None or len(flags) != len(words):
             flags = [""] * len(words)
-        return [QuotedToken(t, q) if q else ("\n" if t == "\x00" else t) for t, q in zip(words, flags)]
+        out = []
+        for t, q in zip(words, flags):
+            if q and QUOTED_REDIRECT.fullmatch(t):
+                # `cat '>' P`, `cat \> P`, `'>>'`, `'&>'`: a quoted or escaped word that reads like a redirection is a word —
+                # an operand, not a write target (the backslash keeps it from being taken for the operator)
+                out.append(QuotedToken("\\" + t, q))
+            else:
+                out.append(QuotedToken(t, q) if q else ("\n" if t == "\x00" else t))
+        return out
 
     @staticmethod
     def _quoted_words(text: str) -> list[str] | None:
@@ -1701,7 +1762,7 @@ class Gate:
                     i += 1
                 flags.append("")
             else:
-                before, quotes, after, quote = "", 0, False, ""
+                before, quotes, after, quote, start = "", 0, False, "", i
                 while i < n and text[i] not in " \t\r;&|()<>":
                     z = text[i]
                     if z == "\\":
@@ -1725,6 +1786,8 @@ class Gate:
                             before += z
                         i += 1
                 flags.append(quote if quotes == 1 and not after and re.fullmatch(r"(?:--[\w-]+=)?", before) else "")
+                if not flags[-1] and re.fullmatch(r"(?:\\[;&|()<>])+", text[start:i]):
+                    flags[-1] = "\\"  # `\>`: an operator character made a plain word by the backslash
         return flags
 
     def _token_kind(
@@ -2206,6 +2269,10 @@ class Gate:
             depth = 0
             if stage:
                 target = self._cd_target(stage)
+                matches = self._cd_matches(stage, sure if narrow else seen) if target is None else []
+                if matches:  # `cd ../Sens*`: where it may lead is added; what follows is checked there too
+                    narrow = False
+                    seen += [d for d in matches if d not in seen]
                 if narrow and target is None and not self._chain_safe(stage):
                     narrow = False
                 result.append(list(sure if narrow else seen))
@@ -2771,6 +2838,13 @@ class Gate:
         tokens = self._tokens(command)
         if reason := self._human_only(command, tokens):
             return reason
+        outside, _, _, body = self._heredoc_text(command)
+        in_bodies = set(body.split("\n")) if body else set()  # globs are not expanded in a heredoc body, parameters are
+        found = self._zsh_code(outside) or self._zsh_code(
+            "\n".join(ln for ln in outside.split("\n") if ln not in in_bodies), flags=False
+        )
+        if found:
+            return f"piigate: command denied — {found}; the gate cannot see what it would read. {HINT}"
         if reason := self._marker_only_rmdir(tokens):
             return reason
         if self._marker_recipe(command, files):

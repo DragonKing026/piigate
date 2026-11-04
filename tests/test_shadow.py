@@ -288,6 +288,16 @@ class TestShadow(unittest.TestCase):
                 shadow._update(lambda d: None)
         self.assertEqual(sorted(p.name for p in Path(shadow.path()).parent.iterdir()), [shadow.FILE, shadow.FILE + ".lock"])
 
+    def test_an_alarm_between_mkstemp_and_replace_leaves_no_temporary_file(self):
+        def slow_dump(*a, **k):
+            time.sleep(30)
+
+        with mock.patch.object(json, "dump", slow_dump):
+            pid = shadow.observe(self.cfg, self.cwd, "ls", None)
+            self.wait_child(pid, shadow.BUDGET_S + 1)
+        names = sorted(p.name for p in Path(shadow.path()).parent.iterdir())
+        self.assertEqual([n for n in names if n not in (shadow.FILE + ".lock",)], [])
+
     def test_memfd_asks_for_exec_and_falls_back_on_einval(self):
         calls = []
         real = os.memfd_create

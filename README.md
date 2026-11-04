@@ -346,7 +346,7 @@ at most 60 days, a few KB, in a directory created with mode 0700; a busy lock or
 
 - per day, a count for each of: `same-allow`, `same-deny`, `old-deny-new-allow`, `old-allow-new-deny`, `parse-error`,
   `shadow-error`, `shadow-timeout`;
-- for `old-deny-new-allow`, the cause as a fixed code (`subshell-cd`, `pipeline-cd`, `known-value-resolution`, `other`);
+- for `old-deny-new-allow`, the cause as a fixed code (`subshell-cd`, `pipeline-cd`, `absolute-cd`, `known-value-resolution`, `other`);
 - for the two disagreement counts, the old (or new) reason as one of a dozen fixed labels (`sensitive-dir`, `human-only`, …);
 - a histogram of the time in milliseconds, in fixed buckets.
 

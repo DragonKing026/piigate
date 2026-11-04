@@ -15,6 +15,8 @@ CLASSES = {
     "directory it never left as 'maybe changed' and denies)",
     "pipeline-cd": "`echo | cd ..; cat S*/p*`: a pipeline stage runs in a forked shell (bash without `lastpipe`), so its `cd` does not "
     "change the directory of what follows (the old gate took the `cd` as run here and denied)",
+    "absolute-cd": "`cd ../Sens* && cd /tmp && cat f`: after a `cd` the old gate cannot follow (a pattern, a variable), it keeps checking "
+    "`f` in every directory reached so far; the tree gate knows that an absolute `cd` puts the rest of the line in that directory",
     "known-value-resolution": "`cat > \"$S/x\"`, `tee $f`, `cd $d`: a variable of KNOWN value is that value (the old gate treated every "
     "`$` in a write target or a path as unknown)",
 }

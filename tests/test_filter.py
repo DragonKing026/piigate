@@ -375,6 +375,38 @@ class TestGate(unittest.TestCase):
         self.assertIsNotNone(b.decision("Read", {"file_path": str(dest)}))
         self.assertIsNotNone(b.decision("Bash", {"command": f"cat {dest}"}))
 
+    def _world(self, name):
+        root = TMP / name
+        (root / "work").mkdir(parents=True, exist_ok=True)
+        (root / "Sensitive-data").mkdir(exist_ok=True)
+        (root / "Sensitive-data" / "people.csv").write_text("dummy\n")
+        (root / "work" / "notes.md").write_text("x\n")
+        cfg = json.loads(json.dumps(CONFIG))
+        cfg["sources"]["directories"].append(str(root / "Sensitive-data"))
+        return gate.Gate(cfg, str(root / "work"))
+
+    def test_a_quoted_or_escaped_operator_is_a_word(self):
+        b = self._world("quoted-operator")
+        for op in ("'>'", "'>>'", "'>|'", "'&>'", "\\>", "\\>\\>", '">"'):
+            with self.subTest(op=op):
+                self.assertIsNotNone(b.bash(f"cat {op} ../Sensitive-data/people.csv"))
+        for command in ("cat '>' notes.md", "echo a '>' b", "echo a > out.txt", "echo '>' > out.txt"):
+            with self.subTest(command=command):
+                self.assertIsNone(b.bash(command))
+
+    def test_cd_with_a_pattern_leads_where_the_pattern_leads(self):
+        b = self._world("cd-pattern")
+        for command in (
+            "cd ../Sens* && cat people.csv", "cd ../S*; cat people.csv", "cd ../Sens[i]tive-data && cat people.csv",
+            "cd ../Sensitive-dat? && cat people.csv", "cd ../{Sensitive-data,x} && cat people.csv", "pushd ../Sens* && cat people.csv",
+            "cd ~+/../Sensitive-data && cat people.csv", "cd ../Sens* ; cd /tmp; cat people.csv",
+        ):
+            with self.subTest(command=command):
+                self.assertIsNotNone(b.bash(command))
+        for command in ("cd ../Sens* && ls", "cd . && cat notes.md", "cd ../zzz* && cat notes.md", "cd ../w* && cat notes.md"):
+            with self.subTest(command=command):
+                self.assertIsNone(b.bash(command))
+
     def test_grep_glob_edit(self):
         self.assertTrue(self.denial("Grep", {"pattern": "x", "path": f"{self.home}/Downloads/thunderbird.tmp"}))
         self.assertTrue(self.denial("Grep", {"pattern": "x", "glob": "*.csv", "path": str(FILES["csv"].parent)}))

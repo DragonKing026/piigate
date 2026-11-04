@@ -532,6 +532,28 @@ class TestRound7(Base):
         self.assertGreater(result["real_reads"], 300)
 
 
+class TestOldGateZshCode(Base):
+    """The old gate (`Gate`) refuses the zsh syntax that runs code, and only that. (Here, not in test_filter.py: these
+    lines are zsh-only and the bash corpus of test_filter.py must parse in both grammars.)"""
+
+    def test_zsh_code_syntax_is_refused_where_it_is_code(self):
+        b = self.old()
+        for command in (
+            "echo ${(e)x}", "echo ${(%)x}", "echo ${${(e)x}}", "echo ${(e)${x}}", "echo ${y:-${(e)x}}", 'echo "${(e)x}"',
+            "echo ${(@e)x}", "echo *(e:ls:)", "echo *(e/ls/)", "echo *(e,ls,)", "echo *(e!ls!)", "echo *.csv(e:ls:)", "echo *(+f)",
+            "echo *(#qe:ls:)", "echo *(N.e:ls:)",
+        ):
+            with self.subTest(command=command):
+                self.assertIsNotNone(gate.Gate.bash(b, command, True))
+        for command in (
+            "echo '${(e)x}'", "echo ${(j:,:)x}", "echo ${(@)x}", "echo *(.)", "echo *.csv(N)", "echo +(a|b)", "echo @(ab|e:x)",
+            'git commit -m "fix(e: x)"', "grep 'def f(e: str)' a.py", "python3 -c 'print(e)'", "echo $(echo hi)", "(echo hi)",
+            "echo \\*\\(e:x\\)", 'echo "a(e:b)"', "python3 - <<'EOF'\ndef f(e: str): pass\nEOF",
+        ):
+            with self.subTest(command=command):
+                self.assertIsNone(gate.Gate.bash(b, command, True))
+
+
 class TestMonotonicity(Base):
     """What the old gate denies, the AST gate denies — except the listed structural classes (tests/shell_monotone.py)."""
 
