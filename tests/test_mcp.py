@@ -240,6 +240,39 @@ def hook_side(env: dict, text: str) -> dict:
     return json.loads(r.stdout)
 
 
+class TestWorktreeDirectory(unittest.TestCase):
+    """issue #7: the session is in the main directory of a repo, the data directory is in a linked worktree — the gate
+    protects it, so piigate_list must accept it."""
+
+    @classmethod
+    def setUpClass(cls):
+        configure()
+        cls.repo = TMP / "worktree-repo"
+        git = ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
+        subprocess.run([*git, "init", "-q", "-b", "main", str(cls.repo)], check=True, capture_output=True)
+        subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "init"], cwd=cls.repo, check=True, capture_output=True)
+        cls.worktree = cls.repo / ".claude" / "worktrees" / "w1"
+        subprocess.run([*git, "worktree", "add", "-q", "-b", "w1", str(cls.worktree)], cwd=cls.repo, check=True, capture_output=True)
+        (cls.worktree / "Sensitive-data").mkdir()
+        (cls.worktree / "Sensitive-data" / "notes.txt").write_text("Plain notes without data.\n", encoding="utf-8")
+        (cls.repo / "src").mkdir()
+
+    def test_list_in_a_worktree_directory(self):
+        env = {"CLAUDE_PROJECT_DIR": str(self.repo)}
+        _, listed, outside = session(
+            PIIGATE_SERVER,
+            [
+                ("piigate_list", {"directory": str(self.worktree / "Sensitive-data")}),
+                ("piigate_list", {"directory": str(self.repo / "src")}),
+            ],
+            env=env,
+        )
+        self.assertFalse(listed.is_error, text(listed))
+        self.assertIn("notes.txt", text(listed))
+        self.assertTrue(outside.is_error)
+        self.assertIn("outside the sensitive directories", text(outside))
+
+
 class TestLocalEngine(unittest.TestCase):
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp(prefix="pgm-"))  # short: Unix socket paths are limited to ~107 bytes

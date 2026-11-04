@@ -225,10 +225,6 @@ def file_list(directory: Path, cfg: dict, pseudonym_map: PseudonymMap | None = N
     return f"[piigate] {len(files)} files; preview: piigate show <directory> --number N\n" + "\n".join(rows) + "\n"
 
 
-def _in(p: str, directories: list[str]) -> bool:
-    return any(p == k or p.startswith(k.rstrip("/") + "/") for k in directories)
-
-
 def source(path: str, cfg: dict, *, number: int | None = None, directory: bool = False) -> Path:
     """MCP tool input (piigate_*): an absolute path that, after `realpath`, is inside a sensitive directory — or (a file)
     has a sensitive-data extension from the configuration; never a filter file. A symlink from a sensitive directory
@@ -239,10 +235,9 @@ def source(path: str, cfg: dict, *, number: int | None = None, directory: bool =
         raise FilterError("the path must be absolute (or start with ~/)")
     if _is_protected(p, cfg):
         raise FilterError("filter file (map, key, configuration) — not accessible")
-    sensitive = config.sensitive_dirs(cfg)
     real = os.path.realpath(p)
     if directory or number is not None:
-        if not _in(real, sensitive):
+        if not config.in_sensitive(cfg, real):
             raise FilterError(f"directory outside the sensitive directories ({', '.join(cfg['sources']['directories'])})")
         if not os.path.isdir(real):
             raise FilterError("not a directory")
@@ -251,7 +246,7 @@ def source(path: str, cfg: dict, *, number: int | None = None, directory: bool =
         p = file_from_list(Path(real), number, cfg)
         real = os.path.realpath(p)
     extensions = tuple(e.casefold() for e in cfg["sources"]["extensions"])
-    if not _in(real, sensitive) and not real.casefold().endswith(extensions):
+    if not config.in_sensitive(cfg, real) and not real.casefold().endswith(extensions):
         raise FilterError(
             "file outside the sensitive directories and without a sensitive-data extension — read such a file directly (Read)"
         )

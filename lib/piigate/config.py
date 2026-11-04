@@ -4,6 +4,7 @@ import json
 import os
 import pwd
 import re
+import stat
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]  # plugin directory
@@ -47,6 +48,7 @@ def load(cwd: str | None = None) -> dict:
 
 # --- in-project directories --------------------------------------------------------------------------
 
+GITDIR_FILE_LIMIT = 4096  # pointer files and `.gitignore` markers are small; anything larger is not read
 GITIGNORE = "# piigate: sensitive data or filtered copies — nothing in this directory goes into git\n*\n"
 
 
@@ -81,13 +83,98 @@ def project_roots(cwd: str | None) -> list[str]:
     return result
 
 
+WORKTREE_LIMIT = 64
+
+
+def read_small(path: Path | str) -> str | None:
+    """Text of a small pointer file (`.git`, `commondir`, `gitdir`); None when it is missing, not a regular file (a FIFO
+    or a device would block or never end), too large, not UTF-8 or contains a NUL. Never blocks, never follows a symlink."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        data = os.read(fd, GITDIR_FILE_LIMIT + 1)
+        if len(data) > GITDIR_FILE_LIMIT or b"\x00" in data:
+            return None
+        return data.decode("utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    finally:
+        os.close(fd)
+
+
+def _resolve(value: str, base: Path) -> Path:
+    p = Path(value)
+    return Path(os.path.realpath(p if p.is_absolute() else base / p))
+
+
+def worktree_roots(root: str) -> list[str]:
+    """Top directories of every git worktree of the repository `root` belongs to — the main one and the linked ones —
+    read from files only, without running git (the gate runs on every tool call). The given root comes first. Stale
+    entries, garbage, oversized files and read errors are skipped; a submodule or a plain directory is just itself.
+    The pointer files can be edited (or the registry broken) by the agent, so this list is a convenience that widens
+    the protected set; it is not the only safeguard — the gate also walks the directory tree on a recursive search.
+    Never raises: on any error only the given root is returned."""
+    try:
+        return _worktree_roots(root)
+    except (OSError, ValueError):
+        start = Path(os.path.realpath(root))
+        return [str(start)] if _outside_home(start) else []
+
+
+def _worktree_roots(root: str) -> list[str]:
+    start = Path(os.path.realpath(root))
+    result = [start]
+    marker = start / ".git"
+    common: Path | None = None
+    if marker.is_dir() and not marker.is_symlink():
+        common = marker
+    elif marker.is_file():
+        text = read_small(marker)
+        if text and text.startswith("gitdir:"):
+            git_dir = _resolve(text[len("gitdir:") :].strip(), start)
+            if (pointer := read_small(git_dir / "commondir")) is not None:  # no commondir: a submodule, not a linked worktree
+                common = _resolve(pointer, git_dir)
+    if common is None:
+        return [str(start)] if _outside_home(start) else []
+    if common.name == ".git" and common.parent not in result:
+        result.append(common.parent)
+    try:
+        entries = sorted(e for e in (common / "worktrees").iterdir() if e.is_dir())
+    except OSError:
+        entries = []
+    found = 0
+    for entry in entries[: 8 * WORKTREE_LIMIT]:  # only entries with a valid `gitdir` count towards the limit
+        if (pointer := read_small(entry / "gitdir")) is None:
+            continue
+        try:
+            dot_git = _resolve(pointer, entry)
+        except (OSError, ValueError):
+            continue
+        if dot_git.name == ".git" and dot_git.parent.is_dir():
+            found += 1
+            if dot_git.parent not in result:
+                result.append(dot_git.parent)
+            if found >= WORKTREE_LIMIT:
+                break
+    return [str(k) for k in result if _outside_home(k)]
+
+
 def _add_project_dirs(cfg: dict, roots: list[str]) -> dict:
     names = cfg.get("project_directories", {})
     anon_cfg = cfg.setdefault("anonymization", {})
     anon_cfg["directories"] = [anon_cfg.get("directory", DEFAULT_ANONYMIZED)]  # all copy directories — the gate allows reading them directly
     w = cfg["in_project"] = {"sensitive": [], "anonymized": []}
     if n := names.get("sensitive"):
-        w["sensitive"] = [os.path.join(k, n) for k in roots]
+        # the session and repo roots first (the first one holds the copies), then the other worktrees of those repos: the
+        # protected set may grow, the readable Anonymized-data set below must not (a `gitdir` file can be planted)
+        every = list(roots)
+        for k in roots:
+            every += [x for x in worktree_roots(k) if x not in every]
+        w["sensitive"] = [os.path.join(k, n) for k in every]
         z = cfg["sources"]
         z["directories"] = list(z["directories"]) + [k for k in w["sensitive"] if k not in z["directories"]]
     if n := names.get("anonymized"):
@@ -114,12 +201,18 @@ def ensure_gitignore(folder: str | Path) -> None:
     try:
         if os.path.islink(folder) or not Path(folder).is_dir() or os.path.islink(p):
             return
-        fd = os.open(p, os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o644)
-        with os.fdopen(fd, "r+", encoding="utf-8") as f:
-            f.seek(0)
-            content = f.read()
-            if "*" not in content.splitlines():
-                f.write(("\n" if content and not content.endswith("\n") else "") + ("\n" if content else "") + GITIGNORE)
+        fd = os.open(p, os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o644)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > GITDIR_FILE_LIMIT:
+                return  # a FIFO, a device or a huge file: neither read nor appended to (the directory is protected by name)
+            with os.fdopen(fd, "r+", encoding="utf-8", closefd=False) as f:
+                f.seek(0)
+                content = f.read()
+                if "*" not in content.splitlines():
+                    f.write(("\n" if content and not content.endswith("\n") else "") + ("\n" if content else "") + GITIGNORE)
+        finally:
+            os.close(fd)
     except (OSError, UnicodeDecodeError):
         pass  # a missing .gitignore does not weaken the gate; a read-only directory stays as it is
 
@@ -172,6 +265,22 @@ def expand(path: str) -> str:
 
 def sensitive_dirs(cfg: dict) -> list[str]:
     return [expand(k) for k in cfg["sources"]["directories"]]
+
+
+def sensitive_name(cfg: dict) -> str | None:
+    """Name of the in-project sensitive directory (`project_directories.sensitive`) — a directory of that name is
+    sensitive in ANY project, also one the session knows nothing about."""
+    return (cfg.get("project_directories") or {}).get("sensitive") or None
+
+
+def in_sensitive(cfg: dict, real_path: str) -> bool:
+    """A RESOLVED path counts as sensitive: inside a configured sensitive directory (the in-project ones of every
+    worktree included) or below a directory named like the in-project one. Call it on the realpath, so that a symlink
+    from a sensitive directory to the outside loses the permission."""
+    n = sensitive_name(cfg)
+    if n and n in Path(real_path).parts:
+        return True
+    return any(real_path == k or real_path.startswith(k.rstrip("/") + "/") for k in sensitive_dirs(cfg))
 
 
 def protected_dirs(cfg: dict) -> list[str]:
