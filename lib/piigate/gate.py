@@ -53,6 +53,7 @@ LAUNCHERS = {
     "find", "fd", "watch", "flock", "script", "unbuffer", "alias", "function", "export", "declare", "typeset",
     "local", "readonly", "trap",
 }
+NO_COMMAND_LAUNCHERS = {"export", "declare", "typeset", "local", "readonly", "alias", "function"}  # arguments are data
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "fish"}
 # launchers followed directly by the command and its own arguments (`timeout 60 tool --dir X`): the arguments are known
 DIRECT_LAUNCHERS = {
@@ -1482,6 +1483,11 @@ class Gate:
     def _substitutions(text: str) -> list[str]:
         """Contents of $(…), <(…), >(…) and `…` that the shell runs: unquoted or in double quotes, never inside single
         quotes (#23: a single-quoted word is literal — its backticks and `$(` are text)."""
+        return [inner for _, _, inner in Gate._substitution_spans(text)]
+
+    @staticmethod
+    def _substitution_spans(text: str) -> list[tuple[int, int, str]]:
+        """The outermost substitutions of `_substitutions` as (start, end, contents) positions in the text."""
         result, i, single, double = [], 0, False, False
         while i < len(text):
             z = text[i]
@@ -1496,14 +1502,14 @@ class Gate:
             elif z == "`":
                 j = text.find("`", i + 1)
                 j = len(text) if j < 0 else j
-                result.append(text[i + 1 : j])
+                result.append((i, j + 1, text[i + 1 : j]))
                 i = j
             elif (z == "$" or (z in "<>" and not double)) and text[i + 1 : i + 2] == "(":
                 depth, j = 1, i + 2
                 while j < len(text) and depth:
                     depth += {"(": 1, ")": -1}.get(text[j], 0)
                     j += 1
-                result.append(text[i + 2 : j - 1])
+                result.append((i, j, text[i + 2 : j - 1]))
                 i = j - 1
             i += 1
         return result
@@ -2636,7 +2642,9 @@ class Gate:
                 continue
             flat = _flat(command)
             standalone = re.search(r"(?<![\w./-])piigate(?![\w.-])", flat)
-            suspicious = tokens is None or re.search(r"\$\(|`|<\(|\$\{|\beval\b", command) or (
+            # the program that runs may be built at run time: a substitution, backticks or `${…}` as the command word (or
+            # as the command given to a launcher), eval — not a substitution somewhere else (`X=$(date); echo "$X"`)
+            suspicious = tokens is None or re.search(r"\beval\b", command) or self._dynamic_command(command) or (
                 standalone and "$" in command
             )
             prefix = r"(?:project['\",\s]+)?" if word == "approve" else ""
@@ -2656,6 +2664,57 @@ class Gate:
                     "Show the human the command to run."
                 )
         return None
+
+    def _dynamic_command(self, command: str, depth: int = 0) -> bool:
+        """The command word of some stage (or the command a launcher runs, or what a shell/eval/xargs gets) is built at
+        run time — it holds a substitution, backticks or `${…}` — also inside a substitution. Unparsable — True."""
+        if depth > 8:
+            return True
+        text = self._strip_heredocs(command)
+        spans = self._substitution_spans(text)
+        masked, position = [], 0
+        for start, end, inner in spans:
+            masked += [text[position:start], "\x01"]
+            position = end
+            if self._dynamic_command(inner, depth + 1):
+                return True
+        masked.append(text[position:])
+        lex = shlex.shlex("".join(masked), posix=True, punctuation_chars=";&|()\n")
+        lex.whitespace = " \t\r"
+        lex.whitespace_split = True
+        lex.commenters = ""
+        try:
+            tokens = list(lex)
+        except ValueError:
+            return True
+
+        def built(t: str) -> bool:
+            return "\x01" in t or "`" in t or "${" in t
+
+        stages: list[list[str]] = [[]]
+        for t in tokens:
+            if re.fullmatch(r"[;&|()\n]+", t):
+                stages.append([])
+            else:
+                stages[-1].append(t)
+        for stage in stages:
+            k = 0
+            while k < len(stage):
+                t = stage[k]
+                if t in SHELL_KEYWORDS or re.match(r"^\w+=", t) or REDIRECT_GLUED.fullmatch(t):
+                    k += 1
+                elif REDIRECT_ALONE.fullmatch(t):
+                    k += 2
+                else:
+                    break
+            if k >= len(stage):
+                continue
+            if built(stage[k]):
+                return True
+            runs = Path(stage[k]).name in LAUNCHERS and stage[k] not in NO_COMMAND_LAUNCHERS
+            if runs and any(built(t) for t in stage[k + 1 :]):
+                return True
+        return False
 
     @staticmethod
     def _runs_piigate(stage: list[str]) -> int | None:

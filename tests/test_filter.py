@@ -2724,6 +2724,58 @@ class TestFalseAlarms(unittest.TestCase):
             with self.subTest(command):
                 self.assertIsNotNone(b.bash(command))
 
+    def test_human_only_word_after_a_substitution(self):
+        """Issue #26: a command substitution elsewhere does not turn the word into a call; a call stays denied
+        wherever `piigate` runs (also in or after a substitution, built at run time, under a launcher)."""
+        word = "rev" + "erse"
+        appr = "appr" + "ove"
+        for where in (self.public, self.phi):
+            b = self.gate(where)
+            for command in (
+                f'X=$(echo hi); echo "$X https://example.test/api/orders/1/{appr}"',
+                f'X=$(echo hi); echo "$X"; grep -c -E "a|{appr}" /dev/null',
+                f"X=$(echo hi); python3 -c 'print(sorted([1, 2], {word}=True))'",
+                f"X=`echo hi`; echo \"$X {appr}\"",
+                f'echo "$(date) {appr}"',
+                f'echo "${{HOME}} {appr}"',
+                f'for f in $(ls); do grep -c {appr} "$f"; done',
+                f'N=$(wc -l < a.txt); git log --{word} -n "$N" --oneline',
+                f'X=$(echo hi) && sudo -n echo "$X {appr}"',
+                f'export X=$(echo hi); grep {appr} a.txt',
+                f'echo "$(echo a) {appr}" | wc -l',
+                f"gh issue list -R o/piigate --search \"$(date +%Y) {appr}\"",
+            ):
+                with self.subTest(where=where.name, command=command):
+                    self.assertIsNone(b.bash(command))
+        b = self.gate(self.phi)
+        for command in (
+            f"X=$(echo hi); piigate {word} x",
+            f"X=$(echo hi); echo \"$X\"; piigate project {appr}",
+            f"echo hi; $(piigate project {appr})",
+            f"X=$(piigate project {appr}); echo $X",
+            f"echo `piigate {word} x`",
+            f"echo \"$(piigate {word} x)\"",
+            f"X=$(echo hi); /usr/local/bin/piigate project {appr}",
+            f"X=$(echo hi); bash -c 'piigate project {appr}'",
+            f"X=$(echo hi); sh -c \"piigate {word} x\"",
+            f"echo hi | piigate project {appr}",
+            f"true && piigate project {appr}",
+            f"X=$(echo hi); python3 lib/cli.py {word} report.md",
+            f"X=$(echo hi); sudo piigate project {appr}",
+            f"$(echo pii)gate project {appr}",
+            f"`echo pii`gate {word} x",
+            f"X=$(echo pii); ${{X}}gate project {appr}",
+            f"X=$(echo hi); \"$(echo pii)gate\" {word} x",
+            f"X=$(echo hi); eval \"$(echo pii)gate project {appr}\"",
+            f"X=$(echo hi); bash -c \"$(echo pii)gate project {appr}\"",
+            f"X=$(echo hi); echo x | xargs $(echo pii)gate {word}",
+            f"echo $($(echo pii)gate project {appr})",
+            f"X=piigate; echo hi; $X project {appr}",
+            f"X=$(echo hi); eval piigate project {appr}",
+        ):
+            with self.subTest(command):
+                self.assertIsNotNone(b.bash(command))
+
     def test_relative_paths_against_tool_cwd(self):
         """The hook resolves relative paths against the tool call's cwd, not its own working directory."""
         def bash(command: str) -> dict | None:
