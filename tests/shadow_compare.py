@@ -86,19 +86,16 @@ class Recorder:
         out = {}
         for dialect in DIALECTS:
             g = self.ast_cls(cfg, cwd, dialect)
-            adapter_error = ""
             start = time.perf_counter()
-            try:
-                reason = g.bash(command, files)
-            except Exception as e:  # a bug of the adapter, kept visible
-                reason, adapter_error = None, f"{type(e).__name__}: {e}"[:200]
+            reason = g.bash(command, files)  # never raises: an unexpected exception is a denial with `internal_error`
+            adapter_error = g.internal_error
             self.times_new[dialect].append((time.perf_counter() - start) * 1000)
             out[dialect] = {"reason": reason, "parse_error": g.parse_error, "adapter_error": adapter_error, "gate": g}
         return out
 
     def record(self, old_gate, command: str, files: bool, old_reason, source: str, expected: str | None = None) -> None:
         cfg, cwd = old_gate.cfg, old_gate.cwd
-        key = (command, files, cwd, old_reason is None, source == "hook")
+        key = (command, files, cwd, old_reason is None, source == "hook", config_key(cfg))
         if key in self.seen:
             self.seen[key]["count"] += 1
             return
@@ -153,7 +150,7 @@ class Recorder:
         hook_denied = bool(result and result.get("hookSpecificOutput", {}).get("permissionDecision") == "deny")
         self.record(g, command, True, reason, "hook")
         if hook_denied != (reason is not None):
-            self.seen[(command, True, g.cwd, reason is None, True)]["hook_mismatch"] = True
+            self.seen[(command, True, g.cwd, reason is None, True, config_key(cfg))]["hook_mismatch"] = True
 
     # -- heuristics, one by one
     def note(self, name: str, differ: bool, example: dict) -> None:
@@ -224,6 +221,13 @@ class Recorder:
             [None if x is None else list(map(str, x)) for x in old_inv] != [None if x is None else list(map(str, x)) for x in new_inv],
             {"command": command[:120], "old": old_inv[:3], "new": new_inv[:3]},
         )
+
+
+def config_key(cfg: dict) -> str:
+    """The configuration is part of what a decision depends on: the same line under another one is another record."""
+    import hashlib
+
+    return hashlib.sha256(json.dumps(cfg, sort_keys=True, default=str).encode()).hexdigest()[:12]
 
 
 def shell_toplevel(calls):
@@ -327,8 +331,36 @@ def main() -> None:
     finally:
         world.close()
 
+    import shell_adversarial
+
+    world2 = shell_zsh_cases.World()
+    try:
+        adv_rows = shell_adversarial.measure(world2)
+    finally:
+        world2.close()
+    adversarial = {
+        "cases": len(adv_rows),
+        "categories": {d: dict(Counter(r[d]["category"] for r in adv_rows)) for d in DIALECTS},
+        "real_reads_and_old_allows": [r["name"] for r in adv_rows if r["old_hole"]],
+        "real_reads_and_new_allows": {
+            d: [{"name": r["name"], "section": r["section"], "why": r["known"] or "UNEXPLAINED"} for r in shell_adversarial.holes(adv_rows, d)]
+            for d in DIALECTS
+        },
+        "unexplained": {d: [r["name"] for r in shell_adversarial.unexplained(adv_rows, d)] for d in DIALECTS},
+        "benign_new_denies": {
+            d: [r["command"][:90] for r in adv_rows if r["section"] == "B" and r["old"] == "allow" and r[d]["decision"] == "deny"]
+            for d in DIALECTS
+        },
+        "benign_cases": sum(r["section"] == "B" for r in adv_rows),
+        "piigate_expectation_broken": [
+            r["name"] for r in adv_rows if r["expect"] and any(r[d]["decision"] != r["expect"] for d in DIALECTS)
+        ],
+        "old_deny_new_allow": [r["name"] for r in adv_rows if any(r[d]["category"] == "OLD-DENY-NEW-ALLOW" for d in DIALECTS)],
+        "rows": adv_rows,
+    }
     report = {
         "tests": tests_summary,
+        "adversarial": adversarial,
         "commands": {"from_test_calls": from_calls, "added_from_corpus": added, "corpus_templated_skipped": templated_skipped, "total": len(rec.records)},
         "calls_total": sum(r["count"] for r in rec.records),
         "by_source": dict(Counter(r["source"] for r in rec.records)),
@@ -376,6 +408,18 @@ def print_report(report: dict, n_examples: int) -> None:
         for r in report["discrepancies"][d][:n_examples]:
             print(f"  [{r[d]['category']}] {r['test']}: {r['command'][:110]!r}")
             print(f"      old: {r['old']} {r['old_reason'][:80]!r} | new: {r[d]['decision']} {(r[d]['parse_error'] or r[d]['adapter_error'] or r[d]['reason'])[:80]!r} | expected {r['expected']}")
+    adv = report["adversarial"]
+    print(f"\nadversarial corpus: {adv['cases']} cases; categories:", adv["categories"])
+    print("  a real shell reads and the OLD gate allows:", adv["real_reads_and_old_allows"])
+    for d in DIALECTS:
+        print(f"  a real shell reads and the AST gate ({d}) allows:")
+        for h in adv["real_reads_and_new_allows"][d]:
+            print(f"    {h['section']} {h['name']}: {h['why']}")
+    for d in DIALECTS:
+        print(f"  benign lines (B) the old gate allows and the AST gate denies [{d}] ({len(adv['benign_new_denies'][d])}/{adv['benign_cases']}):")
+        for c in adv["benign_new_denies"][d]:
+            print("    ", repr(c))
+    print("  OLD-DENY-NEW-ALLOW:", adv["old_deny_new_allow"], "| piigate expectation broken:", adv["piigate_expectation_broken"])
     print("\nzsh cases: old / bash-AST / zsh-AST / real")
     for row in report["zsh_cases"]:
         mark = "  <== OLD ALLOWS A READ" if row["old_hole"] else ""

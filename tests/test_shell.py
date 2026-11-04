@@ -583,6 +583,138 @@ class TestDialect(Base):
         self.assertEqual([c.name for c in calls], ["bash", "cat", "cat"])
 
 
+class TestNoWordDisappears(Base):
+    """The rule of the front-end: no word, redirection or heredoc of the shfmt tree is lost before the classification.
+    Walks the raw tree of every command of the gate tests and checks each literal and quoted piece against what
+    `shell.parse` emitted (words, assignments, redirection targets, heredoc bodies)."""
+
+    SKIP = {"ArithmExp", "ArithmCmd", "CStyleLoop"}  # numbers and variable names of arithmetic: no path there
+
+    @staticmethod
+    def pieces(node, out: list[str]) -> None:
+        if isinstance(node, dict):
+            t = node.get("Type")
+            if t in TestNoWordDisappears.SKIP:
+                return
+            if t in ("Lit", "SglQuoted") and node.get("Value"):
+                out.append(node["Value"])
+            for k, v in node.items():
+                if k not in ("Pos", "End", "Position"):
+                    TestNoWordDisappears.pieces(v, out)
+        elif isinstance(node, list):
+            for v in node:
+                TestNoWordDisappears.pieces(v, out)
+
+    @staticmethod
+    def emitted(calls) -> str:
+        out: list[str] = []
+        for c in calls:
+            words = [*c.argv, *(a.value for a in c.assigns if a.value), *(x for a in c.assigns for x in a.array)]
+            out += [w.text for w in words]
+            for r in c.redirects:
+                if r.target is not None:
+                    out.append(r.target.text)
+                if r.heredoc is not None:
+                    out += [r.heredoc.body, r.heredoc.delimiter]
+        return "\n".join(out).replace("\\", "")
+
+    def check(self, command: str) -> list[str]:
+        raw: list[str] = []
+        self.pieces(shell.ast(command), raw)
+        text = self.emitted(shell.parse(command, cwd=CWD))
+        return [p for p in raw if p.replace("\\", "") and p.replace("\\", "") not in text and not p.isspace()]
+
+    def test_every_piece_of_the_tree_is_emitted(self):
+        import shell_corpus
+
+        lost = {}
+        for case in shell_corpus.extract():
+            missing = self.check(case.command)
+            if missing:
+                lost[case.command[:70]] = missing[:3]
+        self.assertEqual(lost, {})
+
+    def test_loop_and_case_words(self):
+        for command in ("for f in ../S*/p*.csv; do :; done", "select f in a b; do :; done", "case ../x in ../y) :;; esac"):
+            self.assertEqual(self.check(command), [], command)
+
+
+class TestPinnedBinary(Base):
+    """The parser is part of the gate: only a shfmt whose bytes have the pinned SHA-256 may run."""
+
+    def fake(self, directory: Path, body: str = '#!/bin/sh\necho \'{"Type":"File"}\'\n') -> Path:
+        path = directory / "shfmt"
+        path.write_text(body, encoding="utf-8")
+        path.chmod(0o755)
+        return path
+
+    def test_fake_shfmt_on_path_is_never_run(self):
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            self.fake(Path(d))
+            saved = os.environ["PATH"]
+            os.environ["PATH"] = d + os.pathsep + saved
+            try:
+                calls = shell.parse("cat ../Sensitive-data/people.csv", cwd=CWD)
+            finally:
+                os.environ["PATH"] = saved
+        self.assertEqual([c.name for c in calls], ["cat"])  # the real parser answered, not the fake
+
+    def test_a_file_with_another_checksum_is_refused(self):
+        import tempfile
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as d:
+            fake = self.fake(Path(d))
+            with mock.patch.object(shell, "_shfmt_candidates", return_value=[str(fake)]):
+                with self.assertRaises(shell.ShfmtMissing):
+                    shell.parse("cat x", cwd=CWD)
+
+    def test_no_candidate_is_a_parse_error(self):
+        from unittest import mock
+
+        with mock.patch.object(shell, "_shfmt_candidates", return_value=["/nonexistent/shfmt"]):
+            with self.assertRaises(shell.ParseError):
+                shell.parse("cat x", cwd=CWD)
+
+    def test_the_pins_are_the_release_digests(self):
+        self.assertEqual(set(shell.SHFMT_PINS), {("linux", "amd64"), ("linux", "arm64"), ("darwin", "amd64"), ("darwin", "arm64")})
+        for digest in shell.SHFMT_PINS.values():
+            self.assertRegex(digest, r"^[0-9a-f]{64}$")
+
+    def test_an_empty_tree_for_a_real_command_is_an_error(self):
+        import subprocess
+        from unittest import mock
+
+        empty = subprocess.CompletedProcess([], 0, stdout=b'{"Type":"File"}', stderr=b"")
+        with mock.patch.object(shell, "_run_shfmt", return_value=empty):
+            with self.assertRaises(shell.ParseError):
+                shell.parse("cat ../Sensitive-data/people.csv", cwd=CWD)
+            self.assertEqual(shell.parse("# only a comment\n\n", cwd=CWD), [])
+            self.assertEqual(shell.parse("", cwd=CWD), [])
+
+
+class TestLimits(Base):
+    def test_loops_nested_too_deeply_are_refused_fast(self):
+        import time
+
+        deep = "for a in 1; do " * (shell.MAX_LOOP_NESTING + 1) + "ls;" + " done" * (shell.MAX_LOOP_NESTING + 1)
+        start = time.monotonic()
+        with self.assertRaises(shell.ParseError):
+            parse(deep)
+        self.assertLess(time.monotonic() - start, 3)
+        ok = "for a in 1; do " * shell.MAX_LOOP_NESTING + "ls;" + " done" * shell.MAX_LOOP_NESTING
+        start = time.monotonic()
+        self.assertTrue(parse(ok))
+        self.assertLess(time.monotonic() - start, 3)
+
+    def test_nul_in_a_word(self):
+        (call,) = parse("cat $'\\0'")
+        self.assertIn("\x00", call.argv[1].text)  # the parser reports it; the gate refuses it (test_shell_gate)
+
+
 class TestCorpus(Base):
     def test_every_command_of_the_gate_tests_parses(self):
         import shell_corpus

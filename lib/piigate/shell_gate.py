@@ -350,11 +350,17 @@ class AstGate(gate.Gate):
 
     def _operands(self, stage: list[str]) -> list[tuple[int, str]]:
         """The words of the stage that are not its command, an option, a write target, text or a search pattern."""
-        skip = self._write_targets(stage) | self._text_args(stage) | self._searcher_args(stage)[0]
+        # a message / pattern that holds a substitution is still a message / pattern: probe with the placeholders removed
+        probe = [SUBST_PLACEHOLDER.sub("X", str(t)) for t in stage]
+        skip = self._write_targets(stage) | self._commit_message(probe) | self._searcher_args(probe)[0]
+        if stage and stage[0] in ("echo", "printf"):
+            skip |= set(range(1, len(stage)))
+        assignment = stage and stage[0] == "env"  # `NAME=value` words that `_strip_prefixes` put in front of a command
         return [
             (i, t)
             for i, t in enumerate(stage)
             if i and i not in skip and t and not t.startswith("-") and not gate.REDIRECT_ALONE.fullmatch(t)
+            and not (assignment and re.match(r"[A-Za-z_]\w*\+?=", t))
         ]
 
     def _unknown_dir_kinds(self, stage: list[str]) -> list[tuple[str, str]]:

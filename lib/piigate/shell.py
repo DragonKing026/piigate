@@ -311,6 +311,21 @@ def _has_brace(raw: str) -> bool:
     return False
 
 
+def _lits(node) -> list[str]:
+    """Every literal text under a node, in order (a subscript, an arithmetic expression) — substitutions are walked apart."""
+    if isinstance(node, dict):
+        if node.get("Type") in ("CmdSubst", "ProcSubst"):
+            return ["$(…)"]
+        out = [node["Value"]] if node.get("Type") == "Lit" and node.get("Value") else []
+        for k, v in node.items():
+            if k not in ("Pos", "End", "Position"):
+                out += _lits(v)
+        return out
+    if isinstance(node, list):
+        return [x for v in node for x in _lits(v)]
+    return []
+
+
 def _param_text(p: dict, kinds: set[str]) -> str:
     """`$x`, `${x}`; with an operand (`${x:-Sensitive/a.csv}`, `${x/a/b}`) the operand stays in the text — it is what the
     shell substitutes, and a path in it must stay visible to the gate. An unquoted operand with a glob is globbed."""
@@ -324,6 +339,8 @@ def _param_text(p: dict, kinds: set[str]) -> str:
             w = _word(operand)
             kinds |= w.kinds - {"param"}
             inner += prefix + w.text
+    if p.get("Index") is not None:  # `${a[@]}`, `${a[$i]}`: the subscript is part of what the word names
+        inner += "[" + "".join(_lits(p["Index"])) + "]"
     return "${" + inner + "}"
 
 
