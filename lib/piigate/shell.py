@@ -17,15 +17,19 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
+import hashlib
+import platform
 import subprocess
+import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 
 DIALECTS = ("bash", "zsh")  # the grammar shfmt is asked for (`-ln`); the agent's Bash tool may run either shell
 DEFAULT_DIALECT = "bash"
 SHFMT_TIMEOUT = 5.0  # seconds; a pathological input must not hang the hook
 MAX_DEPTH = 4  # nesting of `bash -c '…'` / `eval` scripts that is parsed
 MAX_BYTES = 256 * 1024  # larger commands are refused (fail closed) instead of being parsed
+MAX_LOOP_NESTING = 6  # loops inside loops: each level walks its body twice, so the time is 2**depth
 
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "mksh", "ash", "fish"}
 # interpreters that read a program from stdin when called without a script (or with `-`)
@@ -47,7 +51,7 @@ class ParseError(Exception):
 
 
 class ShfmtMissing(ParseError):
-    """No `shfmt` binary found (not on PATH, not in ~/.local/bin)."""
+    """No `shfmt` binary with a pinned checksum (not bundled with the plugin, not in ~/.local/bin)."""
 
 
 @dataclass(frozen=True)
@@ -105,6 +109,7 @@ class Call:
     )
     piped_in: bool = False  # stdin comes from a pipe
     piped_stderr: bool = False  # ... from `|&`: the previous stage's stderr comes with it
+    pipes_out: bool = False  # its stage feeds a later stage of the pipeline (every command of a `{ a; b; } | c` stage does)
     opaque_code: bool = False  # `bash -c "$x"` / `eval $x`: code the parser cannot see
     background: bool = False
 
@@ -117,14 +122,73 @@ class Call:
 # ------------------------------------------------------------------------------------------------ running shfmt
 
 
-def _shfmt_binary() -> str:
-    found = shutil.which("shfmt")
-    if found:
-        return found
-    for candidate in (os.path.expanduser("~/.local/bin/shfmt"), "/usr/local/bin/shfmt", "/usr/bin/shfmt"):
-        if os.access(candidate, os.X_OK):
-            return candidate
-    raise ShfmtMissing("shfmt not found")
+# The parser is part of the gate: a program that answers `{"Type":"File"}` to everything would make the gate allow it
+# all. So the binary that runs must be exactly one this module knows — by the SHA-256 of its bytes, checked for every
+# run (the bytes that are checked are the bytes that run: on Linux they go through a memfd).
+# Source of the sums: the `digest` field of the assets of the GitHub release mvdan/sh v3.14.1
+# (`gh api repos/mvdan/sh/releases/tags/v3.14.1`), the release's own checksum for each uploaded file. Nothing downloaded.
+SHFMT_VERSION = "3.14.1"
+SHFMT_PINS = {
+    ("linux", "amd64"): "76e77641faa025814b77f153b29796b8e6fa2fca03e0c76a691608b86c7ea7bf",
+    ("linux", "arm64"): "5f2db09dae91fca848f7adbdd014632e921a383863a2ad7e0450ad3aba0c6489",
+    ("darwin", "amd64"): "d33eee0da0f92835b3562e9767a05cee7e4eaeef47daa03bfd09da17b4b590a6",
+    ("darwin", "arm64"): "b7c872db63553ccffc7253aba3ed7d4885a27d83f1ba567b1138c6315a5847e5",
+}
+PLUGIN_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _platform() -> tuple[str, str]:
+    system = {"linux": "linux", "darwin": "darwin"}.get(sys.platform, sys.platform)
+    machine = platform.machine().lower()
+    return system, {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}.get(machine, machine)
+
+
+def _shfmt_candidates() -> list[str]:
+    """Where the pinned binary may be: the plugin's own file, until it is bundled also the user's install. PATH is never
+    searched (the agent can put a program there)."""
+    system, arch = _platform()
+    return [str(PLUGIN_ROOT / "bin" / f"shfmt-{system}-{arch}"), os.path.expanduser("~/.local/bin/shfmt")]
+
+
+def _shfmt_binary() -> tuple[str, bytes]:
+    """(path, bytes) of the first candidate whose SHA-256 is the pin of this platform; ShfmtMissing otherwise."""
+    pin = SHFMT_PINS.get(_platform())
+    if pin is None:
+        raise ShfmtMissing(f"no pinned shfmt for {_platform()}")
+    wrong = []
+    for candidate in _shfmt_candidates():
+        try:
+            data = Path(candidate).read_bytes()
+        except OSError:
+            continue
+        if hashlib.sha256(data).hexdigest() == pin:
+            return candidate, data
+        wrong.append(candidate)
+    raise ShfmtMissing("shfmt with the pinned checksum not found" + (" (a file with another checksum exists)" if wrong else ""))
+
+
+def _run_shfmt(command: bytes, dialect: str) -> subprocess.CompletedProcess:
+    path, data = _shfmt_binary()
+    args = ["-ln", dialect, "--to-json"]
+    env = {"PATH": "/usr/bin:/bin"}
+    fd = -1
+    try:
+        if hasattr(os, "memfd_create"):
+            try:
+                fd = os.memfd_create("shfmt", 0)
+                os.write(fd, data)
+                return subprocess.run(
+                    [f"/proc/self/fd/{fd}", *args], input=command, capture_output=True, timeout=SHFMT_TIMEOUT,
+                    check=False, cwd="/", env=env, pass_fds=(fd,),
+                )
+            except OSError:
+                pass  # no memfd or not executable there: run the file (checked just before)
+        return subprocess.run(
+            [path, *args], input=command, capture_output=True, timeout=SHFMT_TIMEOUT, check=False, cwd="/", env=env
+        )
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
 
 def ast(command: str, dialect: str = DEFAULT_DIALECT) -> dict:
@@ -134,15 +198,7 @@ def ast(command: str, dialect: str = DEFAULT_DIALECT) -> dict:
     if len(command.encode("utf-8", "replace")) > MAX_BYTES:
         raise ParseError("command too long")
     try:
-        done = subprocess.run(
-            [_shfmt_binary(), "-ln", dialect, "--to-json"],
-            input=command.encode("utf-8", "surrogateescape"),
-            capture_output=True,
-            timeout=SHFMT_TIMEOUT,
-            check=False,
-            cwd="/",
-            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
-        )
+        done = _run_shfmt(command.encode("utf-8", "surrogateescape"), dialect)
     except subprocess.TimeoutExpired as e:
         raise ParseError("shfmt timed out") from e
     except OSError as e:
@@ -156,6 +212,8 @@ def ast(command: str, dialect: str = DEFAULT_DIALECT) -> dict:
         raise ParseError("shfmt returned invalid JSON") from e
     if not isinstance(tree, dict) or tree.get("Type") != "File":
         raise ParseError("unexpected shfmt output")
+    if not tree.get("Stmts") and any(line.strip() and not line.lstrip().startswith("#") for line in command.splitlines()):
+        raise ParseError("shfmt found no command in a line that is not a comment")  # a parser that says "nothing" is lying
     return tree
 
 
@@ -463,6 +521,7 @@ def _stdin_interpreter(argv: list[Word]) -> str:
 class _Walker:
     def __init__(self, session_cwd: str, depth: int = 0, dialect: str = DEFAULT_DIALECT):
         self.dialect = dialect
+        self.loops = 0  # loops open around the statement being walked
         self.functions: set[str] = set()  # names declared so far: a call of one may run any `cd` in its body
         self.session = os.path.normpath(session_cwd)
         self.calls: list[Call] = []
@@ -535,13 +594,20 @@ class _Walker:
                 st,
             )
         if t == "ForClause":
-            self.substs(c.get("Loop"), st, None)
+            # the words of `for f in WORDS` / `select f in WORDS` are arguments like any other: a path there is judged
+            words = [Word("select" if c.get("Select") else "for", "none", False), *(_word(n) for n in _find_words(c.get("Loop")))]
+            call = self.emit(Call(words, list(redirs), st.sure, sub, origin=origin, cwd_known=st.known))
+            self.substs(c.get("Loop"), st, call)
             return self.loop(lambda s0: self.stmts(c.get("Do") or [], s0, sub, inherited, origin), st)
         if t == "CaseClause":
-            self.substs(c.get("Word"), st, None)
+            words = [Word("case", "none", False), *(_word(n) for n in _find_words(c.get("Word")))]
+            for item in c.get("Items") or []:
+                words += [_word(n) for n in _find_words(item.get("Patterns"))]
+            call = self.emit(Call(words, list(redirs), st.sure, sub, origin=origin, cwd_known=st.known))
+            self.substs(c.get("Word"), st, call)
             outs = [st]
             for item in c.get("Items") or []:
-                self.substs(item.get("Patterns"), st, None)
+                self.substs(item.get("Patterns"), st, call)
                 outs.append(self.stmts(item.get("Stmts") or [], st, sub, inherited, origin))
             return _join(outs)
         if t == "FuncDecl":
@@ -569,13 +635,19 @@ class _Walker:
         return _join([then, other])
 
     def loop(self, body, st: _State) -> _State:
-        self.dry += 1
+        if self.loops >= MAX_LOOP_NESTING:
+            raise ParseError("loops nested too deeply")
+        self.loops += 1
         try:
-            first = body(st)
+            self.dry += 1
+            try:
+                first = body(st)
+            finally:
+                self.dry -= 1
+            wide = _State(st.sure | first.sure, first.seen, first.known)  # the next round starts where the body ended
+            again = body(wide)
         finally:
-            self.dry -= 1
-        wide = _State(st.sure | first.sure, first.seen, first.known)  # the next round starts where the body ended
-        again = body(wide)
+            self.loops -= 1
         return _State(st.sure | again.sure, again.seen, again.known)
 
     def binary(self, c, st, sub, redirs, origin) -> _State:
@@ -613,6 +685,9 @@ class _Walker:
                     call.piped_in = True
                     call.piped_stderr = ops[i - 1] == "|&"
         if not self.dry:
+            for a, b in spans[:-1]:  # every command of a stage feeds the next stage, not only the last one
+                for call in _toplevel(self.calls[a:b]):
+                    call.pipes_out = True
             for i, (a, b) in enumerate(spans):
                 if any(call.stdin_interpreter and call.piped_in for call in _toplevel(self.calls[a:b])):
                     for j in range(i):
@@ -750,7 +825,8 @@ class _Walker:
         if target is None:
             return self.unknown_dir(st)
         moved = frozenset(_resolve(target, d, tilde) for d in st.sure)
-        return _State(moved, st.seen | moved, st.known)
+        absolute = os.path.isabs(os.path.expanduser(target) if tilde else target)
+        return _State(moved, st.seen | moved, st.known or absolute)  # `cd /abs` makes the directory known again
 
     def unknown_dir(self, st: _State) -> _State:
         wide = frozenset({*st.seen, self.session})

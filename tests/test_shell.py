@@ -287,9 +287,11 @@ class TestStructure(Base):
         self.assertEqual([c.name for c in calls], ["cd", "ls", "pwd", "id", "w", "read", "echo"])
         self.assertTrue(all(r.inherited for c in calls[5:] for r in c.redirects))
         calls = parse("for i in $(ls d); do cat $i; done; case $x in a) pwd;; esac; f() { cat z; }; { cat; } < s.txt")
-        self.assertEqual([c.name for c in calls], ["ls", "cat", "pwd", "cat", "cat"])
-        self.assertEqual(calls[3].origin, "function")
-        self.assertEqual([(r.op, r.target.text, r.inherited) for r in calls[4].redirects], [("<", "s.txt", True)])
+        # the words of `for` and `case` are calls too (so that no word reaches the gate unjudged)
+        self.assertEqual([c.name for c in calls], ["for", "ls", "cat", "case", "pwd", "cat", "cat"])
+        self.assertEqual([w.text for w in calls[0].argv], ["for", "$(…)"])
+        self.assertEqual(calls[5].origin, "function")
+        self.assertEqual([(r.op, r.target.text, r.inherited) for r in calls[6].redirects], [("<", "s.txt", True)])
 
     def test_assignments_and_substitutions(self):
         call = parse("FOO=1 BAR=$(id) cat f")[0]
@@ -421,7 +423,7 @@ class TestDirectories(Base):
     def test_brace_group_leaks_and_loop_bodies_repeat(self):
         self.assertEqual(self.last_dirs("{ cd a && ls; } && cat f"), frozenset({"/w/a"}))
         self.assertEqual(self.last_dirs("{ cd a; ls; } && cat f"), frozenset({"/w", "/w/a"}))
-        dirs = [c.cwds for c in parse("for i in 1 2; do ls; cd d; done")]
+        dirs = [c.cwds for c in parse("for i in 1 2; do ls; cd d; done") if c.name == "ls"]
         self.assertEqual(dirs[0], frozenset({"/w", "/w/d"}))  # the second round starts in d
 
     def test_substitution_and_function_directories(self):
