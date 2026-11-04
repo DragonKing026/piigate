@@ -15,6 +15,10 @@ fi
 python3 -I "$dir/test_filter.py"
 python3 -I "$dir/test_properties.py"  # Hypothesis (tests/requirements.txt); skips itself when not installed
 python3 -I "$dir/test_engine.py"  # unix socket, engine modes, pins of the container image
+# Bash gate on the syntax tree (bundled shfmt) and the shadow mode; the real-shell matrix runs under a memory limit
+python3 -I "$dir/test_shell.py"
+python3 -I "$dir/test_shadow.py"
+(ulimit -v 4000000; exec timeout 600 python3 -I "$dir/test_shell_gate.py")  # ~3 min with the matrix; skips what lacks zsh
 if command -v uv >/dev/null; then
     uv run --quiet --script "$dir/test_mcp.py"
 else

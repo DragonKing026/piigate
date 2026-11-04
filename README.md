@@ -315,6 +315,14 @@ through the full text filter.
   writing a script and running it is refused when the command names a sensitive path or builds the script from text
   assembled at run time (`printf '…%s…'`, `"$x"`).
   The gate is a seat belt against mistakes and shortcuts, not a sandbox.
+- **The syntax-tree front-end (shadow mode only, not the gate).** A second Bash front-end, built on the syntax tree of the
+  bundled `shfmt`, judges commands next to the gate in [shadow mode](#shadow-mode); it decides nothing. It reads the
+  structure of a line, not what a program does with it, so it shares the limits above and adds its own: a name that is
+  only known to a real shell at run time stays unknown to it (a pattern that matches a copy of a script made earlier;
+  a variable set by `printf -v` or by the `${name:=…}` form; an environment variable that is part of a path; a value
+  given to a shell with `env NAME=… bash -c`; a script handed to an interpreter through a variable). In every such case it
+  judges the text as the old gate does, never more loosely, but it does not follow the value. Anything it cannot parse is
+  refused.
 - **The engine is trusted by address.** piigate protects the socket directory and refuses non-loopback engines, but a
   process of the same user that answers on the engine socket or port first can make NER report nothing (the rules
   still run). On first use the local engine downloads its models (~1 GB); until that finishes, text filtering refuses.
@@ -326,13 +334,42 @@ through the full text filter.
   before the hook replaces it — on your disk, not in the conversation.
 - Files stay on disk (attachments, copies, the pseudonym map). piigate protects the conversation, not the disk.
 
+## Shadow mode
+
+Off by default. When on, every Bash command is judged a second time by the syntax-tree front-end, **after** the gate has
+decided. The gate's answer is final: the second judge runs in a forked child that the hook does not wait for, kills itself
+after one second (a hung `shfmt` included), and an error or timeout in it changes nothing. It exists to measure, on your
+own commands, how often the two front-ends differ — it is not a new gate and nothing here promises that it becomes one.
+
+What is stored — numbers only, in `shell-shadow.json` in the filter's data directory (mode 0600, written under a lock,
+at most 60 days, a few KB; the gate treats it like the map: the agent can neither read nor write it):
+
+- per day, a count for each of: `same-allow`, `same-deny`, `old-deny-new-allow`, `old-allow-new-deny`, `parse-error`,
+  `shadow-error`, `shadow-timeout`;
+- for `old-deny-new-allow`, the cause as a fixed code (`subshell-cd`, `pipeline-cd`, `known-value-resolution`, `other`);
+- for the two disagreement counts, the old (or new) reason as one of a dozen fixed labels (`sensitive-dir`, `human-only`, …);
+- a histogram of the time in milliseconds, in fixed buckets.
+
+Never stored: the command, a path, a file or variable name, an argument, or the text of a reason.
+
+```bash
+piigate shadow          # the totals (counts only; also allowed for the agent)
+piigate shadow-on       # sets "shell_shadow": true in ~/.config/piigate/config.json (human only)
+piigate shadow-off      # sets it back to false (human only)
+piigate shadow-reset    # deletes the counts (human only)
+```
+
+Or edit `~/.config/piigate/config.json` yourself: `{"shell_shadow": true}`. `shfmt` v3.14.1 is bundled for linux and
+darwin on amd64 and arm64 (`bin/shfmt-<os>-<arch>`, pinned by sha256, BSD-3-Clause, [bin/shfmt-LICENSE](bin/shfmt-LICENSE),
+from <https://github.com/mvdan/sh>); on another platform the shadow counts `parse-error` and nothing else happens.
+
 ## Testing
 
 Only on **synthetic** data ([tests/fixtures.py](tests/fixtures.py) — invented people, PESELs with valid checksums,
 `.test` e-mails, made-up streets and towns). Never on real personal data.
 
 ```bash
-tests/run.sh                                   # unit + hook + gate tests, property tests, engine tests, MCP server tests (uv)
+tests/run.sh                                   # unit + hook + gate tests, Bash-gate and shadow tests, property tests, engine tests, MCP server tests (uv)
 pip install --require-hashes -r tests/requirements.txt   # hypothesis (property tests), ruff — pinned by hash
 PIIGATE_TEST_LOCAL_ENGINE=1 python3 -I tests/test_engine.py   # + real local engine (downloads models once)
 PIIGATE_TEST_DB=1 tests/run.sh                 # + throwaway postgres container → psql | piigate table

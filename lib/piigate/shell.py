@@ -53,7 +53,7 @@ class ParseError(Exception):
 
 
 class ShfmtMissing(ParseError):
-    """No `shfmt` binary with a pinned checksum (not bundled with the plugin, not in ~/.local/bin)."""
+    """No `shfmt` binary with a pinned checksum (bundled as bin/shfmt-<os>-<arch>; nothing else is trusted)."""
 
 
 @dataclass(frozen=True)
