@@ -291,7 +291,7 @@ def _word(node: dict) -> Word:
             raw = _text(p)
             quoting.add("none")
             texts.append(_unescape(raw))
-            if "(" in raw:
+            if re.search(r"(?<!\\)\(", raw):  # an unescaped `(` inside a word (`\(` is a literal paren: `find \( -name x \)`)
                 # zsh only: a glob qualifier `*(e:code:)` / `*(+func)` / `*(.)` is kept by shfmt as plain text — it has no
                 # node, and `e:` / `+` run code. Nothing in the tree says what it does: the word is marked
                 kinds.add("zsh")

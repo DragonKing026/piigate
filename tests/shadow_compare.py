@@ -60,6 +60,7 @@ class Recorder:
         self.times_old: list[float] = []
         self.times_new: dict[str, list[float]] = {d: [] for d in DIALECTS}
         self.test = ""
+        self.hook_skipped = 0
         self.heuristic_seen: set[tuple] = set()
 
     # -- the wrapper
@@ -140,6 +141,9 @@ class Recorder:
             cfg = config.load(cwd or None)
             g = self.gate.Gate(cfg, cwd)
             reason = self.original(g, command, True)
+        except Exception:  # the test broke the configuration on purpose (test_bad_config): the hook denied, nothing to compare
+            self.hook_skipped += 1
+            return
         finally:
             for k, v in saved.items():
                 if v is None:
@@ -264,7 +268,8 @@ def main() -> None:
     stream = io.StringIO()
     run = unittest.TextTestRunner(stream=stream, verbosity=0, resultclass=Names).run(suite)
     test_filter.hook = real_hook
-    tests_summary = {"ran": run.testsRun, "failures": len(run.failures), "errors": len(run.errors), "skipped": len(run.skipped)}
+    tests_summary = {"ran": run.testsRun, "failures": len(run.failures), "errors": len(run.errors), "skipped": len(run.skipped),
+        "problems": [f"{t.id().split('.', 1)[-1]}: {tb.strip().splitlines()[-1][:160]}" for t, tb in run.errors + run.failures]}
     from_calls = len(rec.records)
 
     # corpus commands that no test call produced
@@ -327,6 +332,7 @@ def main() -> None:
         "commands": {"from_test_calls": from_calls, "added_from_corpus": added, "corpus_templated_skipped": templated_skipped, "total": len(rec.records)},
         "calls_total": sum(r["count"] for r in rec.records),
         "by_source": dict(Counter(r["source"] for r in rec.records)),
+        "hook_calls_skipped_broken_config": rec.hook_skipped,
         "hook_mismatch": [r["command"][:100] for r in rec.records if r.get("hook_mismatch")],
         "categories": {d: dict(Counter(r[d]["category"] for r in rec.records)) for d in DIALECTS},
         "expected": {},
