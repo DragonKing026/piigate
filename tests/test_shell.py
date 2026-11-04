@@ -108,7 +108,7 @@ class TestHeredocs(Base):
         self.assertFalse(heredoc(unquoted).quoted)
         self.assertIn("${CLAUDE_PLUGIN_ROOT}", heredoc(unquoted).body)  # the shell would expand it
         (word_use,) = parse("cat ${CLAUDE_PLUGIN_ROOT}/config.json")
-        self.assertEqual(word_use.argv[1].kinds, frozenset({"param"}))
+        self.assertEqual(word_use.argv[1].kinds, frozenset({"param", "$CLAUDE_PLUGIN_ROOT"}))  # "$name": the variable read
         self.assertEqual(word_use.argv[1].text, "${CLAUDE_PLUGIN_ROOT}/config.json")
 
     def test_issue_5_gh_body_with_quotes_and_trailing_comma(self):
@@ -233,7 +233,7 @@ class TestWordsAndQuoting(Base):
 
     def test_expansion_kinds(self):
         (call,) = parse("echo $x ${y:-z} $((1+2)) ~ ~/a {a,b}.txt {1..3} '{a,b}' a{} $'x\\ty' \"$@\"")
-        kinds = [w.kinds for w in call.argv[1:]]
+        kinds = [frozenset(k for k in w.kinds if not k.startswith("$")) for w in call.argv[1:]]  # "$name" = variable read
         self.assertEqual(
             kinds,
             [
@@ -430,8 +430,12 @@ class TestDirectories(Base):
         calls = parse("cd a && echo $(ls) && cat f")
         self.assertEqual({c.name: c.cwds for c in calls}["ls"], frozenset({"/w/a"}))
         calls = parse("f() { cat z; }; cd a && f")
-        self.assertFalse(calls[0].cwd_known)  # called later, from anywhere
-        self.assertIn("/w", calls[0].cwds)
+        # the body is walked where it is declared (its words exist) and again where it is called, in the caller's directory
+        self.assertEqual([(c.name, c.origin, sorted(c.cwds)) for c in calls], [
+            ("cat", "function", ["/w"]), ("cd", "top", ["/w"]), ("f", "top", ["/w/a"]), ("cat", "function", ["/w/a"]),
+        ])
+        calls = parse("f() { cd d; }; f; cat x")  # the `cd` of a function carries on
+        self.assertEqual(calls[-1].cwds, frozenset({"/w", "/w/d"}))
 
 
 class TestFailClosed(Base):

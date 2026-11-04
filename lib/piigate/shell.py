@@ -29,6 +29,7 @@ DEFAULT_DIALECT = "bash"
 SHFMT_TIMEOUT = 5.0  # seconds; a pathological input must not hang the hook
 MAX_DEPTH = 4  # nesting of `bash -c '…'` / `eval` scripts that is parsed
 MAX_BYTES = 256 * 1024  # larger commands are refused (fail closed) instead of being parsed
+MAX_CALL_DEPTH = 4  # functions calling functions
 MAX_LOOP_NESTING = 6  # loops inside loops: each level walks its body twice, so the time is 2**depth
 
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "mksh", "ash", "fish"}
@@ -109,6 +110,7 @@ class Call:
     )
     piped_in: bool = False  # stdin comes from a pipe
     piped_stderr: bool = False  # ... from `|&`: the previous stage's stderr comes with it
+    loop_var: str = ""  # the variable of a `for` / `select` pseudo-call
     pipes_out: bool = False  # its stage feeds a later stage of the pipeline (every command of a `{ a; b; } | c` stage does)
     opaque_code: bool = False  # `bash -c "$x"` / `eval $x`: code the parser cannot see
     background: bool = False
@@ -265,11 +267,6 @@ def _ansi_c(raw: str) -> str:
     return _ANSI.sub(one, raw)
 
 
-# zsh glob qualifiers that run code: `(e:'cmd':)`, `(e[cmd])`, `(+function)` — zsh only, and only with BARE_GLOB_QUAL (off in
-# Claude Code's shell setup until a `setopt`); shfmt keeps them as plain text, there is no node for them
-_ZSH_CODE_QUALIFIER = re.compile(r"\((?:[^)]*[^\w])?e[:\[{<(]|\([^)]*\+\w")
-
-
 def _has_glob(raw: str) -> bool:
     i, n = 0, len(raw)
     while i < n:
@@ -330,9 +327,12 @@ def _param_text(p: dict, kinds: set[str]) -> str:
     """`$x`, `${x}`; with an operand (`${x:-Sensitive/a.csv}`, `${x/a/b}`) the operand stays in the text — it is what the
     shell substitutes, and a path in it must stay visible to the gate. An unquoted operand with a glob is globbed."""
     name = _text(p.get("Param") or {})
+    kinds.add("$" + name)  # the variable this expansion reads: `kinds` carries "$name" (the adapter resolves it)
     if p.get("Short"):
         return "$" + name
     inner = name
+    if p.get("NestedParam"):  # zsh `${${(e)x}}`, `${(e)${y}}`: the nested expansion is the name
+        inner = _expansion_text(p["NestedParam"], kinds)
     exp, repl = p.get("Exp") or {}, p.get("Repl") or {}
     for prefix, operand in ((_text(exp, "Op"), exp.get("Word")), ("/", repl.get("Orig")), ("/", repl.get("With"))):
         if operand is not None:
@@ -373,10 +373,8 @@ def _word(node: dict) -> Word:
             texts.append(_unescape(raw))
             if re.search(r"(?<!\\)\(", raw):  # an unescaped `(` inside a word (`\(` is a literal paren: `find \( -name x \)`)
                 # zsh only: a glob qualifier `*(.)` / `*(e:code:)` / `*(+func)` is kept by shfmt as plain text, it has no
-                # node. "zsh": some qualifier is there; "zsh-code": one that runs code
-                kinds.add("zsh")
-                if _ZSH_CODE_QUALIFIER.search(raw):
-                    kinds.add("zsh-code")
+                # node (it can run code: `(e:…:)`, `(e/…/)`, `(+func)`, `(#qe…)` — never read from the text)
+                kinds.add("zsh")  # no node for what the qualifier does: the gate decides by the context, not by its text
             if _has_glob(raw):
                 kinds.add("glob")
             if _has_brace(raw):
@@ -416,10 +414,10 @@ def _expansion_text(p: dict, kinds: set[str]) -> str:
     t = _need(p, "Type")
     if t == "ParamExp":
         kinds.add("param")
-        if p.keys() & {"Flags", "GlobSubst", "Modifiers"}:  # zsh `${(e)x}`, `${~x}`, `${x:a}`
+        if p.keys() & {"Flags", "GlobSubst", "Modifiers", "NestedParam"}:  # zsh `${(e)x}`, `${~x}`, `${x:a}`, `${${…}}`
             kinds.add("zsh")
-            if "e" in _text(p.get("Flags") or {}):
-                kinds.add("zsh-code")  # `(e)` evaluates `$(…)` and `$x` inside the value — works without any setopt
+            if set(_text(p.get("Flags") or {})) & set("e%"):
+                kinds.add("zsh-code")  # `(e)` evaluates `$(…)` and `$x` in the value (works without any setopt); `(%)` prompt escapes
         exp = p.get("Exp") or {}
         if exp.get("Op") == "@" and exp.get("Word") and _word(exp["Word"]).text == "P":
             kinds.update({"cmd", "exec"})  # bash `${x@P}`: prompt expansion runs `$(…)` found in the value
@@ -429,15 +427,15 @@ def _expansion_text(p: dict, kinds: set[str]) -> str:
         return "$(…)"
     if t == "ArithmExp":
         kinds.add("arith")
-        return "$((…))"
+        if _find_subst(p):
+            kinds.add("cmd")
+        return "$((" + "".join(_lits(p)) + "))"  # the operands stay in the word (a subscript there may name a file)
     if t == "ProcSubst":
         kinds.add("proc")
         return p.get("Op", "<(") + "…)"
     if t == "ExtGlob":
         kinds.add("extglob")
-        kinds.add("zsh")  # zsh reads `(…)` after a pattern as a glob qualifier
-        if _ZSH_CODE_QUALIFIER.search("(" + _text(p.get("Pattern") or {}) + ")"):
-            kinds.update({"zsh", "zsh-code"})  # zsh reads `*(e:cmd:)` as a qualifier that runs cmd; bash as an extglob
+        kinds.add("zsh")  # zsh reads `(…)` after a pattern as a glob qualifier; the tree has no node for what is inside
         return _text(p, "Op") + _text(p.get("Pattern") or {}) + ")"
     raise ParseError(f"unsupported word part {t}")
 
@@ -474,7 +472,8 @@ def _redirect(r: dict, inherited: bool = False) -> Redirect:
 class _State:
     sure: frozenset[str]  # where the next command runs when everything before it (joined by &&) succeeded
     seen: frozenset[str]  # every directory a command so far may have run in
-    known: bool = True
+    known: bool = True  # the directory of the next `&&` successor is exactly `sure`
+    any_known: bool = True  # ... on every path (a `cd` that may have failed leaves the earlier directories possible)
 
 
 def _resolve(target: str, base: str, tilde: bool = True) -> str:
@@ -554,7 +553,8 @@ class _Walker:
     def __init__(self, session_cwd: str, depth: int = 0, dialect: str = DEFAULT_DIALECT):
         self.dialect = dialect
         self.loops = 0  # loops open around the statement being walked
-        self.functions: set[str] = set()  # names declared so far: a call of one may run any `cd` in its body
+        self.functions: dict[str, dict] = {}  # name -> body of the functions declared so far: analysed again at each call
+        self.stack: list[str] = []  # functions being walked (a recursive call is refused)
         self.session = os.path.normpath(session_cwd)
         self.calls: list[Call] = []
         self.dry = 0
@@ -571,7 +571,7 @@ class _Walker:
         for s in _find_subst(node):
             origin = "`" if s.get("Backquotes") else {"CmdSubst": "$(", "ProcSubst": s.get("Op", "<(")}[_need(s, "Type")]
             before = len(self.calls)
-            self.stmts(s.get("Stmts") or [], _State(st.sure, st.seen, st.known), True, (), origin)
+            self.stmts(s.get("Stmts") or [], st, True, (), origin)
             if parent is not None:
                 parent.substitutions.extend(_toplevel(self.calls[before:]))
 
@@ -579,7 +579,7 @@ class _Walker:
     def stmts(self, items: list[dict], st: _State, sub: bool, inh: tuple[Redirect, ...], origin: str) -> _State:
         for i, s in enumerate(items):
             if i:  # after `;` / newline the previous command may have failed (the last is followed by the caller's operator)
-                st = _State(st.seen, st.seen, st.known)
+                st = _State(st.seen, st.seen, st.any_known, st.any_known)
             st = self.stmt(s, st, sub, inh, origin)
         return st
 
@@ -629,6 +629,7 @@ class _Walker:
             # the words of `for f in WORDS` / `select f in WORDS` are arguments like any other: a path there is judged
             words = [Word("select" if c.get("Select") else "for", "none", False), *(_word(n) for n in _find_words(c.get("Loop")))]
             call = self.emit(Call(words, list(redirs), st.sure, sub, origin=origin, cwd_known=st.known))
+            call.loop_var = _text((c.get("Loop") or {}).get("Name") or {})
             self.substs(c.get("Loop"), st, call)
             return self.loop(lambda s0: self.stmts(c.get("Do") or [], s0, sub, inherited, origin), st)
         if t == "CaseClause":
@@ -643,14 +644,23 @@ class _Walker:
                 outs.append(self.stmts(item.get("Stmts") or [], st, sub, inherited, origin))
             return _join(outs)
         if t == "FuncDecl":
-            self.functions.add(_text(c.get("Name") or {}))
-            wide = frozenset({*st.seen, self.session})
-            self.stmt(_need(c, "Body"), _State(wide, wide, False), sub, inherited, "function")
+            name = _text(c.get("Name") or {})
+            body = _need(c, "Body")
+            self.functions[name] = body
+            # the words of the body are emitted where it is declared (nothing disappears even if it is never called); the
+            # effect on the directory and the pipeline is analysed where it is CALLED (`call`)
+            self.stmt(body, st, sub, inherited, "function")
             return st
-        if t == "TimeClause" or t == "CoprocClause":
+        if t == "CoprocClause":
+            # a coprocess runs beside the rest of the line and its output comes back through `$COPROC`: nobody follows it
+            call = self.emit(Call([Word("coproc", "none", False)], list(redirs), st.sure, sub, origin=origin, cwd_known=st.known))
+            call.opaque_code = True
             if c.get("Stmt"):
-                inner = self.stmt(c["Stmt"], st, sub or t == "CoprocClause", inherited, origin)
-                return st if t == "CoprocClause" else inner
+                self.stmt(c["Stmt"], st, True, inherited, origin)
+            return st
+        if t == "TimeClause":
+            if c.get("Stmt"):
+                return self.stmt(c["Stmt"], st, sub, inherited, origin)
             return st
         if t in ("DeclClause", "TestClause", "ArithmCmd", "LetClause"):
             return self.builtin_like(c, t, st, sub, redirs, origin, stmt)
@@ -659,7 +669,7 @@ class _Walker:
     def if_clause(self, c, st, sub, inh, origin) -> _State:
         cond = self.stmts(c.get("Cond") or [], st, sub, inh, origin) if c.get("Cond") else st
         then = self.stmts(c.get("Then") or [], cond, sub, inh, origin)
-        other_in = _State(cond.seen, cond.seen, cond.known)  # the condition may have changed directory and failed
+        other_in = _State(cond.seen, cond.seen, cond.any_known, cond.any_known)  # the condition may have changed directory and failed
         if c.get("Else"):
             other = self.if_clause(c["Else"], other_in, sub, inh, origin)
         else:
@@ -676,11 +686,11 @@ class _Walker:
                 first = body(st)
             finally:
                 self.dry -= 1
-            wide = _State(st.sure | first.sure, first.seen, first.known)  # the next round starts where the body ended
+            wide = _State(st.sure | first.sure, first.seen, first.known, first.any_known)  # the next round starts where it ended
             again = body(wide)
         finally:
             self.loops -= 1
-        return _State(st.sure | again.sure, again.seen, again.known)
+        return _State(st.sure | again.sure, again.seen, st.known and again.known, st.any_known and again.any_known)
 
     def binary(self, c, st, sub, redirs, origin) -> _State:
         op = _need(c, "Op")
@@ -688,10 +698,10 @@ class _Walker:
             return self.pipeline(c, st, sub, redirs, origin)
         x = self.stmt(_need(c, "X"), st, sub, redirs, origin)
         if op == "&&":
-            return self.stmt(_need(c, "Y"), _State(x.sure, x.seen, x.known), sub, redirs, origin)
+            return self.stmt(_need(c, "Y"), x, sub, redirs, origin)
         # `||`: the right side runs where the left one failed - anywhere the left side went
-        y = self.stmt(_need(c, "Y"), _State(x.seen, x.seen, x.known), sub, redirs, origin)
-        return _State(x.sure | y.sure, y.seen, x.known and y.known)
+        y = self.stmt(_need(c, "Y"), _State(x.seen, x.seen, x.any_known, x.any_known), sub, redirs, origin)
+        return _State(x.sure | y.sure, y.seen, x.known and y.known, x.any_known and y.any_known)
 
     def pipeline(self, c, st, sub, redirs, origin) -> _State:
         stages: list[dict] = []
@@ -738,21 +748,49 @@ class _Walker:
             self.substs(part, st, call)
         after = self.nested_script(call, st)  # `eval cd ..` runs in this shell: its directory carries on
         self.chdir_wrapper(call, st)
+        name = argv[0].text if argv and argv[0].static else ""
+        if name in self.functions:
+            return self.call_function(name, call, after or st, sub, redirs, origin)
         return self.after_call(call, after or st)
 
+    def call_function(self, name: str, call: Call, st: _State, sub, redirs, origin) -> _State:
+        """The body of a function, walked again where it is called: with the directory of the call, its commands in the
+        pipeline of the call, its `cd` carried on (a function runs in the calling shell)."""
+        if name in self.stack:
+            raise ParseError("recursive function")
+        if len(self.stack) >= MAX_CALL_DEPTH:
+            raise ParseError("functions called too deeply")
+        inherited = tuple(Redirect(r.op, r.target, r.heredoc, r.fd, True) for r in redirs)
+        self.stack.append(name)
+        try:
+            return self.stmt(self.functions[name], st, sub, inherited, "function")
+        finally:
+            self.stack.pop()
+
     def assign(self, a: dict) -> Assign:
-        array = tuple(_word(e["Value"]) for e in (a.get("Array") or {}).get("Elems") or [] if e.get("Value"))
+        array: list[Word] = []
+        if a.get("Index") is not None:  # `a[k]=v`: the subscript is a word of the assignment
+            array.append(Word("".join(_lits(a["Index"])), "none", False))
+        for e in (a.get("Array") or {}).get("Elems") or []:  # `a=(x y)`, `a=([k]=v)`: every index and every value
+            if e.get("Index") is not None:
+                array.append(Word("[" + "".join(_lits(e["Index"])) + "]", "none", False))
+            if e.get("Value"):
+                array.append(_word(e["Value"]))
         value = _word(a["Value"]) if a.get("Value") else None  # `a=` has no "Value": the empty string
-        return Assign(_text(_need(a, "Name")), value, array, bool(a.get("Append")))
+        return Assign(_text(_need(a, "Name")), value, tuple(array), bool(a.get("Append")))
 
     def builtin_like(self, c, t, st, sub, redirs, origin, stmt) -> _State:
         words: list[Word] = []
+        decl_assigns: list[Assign] = []
         if t == "DeclClause":
             words.append(Word(_text(c.get("Variant") or {}) or "declare", "none", False))
             for a in c.get("Args") or []:
-                if a.get("Name") and (a.get("Value") or a.get("Array")):
-                    v = _word(a["Value"]) if a.get("Value") else Word("(…)", "none", False)
-                    words.append(Word(_text(a["Name"]) + "=" + v.text, v.quoting, v.expands, v.kinds))
+                if a.get("Name") and (a.get("Value") or a.get("Array") or a.get("Index") is not None):
+                    asg = self.assign(a)  # `declare -a a=(P)`, `declare -A a=([k]=P)`: the elements are words of the command
+                    decl_assigns.append(asg)
+                    v = asg.value or Word("", "none", False)
+                    words.append(Word(asg.name + "=" + v.text, v.quoting, v.expands, v.kinds))
+                    words += list(asg.array)
                 elif a.get("Name"):
                     words.append(Word(_text(a["Name"]), "none", False))
                 elif a.get("Value"):
@@ -761,7 +799,7 @@ class _Walker:
             words.append(Word({"TestClause": "[[", "ArithmCmd": "((", "LetClause": "let"}[t], "none", False))
             for n in _find_words(c):
                 words.append(_word(n))
-        call = self.emit(Call(words, list(redirs), st.sure, sub, origin=origin, cwd_known=st.known))
+        call = self.emit(Call(words, list(redirs), st.sure, sub, assigns=decl_assigns, origin=origin, cwd_known=st.known))
         call.background = bool(stmt.get("Background"))
         self.substs(c, st, call)
         self.substs(stmt.get("Redirs"), st, call)
@@ -811,7 +849,7 @@ class _Walker:
         text = " ".join(w.text for w in words)
         inner = _Walker(self.session, self.depth + 1, self.dialect)
         inner.dry = self.dry
-        out = inner.stmts(ast(text, self.dialect).get("Stmts") or [], _State(st.sure, st.seen, st.known), True, (), origin)
+        out = inner.stmts(ast(text, self.dialect).get("Stmts") or [], st, True, (), origin)
         call.substitutions.extend(_toplevel(inner.calls))
         if not self.dry:
             self.calls.extend(inner.calls)
@@ -827,9 +865,9 @@ class _Walker:
             return st
         name = words[0].text
         if name == "popd":
-            return _State(st.seen, st.seen, st.known)
-        if name in ("alias", "source", ".") or name in self.functions:
-            return self.unknown_dir(st)  # an alias may be `cd`; a function or a sourced file may change directory
+            return _State(st.seen, st.seen, st.any_known, st.any_known)
+        if name in ("alias", "source", "."):
+            return self.unknown_dir(st)  # an alias may be `cd`; a sourced file may change directory
         if name == "chdir":
             name = "cd"
         if name not in ("cd", "pushd"):
@@ -858,11 +896,13 @@ class _Walker:
             return self.unknown_dir(st)
         moved = frozenset(_resolve(target, d, tilde) for d in st.sure)
         absolute = os.path.isabs(os.path.expanduser(target) if tilde else target)
-        return _State(moved, st.seen | moved, st.known or absolute)  # `cd /abs` makes the directory known again
+        # `cd` may fail: the directories before it stay possible (`seen`), and `known` is only restored for what follows
+        # `&&` — after `;` it is `any_known` that counts, and a `cd /abs` does not repair that
+        return _State(moved, st.seen | moved, st.known or absolute, st.any_known)
 
     def unknown_dir(self, st: _State) -> _State:
         wide = frozenset({*st.seen, self.session})
-        return _State(wide, wide, False)
+        return _State(wide, wide, False, False)
 
 
 def _toplevel(calls: list[Call]) -> list[Call]:
@@ -874,12 +914,13 @@ def _toplevel(calls: list[Call]) -> list[Call]:
 def _join(states: list[_State]) -> _State:
     sure: frozenset[str] = frozenset()
     seen: frozenset[str] = frozenset()
-    known = True
+    known = any_known = True
     for s in states:
         sure |= s.sure
         seen |= s.seen
         known = known and s.known
-    return _State(sure, seen, known)
+        any_known = any_known and s.any_known
+    return _State(sure, seen, known, any_known)
 
 
 def _find_words(node) -> list[dict]:
@@ -900,6 +941,27 @@ def _find_words(node) -> list[dict]:
     return found
 
 
+class CallList(list):
+    """The calls of a line, plus `assigned_in_expansions`: variables that a `${x:=…}` / `${x=…}` may assign."""
+
+    assigned_in_expansions: frozenset[str] = frozenset()
+
+
+def _expansion_assignments(node) -> set[str]:
+    """Names assigned by `${x:=…}` / `${x=…}` anywhere in the tree (also in a nested substitution or script word)."""
+    found: set[str] = set()
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        if isinstance(n, dict):
+            if n.get("Type") == "ParamExp" and (n.get("Exp") or {}).get("Op") in ("=", ":="):
+                found.add(_text(n.get("Param") or {}))
+            stack.extend(n.values())
+        elif isinstance(n, list):
+            stack.extend(n)
+    return found
+
+
 def parse(command: str, *, cwd: str, dialect: str = DEFAULT_DIALECT) -> list[Call]:
     """Every simple command in the line (also nested ones), in source order, parents before their substitutions.
 
@@ -908,10 +970,14 @@ def parse(command: str, *, cwd: str, dialect: str = DEFAULT_DIALECT) -> list[Cal
     `dialect` is the grammar shfmt reads (`bash` | `zsh`); scripts nested in `-c` / `eval` are read in the same one."""
     walker = _Walker(cwd, dialect=dialect)
     start = frozenset({walker.session})
+    result = CallList()
     try:
-        walker.stmts(ast(command, dialect).get("Stmts") or [], _State(start, start), False, (), "top")
+        tree = ast(command, dialect)
+        walker.stmts(tree.get("Stmts") or [], _State(start, start), False, (), "top")
+        result.assigned_in_expansions = frozenset(_expansion_assignments(tree))
     except ParseError:
         raise
     except (RecursionError, KeyError, TypeError, ValueError, IndexError, AttributeError) as e:
         raise ParseError(f"cannot walk the syntax tree ({type(e).__name__})") from e
-    return walker.calls
+    result.extend(walker.calls)
+    return result
