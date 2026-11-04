@@ -344,14 +344,16 @@ def _group(m: re.Match) -> tuple[int, int]:
     return (m.start(1), m.end(1)) if m.re.groups and m.group(1) else (m.start(), m.end())
 
 
-# four or more groups of three digits in a row are a list of numbers (HTTP codes `200 302 404 500`), not a phone
-NUMBER_LIST_RE = re.compile(r"(?<![\w+.-])\d{3}(?:[\s-]\d{3}){3,}(?!\w)")
+# four or more groups of three digits in one line, with one kind of separator, are a list of numbers (HTTP codes
+# `200 302 404 500`), not a phone; a line break never joins them (a column of phones), nor does a phone label
+NUMBER_LIST_RE = re.compile(r"(?<![\w+.-])\d{3}([ \t-])\d{3}(?:\1\d{3}){2,}(?!\w)")
 BARE_PHONE_RE = re.compile(r"\d{3}[\s-]\d{3}[\s-]\d{3}")
+PHONE_LABEL_RE = re.compile(r"(?i)\b(?:tel|telefon\w*|kom|komórk\w*)\.?\s*[:.]?\s*$")
 
 
 def detect(text: str, *, dates: str = "all", drugs: bool = True) -> list[Fragment]:
     result: list[Fragment] = []
-    lists = [m.span() for m in NUMBER_LIST_RE.finditer(text)]
+    lists = [m.span() for m in NUMBER_LIST_RE.finditer(text) if not PHONE_LABEL_RE.search(text, max(0, m.start() - 24), m.start())]
     for type_, regex, weight in PATTERNS:
         if type_ == "DATE" and dates == "none":
             continue

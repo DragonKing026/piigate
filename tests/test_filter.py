@@ -4145,6 +4145,24 @@ class TestChecksumNumbers(unittest.TestCase):
         self.assertNotIn("600 302 200", result)
         self.assertIn("200 302 200 200 200", result)
 
+    def test_a_list_of_numbers_stays_in_one_line_and_has_no_phone_label(self):
+        """A column of phones is not a list, and neither is a labelled phone followed by a three-digit number."""
+        from piigate import rules
+
+        for sample, phones in (
+            ("600 302 200\n700 111 222", ["600 302 200", "700 111 222"]),
+            ("600 302 200\r\n700 111 222\r\n", ["600 302 200", "700 111 222"]),
+            ("200 302 404 500 200\n600 302 200", ["600 302 200"]),
+            ("600 302 200\n100 200 300 400", ["600 302 200"]),
+            ("tel 600 302 200 700", ["600 302 200"]),
+            ("Telefon: 600 302 200 700", ["600 302 200"]),
+            ("kom. 600-302-200-700", ["600-302-200"]),
+            ("600 302-200 700", ["600 302-200"]),  # mixed separators: not a list
+        ):
+            with self.subTest(sample):
+                found = [sample[f.start : f.end] for f in rules.detect(sample) if f.type_ == "PHONE"]
+                self.assertEqual(found, phones)
+
 
 def sensors_mask(value: str) -> tuple[str, int]:
     from piigate import sensors
