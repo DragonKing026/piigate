@@ -32,7 +32,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "lib"))
 
 CANARY = "CANARY-SENSITIVE-ROW"
-EXEC = "EXEC-MARK"
+EXEC = "EXEC-42"  # printed only by code that really ran (`$((40+2))` is computed, never in the line itself)
 SENSITIVE_NAME = "Sensitive-data"
 
 
@@ -54,7 +54,7 @@ CASES: list[ZshCase] = [
     ZshCase("qualifier-e-hidden", f"echo *(e:'cat {HIDDEN} >&2':)", "the same, the path only as a glob inside the code string"),
     ZshCase("qualifier-e-after-glob", f"echo *.csv(e:'cat {HIDDEN} >&2':)", "qualifier after a data-extension glob"),
     ZshCase("qualifier-e-names-ls", f"ls *(e:'cat {HIDDEN} >&2':)", "a names-only command (`ls`) with a code qualifier"),
-    ZshCase("qualifier-e-echo-exec", f"echo *(e:'echo {EXEC} >&2':)", "qualifier code, harmless — shows that it runs"),
+    ZshCase("qualifier-e-echo-exec", "echo *(e:'echo EXEC-$((40+2)) >&2':)", "qualifier code, harmless — shows that it runs"),
     ZshCase("qualifier-plus-func", f"f() {{ cat {HIDDEN} >&2; }}; echo *(+f)", "glob qualifier `(+func)` calls a function"),
     ZshCase("qualifier-plus-func-name-only", "echo *(+f)", "`(+f)` with the function defined elsewhere (not in this line)"),
     ZshCase("qualifier-dot-hidden", f"cat {HIDDEN[:-4]}(.)", "plain qualifier `(.)` on a sensitive glob"),
@@ -127,15 +127,21 @@ class World:
         cfg["in_project"] = {"sensitive": [], "anonymized": []}
         return (factory or gate.Gate)(cfg, str(self.work))
 
-    def real(self, command: str) -> dict:
-        """Runs the line in zsh (no rc files) inside the directory; a minimal environment, 5 s."""
+    def real(self, command: str, mode: str = "f") -> dict:
+        """Runs the line in zsh (no rc files) inside the directory; a minimal environment, 5 s.
+        mode "f": `zsh -f -c LINE`. mode "cc": the way Claude Code starts a command — `zsh -c` with
+        `setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL`, then `eval LINE` (glob qualifiers work only after a `setopt`)."""
         env = {"HOME": str(self.root), "PATH": "/usr/bin:/bin", "ZDOTDIR": str(self.root / "nozdot")}
         zsh = shutil.which("zsh")
         if not zsh:
             return {"available": False}
+        argv = [zsh, "-f", "-c", command]
+        if mode == "cc":
+            env["PIIGATE_LINE"] = command
+            argv = [zsh, "-f", "-c", 'setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL; eval "$PIIGATE_LINE"']
         try:
             done = subprocess.run(
-                [zsh, "-f", "-c", command],
+                argv,
                 cwd=self.work,
                 env=env,
                 capture_output=True,
@@ -152,7 +158,7 @@ class World:
             "available": True,
             "rc": done.returncode,
             "reads": CANARY in out,
-            "runs": EXEC in out or CANARY in out and ("(e:" in command or "(+" in command or "(e)" in command),
+            "runs": EXEC in out,
             "out": first,
         }
 
@@ -190,7 +196,9 @@ def measure(cases: list[ZshCase] | None = None, world: World | None = None) -> l
                     "bash": shfmt_result(case.command, "bash"),
                     "zsh": shfmt_result(case.command, "zsh"),
                     "real": real,
+                    "real_cc": (cc := world.real(case.command, "cc")),
                     "hole": reason is None and bool(real.get("reads")),
+                    "hole_cc": reason is None and bool(cc.get("reads")),
                 }
             )
         return results
@@ -203,13 +211,14 @@ def table(results: list[dict]) -> str:
     def parse(r: dict) -> str:
         return f"ok:{r['calls']}" if r["ok"] else "ERR"
 
-    lines = [f"{'case':32} {'old':5} {'bash':6} {'zsh':6} {'zsh really':14}", "-" * 70]
+    def did(real: dict) -> str:
+        return "-" if not real.get("available") else ("READS" if real["reads"] else ("runs code" if real["runs"] else "no read"))
+
+    lines = [f"{'case':32} {'old':5} {'bash':6} {'zsh':6} {'zsh -f':10} {'claude-code':11}", "-" * 78]
     for r in results:
-        real = r["real"]
-        did = "-" if not real.get("available") else ("READS" if real["reads"] else ("runs code" if real["runs"] else "no read"))
         lines.append(
-            f"{r['name']:32} {r['old']:5} {parse(r['bash']):6} {parse(r['zsh']):6} {did:14}"
-            + ("  <== OLD ALLOWS A READ" if r["hole"] else "")
+            f"{r['name']:32} {r['old']:5} {parse(r['bash']):6} {parse(r['zsh']):6} {did(r['real']):10} {did(r['real_cc']):11}"
+            + ("  <== OLD ALLOWS A READ" if r["hole"] or r["hole_cc"] else "")
         )
     return "\n".join(lines)
 

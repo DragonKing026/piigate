@@ -17,12 +17,21 @@ a `QuotedToken`. Nested commands follow the command that contains them, after th
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import gate, shell
 from .gate import DIRECT_LAUNCHERS, LAUNCHERS, SHELLS, QuotedToken
 
+UNKNOWN_DIR = "/.piigate-directory-the-gate-cannot-determine"  # a stand-in directory: where the stage ran is not known
+OPERATOR_WORD = re.compile(r"[;&|()<>\n]+|\d*[<>]+[&|]?\d*-?")  # a WORD that the flat list would show as an operator
+SUBST_PLACEHOLDER = re.compile(r"\$\(…\)|[<>=]\(…\)")  # what a command / process substitution looks like inside a word
+# commands whose arguments are only text or names for the shell itself — a relative path there reads nothing
+TEXT_ONLY = {
+    "echo", "printf", "true", "false", ":", "test", "[", "[[", "((", "let", "export", "declare", "typeset", "local", "readonly",
+    "unset", "set", "shift", "wait", "sleep", "pwd", "for", "select", "case", "exit", "return", "read", "cd", "pushd", "popd",
+}
 SUBSTITUTION_ORIGINS = ("$(", "`", "<(", ">(")
 NESTED_UNKNOWN = SUBSTITUTION_ORIGINS + ("-c", "eval")  # a call there has arguments the old gate reports as None
 
@@ -43,6 +52,7 @@ class _Parsed:
     stage_calls: list[shell.Call | None]  # one per stage group of `tokens`
     bodies: list[_Body] = field(default_factory=list)
     view: str = ""
+    tainted: frozenset = frozenset()  # variables assigned from a command substitution
     rest: frozenset = frozenset()  # the words of the command itself (without the text bodies of its heredocs)
 
 
@@ -54,12 +64,17 @@ class AstGate(gate.Gate):
         if dialect:
             self.dialect = dialect
         self.parse_error = ""
+        self.internal_error = ""
         self._cache: dict[str, _Parsed] = {}
         self._current: _Parsed | None = None
 
     # ------------------------------------------------------------------------------------------------ building
 
     def _word_token(self, w: shell.Word) -> str:
+        if OPERATOR_WORD.fullmatch(w.text):
+            # `cat '>' f`, `find -exec x {} \;`: a word that reads like an operator must not become one in the flat list
+            # (the classification compares strings: `>` would make `f` a write target)
+            return QuotedToken("\\" + w.text, w.quote or "'")
         return QuotedToken(w.text, w.quote) if w.quote else w.text
 
     def _call_tokens(self, c: shell.Call) -> list[str]:
@@ -122,11 +137,12 @@ class AstGate(gate.Gate):
         # bodies of heredocs read by a shell or launcher are code: parsed like the command itself
         bodies: list[_Body] = []
         text_bodies: list[str] = []  # stdin text of a non-shell: not shell code, so it has no tree
+        seen_text: set[int] = set()
         for c in list(calls):
             for r in c.redirects:
-                if r.heredoc is None or r.inherited:
+                if r.heredoc is None:
                     continue
-                h = r.heredoc
+                h = r.heredoc  # also one inherited from `{ …; } <<EOF`, `( … ) <<EOF`, a loop, a function: its commands read it
                 if self._script_heredoc(c):
                     if c.stdin_interpreter in SHELLS or (c.argv and c.name in SHELLS):
                         for d in sorted(c.cwds) or [self.cwd]:
@@ -136,12 +152,14 @@ class AstGate(gate.Gate):
                         bodies.append(_Body(h.body, h.quoted, True, False))
                     else:  # a launcher (xargs, find, env…) or no command: its words are what the body holds
                         bodies.append(_Body(h.body, h.quoted, True, False))
-                        text_bodies.append(h.body)
+                        if id(h) not in seen_text:
+                            text_bodies.append(h.body)
                 else:
                     stripped = self._file_writer(c) is not None
                     bodies.append(_Body(h.body, h.quoted, False, stripped))
-                    if not stripped:
+                    if not stripped and id(h) not in seen_text:
                         text_bodies.append(h.body)
+                seen_text.add(id(h))
         top = shell._toplevel(calls)
         groups: list[tuple[list[str], shell.Call | None, str]] = []
         pending: list[shell.Call] = []
@@ -151,11 +169,16 @@ class AstGate(gate.Gate):
                 groups.append((self._call_tokens(n), n, ";"))
             pending.clear()
 
+        before: shell.Call | None = None
         for c in top:
-            if not c.piped_in:
+            # a pipeline stage may hold several commands (`{ a; b; } | c`, `while …; done | c`, `( … ) | c`): all of them
+            # are connected to the next stage, and the commands of one stage to each other
+            piped = c.piped_in or (before is not None and before.pipes_out)
+            if not piped:
                 flush()
-            groups.append((self._call_tokens(c), c, ("|&" if c.piped_stderr else "|") if c.piped_in else ";"))
+            groups.append((self._call_tokens(c), c, ("|&" if c.piped_stderr else "|") if piped else ";"))
             pending.extend(self._descend(c))
+            before = c
         flush()
         tokens: list[str] = []
         stage_calls: list[shell.Call | None] = []
@@ -197,7 +220,15 @@ class AstGate(gate.Gate):
         for b in bodies:
             if not b.stripped:
                 view += "\n" + b.text
-        return _Parsed(command, calls, tokens, stage_calls, bodies, view, rest)
+        if any("\x00" in str(t) for t in tokens):
+            raise shell.ParseError("a NUL byte in a word")
+        tainted = frozenset(
+            a.name
+            for c in calls
+            for a in c.assigns
+            if any({"cmd", "proc"} & w.kinds for w in ([a.value] if a.value else []) + list(a.array))
+        )
+        return _Parsed(command, calls, tokens, stage_calls, bodies, view, tainted, rest)
 
     def _store(self, command: str) -> _Parsed:
         p = self._build(command)
@@ -215,33 +246,46 @@ class AstGate(gate.Gate):
         return p
 
     @staticmethod
-    def _zsh_syntax(calls: list[shell.Call]) -> bool:
-        """A word with zsh syntax the tree does not describe (glob qualifier, `${(flags)…}`): it may run code or reach files
-        the gate cannot see — fail closed."""
+    def _words(c: shell.Call) -> list[shell.Word]:
+        return [*c.argv, *(a.value for a in c.assigns if a.value), *(x for a in c.assigns for x in a.array),
+                *(r.target for r in c.redirects if r.target is not None)]
+
+    def _unjudgeable(self, calls: list[shell.Call]) -> str:
+        """Why the command cannot be judged at all (empty when it can): code or a command name the tree does not hold."""
+        # zsh syntax that has no node in the tree: a glob qualifier / parameter flag. Code in it (`(e:cmd:)`, `(+func)`,
+        # `${(e)x}`) is refused; any other qualifier only when the command can switch qualifiers on (`setopt`, `emulate`)
+        options = any(c.name in ("setopt", "unsetopt", "emulate") for c in calls)
         for c in calls:
-            words = [*c.argv, *(a.value for a in c.assigns if a.value), *(x for a in c.assigns for x in a.array)]
-            words += [r.target for r in c.redirects if r.target is not None]
-            if any({"zsh", "extglob"} & w.kinds for w in words):  # zsh reads `*(…)` as a qualifier, bash as an extglob
-                return True
-        return False
+            for w in self._words(c):
+                if "zsh-code" in w.kinds:
+                    return "zsh syntax that runs code (a glob qualifier `(e:…:)` / `(+func)`, a flag `${(e)x}`)"
+                if options and "zsh" in w.kinds:
+                    return "a zsh glob qualifier or parameter flag in a command that may change the shell options"
+            if c.opaque_code:
+                return "code the parser cannot see (`eval $x`, `bash -c \"$x\"`)"
+            if c.argv and {"cmd", "proc"} & c.argv[0].kinds:
+                return "a command name that is the output of a substitution"
+        return ""
 
     # ------------------------------------------------------------------------------------------------ entry
 
     def bash(self, command: str, files: bool = True) -> str | None:
-        self.parse_error = ""
+        self.parse_error = self.internal_error = ""
         self._current = None
-        if "\x00" not in command:
+        if "\x00" in command:
+            return super().bash(command, files)
+        try:
             try:
                 self._current = self._store(command)
             except shell.ParseError as e:
                 self.parse_error = str(e)
                 return f"piigate: command denied — it cannot be parsed with certainty ({e}). {gate.HINT}"
-        if self._current is not None and self._zsh_syntax(self._current.calls):
-            return (
-                "piigate: command denied — zsh syntax the gate cannot judge (a glob qualifier `(e:…:)` / `(+func)` / "
-                f"`(.)`, a parameter flag `${{(e)x}}`): it may run code or reach files. {gate.HINT}"
-            )
-        return super().bash(command, files)
+            if why := self._unjudgeable(self._current.calls):
+                return f"piigate: command denied — {why}; the gate cannot judge what it runs. {gate.HINT}"
+            return super().bash(command, files)
+        except Exception as e:  # whatever the adapter did not foresee: deny, and say so
+            self.internal_error = f"{type(e).__name__}: {e}"[:200]
+            return f"piigate: command denied — the shadow gate failed ({type(e).__name__}). {gate.HINT}"
 
     # ------------------------------------------------------------------------------------------------ front-end
 
@@ -286,12 +330,53 @@ class AstGate(gate.Gate):
             return super()._stage_dirs(command, tokens)
         stages = self._stages_loose(tokens)
         everywhere = sorted({d for c in p.calls for d in c.cwds} | {self.cwd})
+        if any(not c.cwd_known for c in p.calls):
+            everywhere.append(UNKNOWN_DIR)
         if len(stages) != len(p.stage_calls):  # a word that looks like an operator shifted the stages: check everywhere
             return [list(everywhere) for _ in stages]
         result = []
         for c in p.stage_calls:
-            result.append(sorted(c.cwds) if c is not None else everywhere)
+            dirs = sorted(c.cwds) if c is not None else everywhere
+            result.append([*dirs, UNKNOWN_DIR] if c is not None and not c.cwd_known else dirs)
         return result
+
+    def _stage_kinds(self, stage, c, text, literal, verbatim, body):
+        if self.cwd == UNKNOWN_DIR:  # the stage may have run in a directory the tree cannot name (a `cd` to a glob, to
+            return self._unknown_dir_kinds(stage)  # `-`, from a function, from `eval`/`alias`): relative paths mean nothing
+        found = super()._stage_kinds(stage, c, text, literal, verbatim, body)
+        return found + self._dynamic_operand_kinds(stage)
+
+    def _operands(self, stage: list[str]) -> list[tuple[int, str]]:
+        """The words of the stage that are not its command, an option, a write target, text or a search pattern."""
+        skip = self._write_targets(stage) | self._text_args(stage) | self._searcher_args(stage)[0]
+        return [
+            (i, t)
+            for i, t in enumerate(stage)
+            if i and i not in skip and t and not t.startswith("-") and not gate.REDIRECT_ALONE.fullmatch(t)
+        ]
+
+    def _unknown_dir_kinds(self, stage: list[str]) -> list[tuple[str, str]]:
+        cmd = Path(stage[0]).name if stage else ""
+        if not stage or cmd in TEXT_ONLY or self._stage_class(stage) in ("names", "remote"):
+            return []
+        relative = [t for _, t in self._operands(stage) if not t.startswith(("/", "~"))]
+        searching = cmd in gate.SEARCHERS and self._searcher_args(stage)[2]
+        if relative or searching:
+            return [("sensitive", "a relative path after a `cd`/function/eval whose directory the gate cannot determine")]
+        return []
+
+    def _dynamic_operand_kinds(self, stage: list[str]) -> list[tuple[str, str]]:
+        """A file operand built by a command substitution (`cat $(echo P)`, `f=$(echo P); cat "$f"`, `${f:-$(echo P)}`)
+        is a path nobody can read from the command: refused for a reader. Text (echo, a commit message) is not."""
+        cmd = Path(stage[0]).name if stage else ""
+        if not stage or cmd in TEXT_ONLY:
+            return []
+        tainted = self._current.tainted if self._current is not None else frozenset()
+        pattern = re.compile(r"\$\{?(?:" + "|".join(map(re.escape, tainted)) + r")\b") if tainted else None
+        for _, t in self._operands(stage):
+            if SUBST_PLACEHOLDER.search(t) or (pattern and pattern.search(t)):
+                return [("sensitive", "an operand that a command substitution builds (the path it names is not in the command)")]
+        return []
 
     def _script_stages(self, tokens):
         stages, writes, unsafe = super()._script_stages(tokens)

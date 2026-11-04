@@ -265,6 +265,11 @@ def _ansi_c(raw: str) -> str:
     return _ANSI.sub(one, raw)
 
 
+# zsh glob qualifiers that run code: `(e:'cmd':)`, `(e[cmd])`, `(+function)` — zsh only, and only with BARE_GLOB_QUAL (off in
+# Claude Code's shell setup until a `setopt`); shfmt keeps them as plain text, there is no node for them
+_ZSH_CODE_QUALIFIER = re.compile(r"\((?:[^)]*[^\w])?e[:\[{<(]|\([^)]*\+\w")
+
+
 def _has_glob(raw: str) -> bool:
     i, n = 0, len(raw)
     while i < n:
@@ -350,9 +355,11 @@ def _word(node: dict) -> Word:
             quoting.add("none")
             texts.append(_unescape(raw))
             if re.search(r"(?<!\\)\(", raw):  # an unescaped `(` inside a word (`\(` is a literal paren: `find \( -name x \)`)
-                # zsh only: a glob qualifier `*(e:code:)` / `*(+func)` / `*(.)` is kept by shfmt as plain text — it has no
-                # node, and `e:` / `+` run code. Nothing in the tree says what it does: the word is marked
+                # zsh only: a glob qualifier `*(.)` / `*(e:code:)` / `*(+func)` is kept by shfmt as plain text, it has no
+                # node. "zsh": some qualifier is there; "zsh-code": one that runs code
                 kinds.add("zsh")
+                if _ZSH_CODE_QUALIFIER.search(raw):
+                    kinds.add("zsh-code")
             if _has_glob(raw):
                 kinds.add("glob")
             if _has_brace(raw):
@@ -392,8 +399,13 @@ def _expansion_text(p: dict, kinds: set[str]) -> str:
     t = _need(p, "Type")
     if t == "ParamExp":
         kinds.add("param")
-        if p.keys() & {"Flags", "GlobSubst", "Modifiers"}:  # zsh `${(e)x}` (evaluates $(…) in the value), `${~x}`, `${x:a}`
+        if p.keys() & {"Flags", "GlobSubst", "Modifiers"}:  # zsh `${(e)x}`, `${~x}`, `${x:a}`
             kinds.add("zsh")
+            if "e" in _text(p.get("Flags") or {}):
+                kinds.add("zsh-code")  # `(e)` evaluates `$(…)` and `$x` inside the value — works without any setopt
+        exp = p.get("Exp") or {}
+        if exp.get("Op") == "@" and exp.get("Word") and _word(exp["Word"]).text == "P":
+            kinds.add("cmd")  # bash `${x@P}`: prompt expansion runs `$(…)` found in the value
         return _param_text(p, kinds)
     if t == "CmdSubst":
         kinds.add("cmd")
@@ -406,6 +418,9 @@ def _expansion_text(p: dict, kinds: set[str]) -> str:
         return p.get("Op", "<(") + "…)"
     if t == "ExtGlob":
         kinds.add("extglob")
+        kinds.add("zsh")  # zsh reads `(…)` after a pattern as a glob qualifier
+        if _ZSH_CODE_QUALIFIER.search("(" + _text(p.get("Pattern") or {}) + ")"):
+            kinds.update({"zsh", "zsh-code"})  # zsh reads `*(e:cmd:)` as a qualifier that runs cmd; bash as an extglob
         return _text(p, "Op") + _text(p.get("Pattern") or {}) + ")"
     raise ParseError(f"unsupported word part {t}")
 

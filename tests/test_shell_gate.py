@@ -114,7 +114,7 @@ class TestDecisions(Base):
         self.assertEqual(self.ast().parse_error, "")
 
     def test_dialect_decides_what_parses(self):
-        command = "cat =(cat x.csv)"
+        command = "foreach f (a b)\necho $f\nend"  # zsh only
         g = self.ast("bash")
         self.assertIsNotNone(g.bash(command))
         self.assertTrue(g.parse_error)
