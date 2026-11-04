@@ -398,6 +398,10 @@ def main() -> None:
     print_report(report, n_examples)
     if any(r["signals"] for r in report["adversarial"]["rows"]) or any(r.get("signals") for r in report["zsh_cases"]):
         sys.exit(1)
+    import shell_monotone
+
+    if shell_monotone.tally(report["records"])[1] or shell_monotone.tally(report["adversarial"]["rows"])[1]:
+        sys.exit(1)
 
 
 def print_report(report: dict, n_examples: int) -> None:
@@ -426,6 +430,14 @@ def print_report(report: dict, n_examples: int) -> None:
     ]
     if bad:
         print("MEASUREMENT FAILED: a real shell died of a signal in", bad)
+    import shell_monotone
+
+    mono_tests, unlisted_tests = shell_monotone.tally(report["records"])
+    mono_adv, unlisted_adv = shell_monotone.tally(report["adversarial"]["rows"])
+    print("\nMONOTONICITY (old denies, the AST gate allows) — structural classes, tests corpus:", dict(mono_tests),
+          "| adversarial corpus:", dict(mono_adv))
+    for r in [*unlisted_tests, *unlisted_adv]:
+        print("MONOTONICITY FAILED, not in a listed class:", r["command"][:100].replace("\n", " ⏎ "))
     adv = report["adversarial"]
     print(f"\nadversarial corpus: {adv['cases']} cases; categories:", adv["categories"])
     print("  a real shell reads and the OLD gate allows:", adv["real_reads_and_old_allows"])

@@ -192,6 +192,21 @@ class AstGate(gate.Gate):
         names = {os.path.basename(w.text) for w in (first, *words[:1]) if w.static}
         return bool(names & LAUNCHERS) or bool(c.stdin_interpreter and c.stdin_interpreter in SHELLS)
 
+    def _said(self, w: shell.Word, c: shell.Call) -> str:
+        """The word as the shell will use it, as one string (a variable of known value replaced, anything else as written)."""
+        return " ".join(str(t) for t in self._word_tokens(w, c, self._index.get(id(c), 0), c.origin))
+
+    @staticmethod
+    def _printed_text(c: shell.Call) -> str | None:
+        """What `echo` / `printf` print, when their arguments are words of the line (no command inside)."""
+        if not all(w.static or {"param"} >= w.kinds - {k for k in w.kinds if k.startswith("$")} for w in c.argv):
+            return None
+        args = [w.text for w in c.argv[1:] if not (w.text.startswith("-") and re.fullmatch(r"-[neE]+", w.text))]
+        if c.name == "printf" and args:
+            rest = iter(args[1:])
+            return re.sub(r"%[sb]", lambda m: next(rest, ""), shell._ansi_c(args[0]))
+        return " ".join(args)
+
     def _expanded_body(self, h: shell.Heredoc, c: shell.Call) -> str:
         """The text of an unquoted heredoc as the shell makes it: `$x` / `${x}` of a variable with a KNOWN value replaced;
         anything else stays as written (the old gate saw it so)."""
@@ -252,14 +267,29 @@ class AstGate(gate.Gate):
                     if w.static and "=" in w.text and not w.text.startswith("-"):
                         name, _, path = w.text.partition("=")
                         self._named_dirs[name] = path
+            if c.name in ("echo", "printf") and any(r.op in (">", ">>") for r in c.redirects):
+                # `echo 'cd x; cat ../S*/p*' > f.sh; bash f.sh`: a file written in the line and RUN in the line is code
+                dests = {self._said(r.target, c) for r in c.redirects if r.op in (">", ">>") and r.target is not None}
+                for r in calls:
+                    argv = [self._said(w, r) for w in r.argv]
+                    runs = bool(argv) and (
+                        (os.path.basename(argv[0]) in SHELLS | shell.INTERPRETERS | {"source", "."} and any(a in dests for a in argv[1:]))
+                        or argv[0] in dests
+                        or (argv[0].startswith("./") and argv[0][2:] in {d[2:] if d.startswith("./") else d for d in dests})
+                    )
+                    if runs:
+                        text = self._printed_text(c)
+                        if text is not None:
+                            if os.path.basename(argv[0]) in shell.INTERPRETERS:
+                                text_bodies.append(text)
+                            else:
+                                extra = shell.parse(text, cwd=self.cwd, dialect=self.dialect)
+                                c.substitutions.extend(shell._toplevel(extra))
+                                calls.extend(extra)
+                        break
             if c.pipe_to_shell and c.name in ("echo", "printf") and all(w.static for w in c.argv):
                 # `echo 'cat ../S*/p*' | bash`: what a command prints into a shell is that shell's program
-                args = [w.text for w in c.argv[1:] if not (w.text.startswith("-") and re.fullmatch(r"-[neE]+", w.text))]
-                if c.name == "printf" and args:
-                    rest = iter(args[1:])
-                    text = re.sub(r"%[sb]", lambda m: next(rest, ""), shell._ansi_c(args[0]))
-                else:
-                    text = " ".join(args)
+                text = self._printed_text(c)
                 receivers = [r for r in calls if r.piped_in and r.stdin_interpreter]
                 if any(r.stdin_interpreter in SHELLS for r in receivers):
                     extra = shell.parse(text, cwd=self.cwd, dialect=self.dialect)
@@ -356,6 +386,13 @@ class AstGate(gate.Gate):
         # A text body is data, not shell: it is cut into words by the same tokenizer as before (quotes, punctuation) —
         # the only place where the old tokenizer is still used. Its words are judged as stages (a path in a script the
         # model feeds to python is a path), with no command attached.
+        # MONOTONICITY: every word on the right of an assignment (`x=…`, `a=(…)`, `a+=(…)`, `a[k]=…`, `declare x=…`, an element
+        # with a backtick or `$(…)`) is judged as the old gate judged it — as a word of the line — whether or not the model
+        # can follow where the value goes next. (The old tokenizer saw `a=(../S*/p*)` as the words `a=`, `(`, `../S*/p*`, `)`.)
+        for c in calls:
+            for a in c.assigns:
+                for w in [x for x in (a.value, *a.elements, *a.array) if x is not None]:
+                    text_bodies.append(w.text)
         for body in text_bodies:
             words = self._body_words(body)
             if words:

@@ -471,7 +471,8 @@ class TestRound6(Base):
                     self.deny(command, dialect)
         g = self.ast()
         g.bash("x=abc; cat ${x/*/Z} ${x:1}")  # a pattern operator is not certain: the written text stays
-        self.assertEqual([str(t) for t in g._current.tokens[-2:]], ["${x/*/Z}", "bc"])
+        i = [str(t) for t in g._current.tokens].index("cat")
+        self.assertEqual([str(t) for t in g._current.tokens[i + 1 : i + 3]], ["${x/*/Z}", "bc"])
 
     def test_what_a_command_prints_into_a_shell_is_its_program(self):
         for command in ("echo 'cat ../S*/p*' | bash", "printf 'cat ../S*/p*\\n' | bash", "echo 'cat ../S*/p*' | zsh"):
@@ -521,6 +522,44 @@ class TestRound7(Base):
         self.assertGreater(result["cases"], 700)
         self.assertEqual(result["failures"], [])  # the old gate denies and a real shell reads: the AST gate denies too
         self.assertGreater(result["real_reads"], 300)
+
+
+class TestMonotonicity(Base):
+    """What the old gate denies, the AST gate denies — except the listed structural classes (tests/shell_monotone.py)."""
+
+    def test_every_word_of_an_assignment_is_judged_as_before(self):
+        for command in (
+            "a=(../S*/p*); b=${a[@]}; cat $b", 'a=(../S*/p*); b="${a[*]}"; cat $b', 'a=(../S*/p*); b="$a"; cat $b',
+            "a=(../S*/p*); b=${a[@]:1}; cat $b", "a=(../S*/p*); local b=${a[@]}; cat $b", "a=(../S*/p*); declare b=${a[@]}; cat $b",
+            "a=(../S*/p*); export b=${a[@]}; cat $b", "a=(../S*/p*); b=${a[@]}; c=$b; cat $c",
+            "a=(../Sens*); b=${a[@]}; cd $b; cat people.csv", "a=(../Sens*); b=${a[@]}; cat $b/people.csv",
+            "a=(../S*/p*); n=a; cat ${(P)n}", "a=(../S*/p*); cat ${(P)${:-a}}", "a=(../S*/p*); n=a; cat ${!n}",
+            "a=(../S*/p*); n='a[@]'; cat ${!n}", "a=(../S*/p*); declare -n r=a; cat ${r[@]}", "a=(`echo ../S*/p*`); cat ${a[@]}",
+            "b=`echo ../S*/p*`; cat $b", 'd=$PWD; echo "cd $d; cat ../S*/p*" > /tmp/x.sh; bash /tmp/x.sh',
+            "T=${TMPDIR:-/tmp}; echo 'cd '$PWD'; cat ../S*/p*' > $T/x.sh; bash $T/x.sh",
+        ):
+            for dialect in shell.DIALECTS:
+                with self.subTest(command=command, dialect=dialect):
+                    self.assertIsNotNone(self.ast(dialect).bash(command))
+
+    def test_the_adversarial_corpus_loses_nothing_outside_the_listed_classes(self):
+        import shutil
+
+        import shell_adversarial
+        import shell_monotone
+
+        if not shutil.which("zsh"):
+            self.skipTest("zsh not installed")
+        rows = shell_adversarial.measure()
+        counts, unlisted = shell_monotone.tally(rows)
+        self.assertEqual([r["command"] for r in unlisted], [])
+        self.assertTrue(set(counts) <= set(shell_monotone.CLASSES))
+
+    def test_the_classes_are_few_and_explained(self):
+        import shell_monotone
+
+        self.assertLessEqual(len(shell_monotone.CLASSES), 6)
+        self.assertTrue(all(len(v) > 40 for v in shell_monotone.CLASSES.values()))
 
 
 class TestWordValuesAgainstARealShell(Base):

