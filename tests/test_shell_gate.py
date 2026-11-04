@@ -29,7 +29,8 @@ except shell.ParseError:
 
 
 class TestNoProductionImport(unittest.TestCase):
-    """The shadow modules are measured, not used: no code that runs in a hook or the server may import them."""
+    """The tree front-end only watches: the one place that may import it is `lib/piigate/shadow.py` (inside functions, so
+    nothing loads it unless the shadow mode is on); the gate, the server and the hooks never do."""
 
     SHADOW = {"shell", "shell_gate"}
 
@@ -46,12 +47,19 @@ class TestNoProductionImport(unittest.TestCase):
         return found
 
     def test_production_code_does_not_import_the_shadow_modules(self):
-        files = [p for p in (ROOT / "lib").rglob("*.py") if p.name not in ("shell.py", "shell_gate.py")]
+        files = [p for p in (ROOT / "lib").rglob("*.py") if p.name not in ("shell.py", "shell_gate.py", "shadow.py")]
         files += [ROOT / "server.py", *sorted((ROOT / "hooks").glob("*.py"))]
         self.assertGreater(len(files), 10)
         for path in files:
             with self.subTest(file=str(path.relative_to(ROOT))):
                 self.assertFalse(self.imported(path) & self.SHADOW)
+
+    def test_the_shadow_module_imports_them_only_lazily(self):
+        tree = ast.parse((ROOT / "lib" / "piigate" / "shadow.py").read_text(encoding="utf-8"))
+        for node in tree.body:  # module level: nothing from the tree front-end
+            if isinstance(node, ast.Import | ast.ImportFrom):
+                names = {a.name for a in node.names} | set((getattr(node, "module", None) or "").split("."))
+                self.assertFalse(names & self.SHADOW, ast.dump(node))
 
     def test_hooks_and_launchers_do_not_mention_them(self):
         for path in [*(ROOT / "hooks").glob("*"), ROOT / "bin" / "piigate"]:
