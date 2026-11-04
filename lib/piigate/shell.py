@@ -169,28 +169,45 @@ def _shfmt_binary() -> tuple[str, bytes]:
     raise ShfmtMissing("shfmt with the pinned checksum not found" + (" (a file with another checksum exists)" if wrong else ""))
 
 
+def _sealed_memfd(data: bytes) -> int:
+    """A memfd that holds exactly `data` and can no longer be written, grown or shrunk (nor can the seals change)."""
+    import fcntl
+
+    fd = os.memfd_create("shfmt", os.MFD_ALLOW_SEALING)
+    try:
+        os.write(fd, data)
+        fcntl.fcntl(fd, fcntl.F_ADD_SEALS, fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL)
+    except OSError:
+        os.close(fd)
+        raise
+    return fd
+
+
 def _run_shfmt(command: bytes, dialect: str) -> subprocess.CompletedProcess:
+    """Runs the checked bytes. On Linux they are copied into a sealed memfd and THAT is executed: nothing on disk can
+    change what runs after the check. If that is impossible (no memfd, not executable there, no sealing) the answer is
+    ParseError — there is no fallback to running the file: it could have changed since it was hashed. Without memfd_create
+    (macOS) the file is run after the check: a window between the hash and the exec in which someone who can write the
+    file (the same user — the agent) swaps it; then the swapped program answers for the gate. Nothing closes that on
+    macOS without a signed/immutable binary in the plugin."""
     path, data = _shfmt_binary()
     args = ["-ln", dialect, "--to-json"]
     env = {"PATH": "/usr/bin:/bin"}
-    fd = -1
-    try:
-        if hasattr(os, "memfd_create"):
-            try:
-                fd = os.memfd_create("shfmt", 0)
-                os.write(fd, data)
-                return subprocess.run(
-                    [f"/proc/self/fd/{fd}", *args], input=command, capture_output=True, timeout=SHFMT_TIMEOUT,
-                    check=False, cwd="/", env=env, pass_fds=(fd,),
-                )
-            except OSError:
-                pass  # no memfd or not executable there: run the file (checked just before)
-        return subprocess.run(
-            [path, *args], input=command, capture_output=True, timeout=SHFMT_TIMEOUT, check=False, cwd="/", env=env
-        )
-    finally:
-        if fd >= 0:
+    if hasattr(os, "memfd_create"):
+        try:
+            fd = _sealed_memfd(data)
+        except (OSError, AttributeError) as e:
+            raise ParseError(f"cannot seal the verified shfmt in memory: {e}") from e
+        try:
+            return subprocess.run(
+                [f"/proc/self/fd/{fd}", *args], input=command, capture_output=True, timeout=SHFMT_TIMEOUT,
+                check=False, cwd="/", env=env, pass_fds=(fd,),
+            )
+        finally:
             os.close(fd)
+    return subprocess.run(
+        [path, *args], input=command, capture_output=True, timeout=SHFMT_TIMEOUT, check=False, cwd="/", env=env
+    )
 
 
 def ast(command: str, dialect: str = DEFAULT_DIALECT) -> dict:
