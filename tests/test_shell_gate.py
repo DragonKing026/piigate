@@ -386,6 +386,9 @@ class TestRealShellRunner(unittest.TestCase):
         self.assertEqual(run, [])  # a recursion, a fork bomb, a huge expansion, an endless loop, deep nesting: norun with a reason
         norun = {c.name: c.norun for c in shell_adversarial.CASES if c.norun}
         self.assertIn("function-recursion", norun)
+        for case in shell_adversarial.CASES:  # a network program is never run for real
+            if shell_adversarial.NETWORK_PROGRAMS.search(case.command):
+                self.assertTrue(case.norun, case.name)
         self.assertTrue(all(norun.values()))
         for case in shell_adversarial.CASES:
             if case.norun:

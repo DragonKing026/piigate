@@ -37,8 +37,16 @@ class Adv:
     norun: str = ""  # why the line is NOT run in a real shell (it hangs or crashes one): only the gate's decision is measured
 
 
+# programs that must never really run here: they talk to the network or to a service (gh crashed under the memory limit and
+# left core dumps; a real run could also create issues) — the gate's decision is all that is measured for such lines
+NETWORK_PROGRAMS = re.compile(r"(?:^|[;&|(\s`])(?:gh|ssh|scp|curl|wget|git\s+(?:push|fetch|pull|clone))\s")
+
+
 def _c(section: str, name: str, command: str, expect: str | None = None, norun: str = "") -> Adv:
-    return Adv(name, section, command.replace("{V}", V).replace("{G}", G), expect, norun)
+    command = command.replace("{V}", V).replace("{G}", G)
+    if not norun and NETWORK_PROGRAMS.search(command):
+        norun = "talks to the network (gh, ssh, curl…): never run for real"
+    return Adv(name, section, command, expect, norun)
 
 
 # What a line must not do in a real shell: recurse, fork without end, loop forever, expand to a huge list, nest without end.
