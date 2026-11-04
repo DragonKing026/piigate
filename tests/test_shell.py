@@ -5,6 +5,7 @@ The commands are the ones from the gate's regression tests for issues #1, #4, #5
 They need the `shfmt` binary (mvdan/sh) and skip themselves without it.
 """
 
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -587,20 +588,33 @@ class TestDialect(Base):
         self.assertEqual([c.name for c in calls], ["bash", "cat", "cat"])
 
 
+NODE_COMMANDS = [  # one or more commands per kind of node the shfmt tree has; every path-like word is `P` or `Q`
+    "cat P", "cat 'P'", 'cat "a $x P"', "cat $'P'", 'cat $"P"', "echo P Q",
+    "echo ${x:-P} ${#x} ${x%P} ${x/P/Q} ${a[P]} ${!x} ${x@Q} ${x:1:2} ${!P*}",
+    "echo $(cat P)", "echo `cat P`", "echo $((1+P))", "cat <(cat P) >(cat Q)", "echo @(P|Q) +(R)",
+    "a && b || c", "a | b", "a |& b", "a; b", "a & b", "! a",
+    "if a; then P; elif c; then Q; else R; fi", "while a; do P; done", "until a; do Q; done",
+    "for i in P Q; do :; done", "for ((i=0;i<P;i++)); do :; done", "select s in P; do :; done",
+    "case P in Q|R) S;; *) T;; esac",
+    "{ P; }", "( P )", "f() { P; }", "function g { P; }", "time P", "coproc P", "coproc N { P; }",
+    "let x=P", "declare -a a=(P Q)", "declare -A a=([k]=P [j]=Q)", "export x=P", "local y=P", "readonly z=P", "typeset t=P",
+    "[[ P == Q ]]", "[[ -f P && ( -d Q ) ]]", "(( x = P + 1 ))", "[[ $(cat P) ]]",
+    "a=(P Q)", "a[P]=Q", "a+=(R)", "x=P cmd Q", "FOO=P BAR=Q",
+    "cat <P >Q >>R 2>&1 &>S <<<T", "cat <<EOF\nP\nEOF", "cat <<-EOF\n\tP\nEOF", "a <<'EOF'\nP\nEOF",
+    "echo {P,Q}{1..3}", "echo ~/P ~root", "test -f P", "[ -f P ]", "eval P", "bash -c 'cat P'", "echo ${x:-$(cat P)}",
+]
+
+
 class TestNoWordDisappears(Base):
     """The rule of the front-end: no word, redirection or heredoc of the shfmt tree is lost before the classification.
-    Walks the raw tree of every command of the gate tests and checks each literal and quoted piece against what
-    `shell.parse` emitted (words, assignments, redirection targets, heredoc bodies)."""
-
-    SKIP = {"ArithmExp", "ArithmCmd", "CStyleLoop"}  # numbers and variable names of arithmetic: no path there
+    Walks the raw tree of a command and checks every literal and quoted piece against what `shell.parse` emitted
+    (words, assignments and their subscripts and elements, redirection targets, heredoc bodies and delimiters). Each piece
+    is CONSUMED when it is found, so a piece that occurs twice in the tree must occur twice in the emitted text."""
 
     @staticmethod
     def pieces(node, out: list[str]) -> None:
         if isinstance(node, dict):
-            t = node.get("Type")
-            if t in TestNoWordDisappears.SKIP:
-                return
-            if t in ("Lit", "SglQuoted") and node.get("Value"):
+            if node.get("Type") in ("Lit", "SglQuoted") and node.get("Value"):
                 out.append(node["Value"])
             for k, v in node.items():
                 if k not in ("Pos", "End", "Position"):
@@ -622,13 +636,23 @@ class TestNoWordDisappears(Base):
                     out += [r.heredoc.body, r.heredoc.delimiter]
         return "\n".join(out).replace("\\", "")
 
-    def check(self, command: str) -> list[str]:
+    def check(self, command: str, dialect: str = "bash") -> list[str]:
         raw: list[str] = []
-        self.pieces(shell.ast(command), raw)
-        text = self.emitted(shell.parse(command, cwd=CWD))
-        return [p for p in raw if p.replace("\\", "") and p.replace("\\", "") not in text and not p.isspace()]
+        self.pieces(shell.ast(command, dialect), raw)
+        text = self.emitted(shell.parse(command, cwd=CWD, dialect=dialect))
+        missing = []
+        for piece in sorted(raw, key=len, reverse=True):
+            p = re.sub(r"(?m)^\t+", "", piece.replace("\\", ""))  # `<<-` strips the leading tabs of its body
+            if not p or p.isspace():
+                continue
+            i = text.find(p)
+            if i < 0:
+                missing.append(piece)
+            else:
+                text = text[:i] + "\0" + text[i + len(p) :]
+        return missing
 
-    def test_every_piece_of_the_tree_is_emitted(self):
+    def test_every_piece_of_the_tree_is_emitted_in_the_gate_corpus(self):
         import shell_corpus
 
         lost = {}
@@ -638,9 +662,44 @@ class TestNoWordDisappears(Base):
                 lost[case.command[:70]] = missing[:3]
         self.assertEqual(lost, {})
 
-    def test_loop_and_case_words(self):
-        for command in ("for f in ../S*/p*.csv; do :; done", "select f in a b; do :; done", "case ../x in ../y) :;; esac"):
-            self.assertEqual(self.check(command), [], command)
+    def test_every_piece_of_the_tree_is_emitted_in_the_adversarial_corpus(self):
+        import shell_adversarial
+
+        lost = {}
+        for case in shell_adversarial.CASES:
+            for dialect in shell.DIALECTS:
+                try:
+                    missing = self.check(case.command, dialect)
+                except shell.ParseError:
+                    continue  # refused as a whole: nothing reaches the classification, nothing is lost
+                if missing:
+                    lost[(case.name, dialect)] = missing[:3]
+        self.assertEqual(lost, {})
+
+    def test_every_kind_of_node(self):
+        lost, refused = {}, []
+        for command in NODE_COMMANDS:
+            try:
+                missing = self.check(command)
+            except shell.ParseError:
+                refused.append(command)
+                continue
+            if missing:
+                lost[command] = missing[:3]
+        self.assertEqual(lost, {})
+        self.assertEqual(refused, [])  # every one of them parses: a refusal here would hide a node from this test
+
+    def test_a_node_the_walker_does_not_know_is_refused(self):
+        from unittest import mock
+
+        tree = {"Type": "File", "Stmts": [{"Cmd": {"Type": "SomethingNew", "Args": []}}]}
+        with mock.patch.object(shell, "ast", return_value=tree):
+            with self.assertRaises(shell.ParseError):
+                shell.parse("cat x", cwd=CWD)
+        tree = {"Type": "File", "Stmts": [{"Cmd": {"Type": "CallExpr", "Args": [{"Parts": [{"Type": "NewPart", "Value": "x"}]}]}}]}
+        with mock.patch.object(shell, "ast", return_value=tree):
+            with self.assertRaises(shell.ParseError):
+                shell.parse("cat x", cwd=CWD)
 
 
 class TestPinnedBinary(Base):

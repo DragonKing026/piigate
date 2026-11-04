@@ -356,6 +356,8 @@ def _param_text(p: dict, kinds: set[str]) -> str:
             w = _word(operand)
             kinds |= w.kinds - {"param"}
             inner += prefix + w.text
+    if p.get("Slice"):  # `${x:1:2}`: the offset and the length
+        inner += ":" + "".join(_lits(p["Slice"]))
     if p.get("Index") is not None:  # `${a[@]}`, `${a[$i]}`: the subscript is part of what the word names
         inner += "[" + "".join(_lits(p["Index"])) + "]"
     return "${" + inner + "}"
@@ -670,7 +672,10 @@ class _Walker:
             return st
         if t == "CoprocClause":
             # a coprocess runs beside the rest of the line and its output comes back through `$COPROC`: nobody follows it
-            call = self.emit(Call([Word("coproc", "none", False)], list(redirs), st.sure, sub, origin=origin, cwd_known=st.known))
+            words = [Word("coproc", "none", False)]
+            if c.get("Name"):
+                words.append(Word("".join(_lits(c["Name"])) or _text(c["Name"]), "none", False))
+            call = self.emit(Call(words, list(redirs), st.sure, sub, origin=origin, cwd_known=st.known))
             call.opaque_code = True
             if c.get("Stmt"):
                 self.stmt(c["Stmt"], st, True, inherited, origin)
