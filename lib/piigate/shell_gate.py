@@ -312,10 +312,13 @@ class AstGate(gate.Gate):
                     tokens.append(";")
                 tokens += words
                 stage_calls += [None] * len(self._stages_loose(words))
-        view = all_text
-        for b in bodies:
-            if not b.stripped:
-                view += "\n" + b.text
+        if any(b.stripped for b in bodies):
+            view = all_text  # a body written to a file is cut out: the text is the words of the command plus the other bodies
+            for b in bodies:
+                if not b.stripped:
+                    view += "\n" + b.text
+        else:
+            view = command  # nothing to cut: the checks that read the line as text (recipes, `$` in a tool call) get it as written
         if any("\x00" in str(t) for t in tokens):
             raise shell.ParseError("a NUL byte in a word")
         return _Parsed(command, calls, tokens, stage_calls, bodies, view, rest)
