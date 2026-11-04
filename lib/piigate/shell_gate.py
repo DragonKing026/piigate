@@ -43,6 +43,7 @@ class _Parsed:
     stage_calls: list[shell.Call | None]  # one per stage group of `tokens`
     bodies: list[_Body] = field(default_factory=list)
     view: str = ""
+    rest: frozenset = frozenset()  # the words of the command itself (without the text bodies of its heredocs)
 
 
 class AstGate(gate.Gate):
@@ -153,7 +154,7 @@ class AstGate(gate.Gate):
         for c in top:
             if not c.piped_in:
                 flush()
-            groups.append((self._call_tokens(c), c, "|" if c.piped_in else ";"))
+            groups.append((self._call_tokens(c), c, ("|&" if c.piped_stderr else "|") if c.piped_in else ";"))
             pending.extend(self._descend(c))
         flush()
         tokens: list[str] = []
@@ -163,10 +164,25 @@ class AstGate(gate.Gate):
             if not toks:
                 continue
             if tokens:
-                tokens.append("&" if previous is not None and previous.background and sep != "|" else sep)
+                tokens.append("&" if previous is not None and previous.background and sep not in ("|", "|&") else sep)
             tokens += toks
             stage_calls.append(c)
             previous = c
+        if previous is not None and previous.background:
+            tokens.append("&")
+        # text view for the checks that look for a word in the whole line (heredoc bodies written to a file left out); a
+        # file written by a heredoc AND named again in the command is used later: its body counts as text then
+        all_text = " ".join(tokens)
+        dests = {os.path.basename(d) for c in calls for d in (self._file_writer(c) or [])}
+        reused = any(all_text.count(d) > 1 for d in dests if d)
+        rest = frozenset(map(str, tokens))
+        keep = []
+        for b in bodies:
+            if b.stripped and reused:
+                b = _Body(b.text, b.quoted, b.script, False)
+                text_bodies.append(b.text)
+            keep.append(b)
+        bodies = keep
         # A text body is data, not shell: it is cut into words by the same tokenizer as before (quotes, punctuation) —
         # the only place where the old tokenizer is still used. Its words are judged as stages (a path in a script the
         # model feeds to python is a path), with no command attached.
@@ -177,23 +193,11 @@ class AstGate(gate.Gate):
                     tokens.append(";")
                 tokens += words
                 stage_calls += [None] * len(self._stages_loose(words))
-        if previous is not None and previous.background:
-            tokens.append("&")
-        # text view for the checks that look for a word in the whole line (heredoc bodies written to a file left out)
-        all_text = " ".join(tokens)
-        keep = []
-        for b in bodies:
-            if b.stripped:
-                dests = {os.path.basename(d) for c in calls for d in (self._file_writer(c) or [])}
-                if any(all_text.count(d) > 1 for d in dests if d):
-                    b = _Body(b.text, b.quoted, b.script, False)
-            keep.append(b)
-        bodies = keep
         view = all_text
         for b in bodies:
             if not b.stripped:
                 view += "\n" + b.text
-        return _Parsed(command, calls, tokens, stage_calls, bodies, view)
+        return _Parsed(command, calls, tokens, stage_calls, bodies, view, rest)
 
     def _store(self, command: str) -> _Parsed:
         p = self._build(command)
@@ -255,7 +259,7 @@ class AstGate(gate.Gate):
         if not texts:
             return p.view, set(), set(), ""
         body = "\n".join(b.text for b in texts)
-        rest = set(p.tokens)
+        rest = set(p.rest)
         inner = set(self._body_words(body))
         expanded = {w for b in texts if not b.quoted for w in self._body_words(b.text)}
         return p.view, inner - rest, inner - rest - expanded, body
@@ -267,11 +271,10 @@ class AstGate(gate.Gate):
         stages = self._stages_loose(tokens)
         everywhere = sorted({d for c in p.calls for d in c.cwds} | {self.cwd})
         if len(stages) != len(p.stage_calls):  # a word that looks like an operator shifted the stages: check everywhere
-            return [[self.cwd, *[d for d in everywhere if d != self.cwd]] for _ in stages]
+            return [list(everywhere) for _ in stages]
         result = []
         for c in p.stage_calls:
-            dirs = sorted(c.cwds) if c is not None else everywhere
-            result.append([self.cwd, *[d for d in dirs if d != self.cwd]])
+            result.append(sorted(c.cwds) if c is not None else everywhere)
         return result
 
     def _script_stages(self, tokens):
@@ -292,26 +295,27 @@ class AstGate(gate.Gate):
             return Path(t).name in names
 
         mentioned = any(
-            n in w.text for c in p.calls for w in (*c.argv, *(a.value for a in c.assigns if a.value), *(r.target for r in c.redirects if r.target)) for n in names
+            n in w.text for c in p.calls for w in (*c.argv, *(a.value for a in c.assigns if a.value), *(x for a in c.assigns for x in a.array), *(r.target for r in c.redirects if r.target)) for n in names
         )
         if not mentioned:
             return []
         dynamic = any(w.expands for c in p.calls for w in c.argv)
         found: list[list[str] | None] = []
         for c in p.calls:
-            if dynamic and any(a.value and any(is_name(x) for x in a.value.text.split()) for a in c.assigns):
+            if dynamic and any(
+                any(is_name(x) for w in ([a.value] if a.value else []) + list(a.array) for x in w.text.split())
+                for a in c.assigns
+            ):
                 found.append(None)
             if not c.argv:
                 continue
             first = c.argv[0]
-            if not first.static:
-                continue
             nested = c.origin in NESTED_UNKNOWN
-            cmd = Path(first.text).name
+            cmd = Path(first.text).name  # `$HOME/bin/tool`: the literal base name is what the old gate matched too
             if cmd in names:
                 found.append(None if nested else [w.text for w in c.argv])
                 continue
-            if cmd not in LAUNCHERS:
+            if not first.static or cmd not in LAUNCHERS:
                 continue
             rest = c.argv[1:]
             if cmd in SHELLS or cmd == "eval":

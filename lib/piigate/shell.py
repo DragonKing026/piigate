@@ -104,6 +104,7 @@ class Call:
         ""  # shell/python/node… reading its program from stdin (`bash`, `python3 -`, `source /dev/stdin`)
     )
     piped_in: bool = False  # stdin comes from a pipe
+    piped_stderr: bool = False  # ... from `|&`: the previous stage's stderr comes with it
     opaque_code: bool = False  # `bash -c "$x"` / `eval $x`: code the parser cannot see
     background: bool = False
 
@@ -456,6 +457,7 @@ def _stdin_interpreter(argv: list[Word]) -> str:
 class _Walker:
     def __init__(self, session_cwd: str, depth: int = 0, dialect: str = DEFAULT_DIALECT):
         self.dialect = dialect
+        self.functions: set[str] = set()  # names declared so far: a call of one may run any `cd` in its body
         self.session = os.path.normpath(session_cwd)
         self.calls: list[Call] = []
         self.dry = 0
@@ -537,6 +539,7 @@ class _Walker:
                 outs.append(self.stmts(item.get("Stmts") or [], st, sub, inherited, origin))
             return _join(outs)
         if t == "FuncDecl":
+            self.functions.add(_text(c.get("Name") or {}))
             wide = frozenset({*st.seen, self.session})
             self.stmt(_need(c, "Body"), _State(wide, wide, False), sub, inherited, "function")
             return st
@@ -582,11 +585,13 @@ class _Walker:
 
     def pipeline(self, c, st, sub, redirs, origin) -> _State:
         stages: list[dict] = []
+        ops: list[str] = []  # ops[i - 1] joins stage i - 1 and stage i
 
         def flatten(n):
             cmd = n.get("Cmd")
             if cmd and cmd.get("Type") == "BinaryCmd" and _need(cmd, "Op") in ("|", "|&") and not n.get("Redirs"):
                 flatten(_need(cmd, "X"))
+                ops.append(cmd["Op"])
                 flatten(_need(cmd, "Y"))
             else:
                 stages.append(n)
@@ -600,6 +605,7 @@ class _Walker:
             if i and not self.dry:
                 for call in _toplevel(self.calls[before:]):
                     call.piped_in = True
+                    call.piped_stderr = ops[i - 1] == "|&"
         if not self.dry:
             for i, (a, b) in enumerate(spans):
                 if any(call.stdin_interpreter and call.piped_in for call in _toplevel(self.calls[a:b])):
@@ -617,8 +623,9 @@ class _Walker:
         call.stdin_interpreter = _stdin_interpreter(argv)
         for part in (c.get("Assigns"), c.get("Args"), stmt.get("Redirs")):
             self.substs(part, st, call)
-        self.nested_script(call, st)
-        return self.after_call(call, st)
+        after = self.nested_script(call, st)  # `eval cd ..` runs in this shell: its directory carries on
+        self.chdir_wrapper(call, st)
+        return self.after_call(call, after or st)
 
     def assign(self, a: dict) -> Assign:
         array = tuple(_word(e["Value"]) for e in (a.get("Array") or {}).get("Elems") or [] if e.get("Value"))
@@ -647,24 +654,55 @@ class _Walker:
         self.substs(stmt.get("Redirs"), st, call)
         return st
 
-    def nested_script(self, call: Call, st: _State) -> None:
-        found = _script_words(call.argv)
-        if not found:
-            return
-        kind, words = found
+    def chdir_wrapper(self, call: Call, st: _State) -> None:
+        """`env -C dir cmd`, `sudo -D dir cmd`: the command runs elsewhere — in any directory seen so far."""
+        words = list(call.argv)
+        while words and words[0].static and os.path.basename(words[0].text) in WRAPPERS:
+            wrapper = os.path.basename(words[0].text)
+            for w in words[1:]:
+                if not w.static or not w.text.startswith("-"):
+                    break
+                if (wrapper in ("env", "sudo", "doas") and re.fullmatch(r"-[A-Za-z]*[CD]|--chdir(?:=.*)?|-[CD].+", w.text)) or (
+                    wrapper == "env" and w.text.startswith("--chdir")
+                ):
+                    call.cwds = frozenset({*st.seen, self.session})
+                    call.cwd_known = False
+                    return
+            words = words[1:]
+
+    def nested_script(self, call: Call, st: _State) -> _State | None:
+        """The scripts the command runs: `bash -c S`, `eval S` — and the same behind a launcher in its arguments
+        (`find -exec sh -c S ';'`, `xargs sh -c S`, `env -i bash -c S`): every shell word of the argv followed by -c."""
+        out: _State | None = None
+        i = 0
+        done: set[int] = set()  # a script reached from two starting words (`sudo bash -c S`) runs once
+        while i < len(call.argv):
+            found = _script_words(call.argv[i:])
+            if found and not (found[1] and id(found[1][0]) in done):
+                done.update(id(w) for w in found[1][:1])
+                state = self.run_script(call, st, *found)
+                if found[0] == "eval" and i == 0:
+                    out = state  # a top-level eval runs in THIS shell: its directory carries on
+                elif state is not None and i:
+                    pass  # behind a launcher: a child process
+            i += 1
+        return out
+
+    def run_script(self, call: Call, st: _State, kind: str, words: list[Word]) -> _State | None:
         origin = "eval" if kind == "eval" else "-c"
         if not words or any(not w.static for w in words):
-            call.opaque_code = bool(words) or kind != "eval"
-            return
+            call.opaque_code = call.opaque_code or bool(words) or kind != "eval"
+            return self.unknown_dir(st) if kind == "eval" and words else None
         if self.depth >= MAX_DEPTH:
             raise ParseError("scripts nested too deeply")
         text = " ".join(w.text for w in words)
         inner = _Walker(self.session, self.depth + 1, self.dialect)
         inner.dry = self.dry
-        inner.stmts(ast(text, self.dialect).get("Stmts") or [], _State(st.sure, st.seen, st.known), True, (), origin)
+        out = inner.stmts(ast(text, self.dialect).get("Stmts") or [], _State(st.sure, st.seen, st.known), True, (), origin)
         call.substitutions.extend(_toplevel(inner.calls))
         if not self.dry:
             self.calls.extend(inner.calls)
+        return out if kind == "eval" else None  # `bash -c` is a child process: nothing carries back
 
     def after_call(self, call: Call, st: _State) -> _State:
         if not call.argv:
@@ -677,6 +715,10 @@ class _Walker:
         name = words[0].text
         if name == "popd":
             return _State(st.seen, st.seen, st.known)
+        if name in ("alias", "source", ".") or name in self.functions:
+            return self.unknown_dir(st)  # an alias may be `cd`; a function or a sourced file may change directory
+        if name == "chdir":
+            name = "cd"
         if name not in ("cd", "pushd"):
             return st
         args = []
@@ -689,7 +731,12 @@ class _Walker:
         tilde = True
         if not args:
             target = "~" if name == "cd" else None
-        elif args[0].kinds <= {"tilde"} and args[0].text != "-" and not re.match(r"[+-]\d+$", args[0].text):
+        elif (
+            args[0].kinds <= {"tilde"}
+            and args[0].text != "-"
+            and not re.match(r"[+-]\d+$", args[0].text)
+            and not ("~" in args[0].text and args[0].text != "~" and not args[0].text.startswith("~/"))  # `~-`, `~user`, `~d`
+        ):
             target = args[0].text
             tilde = "tilde" in args[0].kinds
         else:
