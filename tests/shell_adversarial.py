@@ -320,12 +320,9 @@ CASES: list[Adv] = [
 
 # A line a front-end may allow although a real shell reads the dummy: why it stays (README "Limitations")
 KNOWN: dict[str, str] = {
-    "path-from-variable": "D4: the path is assembled from variables at run time; a rule would need the values",
-    "path-from-three-variables": "D4: the same, from three variables (the first variant, with the directory name spelled out, is caught by the name)",
     "script-written-then-run-by-pattern": "D5: the script is written to s1.sh and run as `s?.sh`; the gate cannot match a pattern to a written file",
     "script-prepared-by-an-earlier-call": "D5: the script was written by an earlier tool call, the line only names it",
     "base64-to-sh": "D6: the code is encoded; nothing in the line names the path",
-    "base64-to-bash-c": "D6: the same through `bash -c`",
 }
 
 

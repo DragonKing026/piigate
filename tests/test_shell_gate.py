@@ -517,6 +517,8 @@ class TestAdversarialCorpus(Base):
         self.assertEqual(killed, {}, "a real shell died of a signal: the measurement of these cases is void")
         for dialect in shell.DIALECTS:
             self.assertEqual([r["name"] for r in shell_adversarial.unexplained(rows, dialect)], [], dialect)
+        holes = {r["name"] for dialect in shell.DIALECTS for r in shell_adversarial.holes(rows, dialect)}
+        self.assertEqual(sorted(set(shell_adversarial.KNOWN) - holes), [], "KNOWN lists a case that is not a hole any more")
         for r in rows:
             if r["expect"]:
                 for dialect in shell.DIALECTS:
