@@ -400,12 +400,27 @@ class TestGate(unittest.TestCase):
             "cd ../Sens* && cat people.csv", "cd ../S*; cat people.csv", "cd ../Sens[i]tive-data && cat people.csv",
             "cd ../Sensitive-dat? && cat people.csv", "cd ../{Sensitive-data,x} && cat people.csv", "pushd ../Sens* && cat people.csv",
             "cd ~+/../Sensitive-data && cat people.csv", "cd ../Sens* ; cd /tmp; cat people.csv",
+            "cd ../Sens* >/dev/null; cat people.csv", "cd ../Sens*>/dev/null; cat people.csv", "cd ../Sens* &>/dev/null; cat people.csv",
+            "cd ../Sens* 2>/dev/null; cat people.csv", "cd ../Sens* 2>&1; cat people.csv",
+            "cd ../Sens*  2> /dev/null && cat people.csv", "pushd ../Sens* >/dev/null; cat people.csv",
+            "cd ../Sens* # c\ncat people.csv", "command cd ../Sens*; cat people.csv", "builtin cd ../Sens*; cat people.csv",
+            "command cd ../Sensitive-data; cat people.csv", "cd ../Sensitive-data # c\ncat people.csv",
+            "x=..; cd $x/Sens*; cat people.csv", 'x=..; cd "$x"/Sens*; cat people.csv', "x=..; cd ${x}/Sens*; cat people.csv",
+            "x=../Sensitive-data; cd $x; cat people.csv",
         ):
             with self.subTest(command=command):
                 self.assertIsNotNone(b.bash(command))
         for command in ("cd ../Sens* && ls", "cd . && cat notes.md", "cd ../zzz* && cat notes.md", "cd ../w* && cat notes.md"):
             with self.subTest(command=command):
                 self.assertIsNone(b.bash(command))
+
+    def test_a_cd_that_names_too_many_directories_is_refused(self):
+        b = self._world("cd-overflow")
+        root = TMP / "cd-overflow"
+        for n in range(gate.CD_MATCHES + 6):
+            (root / f"d{n:03d}").mkdir(exist_ok=True)
+        self.assertIsNotNone(b.bash("cd ../d* && cat notes.md"))  # more than the gate can follow: fail closed
+        self.assertIsNone(b.bash("cd ../d00* && cat notes.md"))  # ten of them
 
     def test_grep_glob_edit(self):
         self.assertTrue(self.denial("Grep", {"pattern": "x", "path": f"{self.home}/Downloads/thunderbird.tmp"}))

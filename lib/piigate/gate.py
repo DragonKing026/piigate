@@ -107,7 +107,9 @@ FIND_ACTIONS = {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fp
 NETWORK_COMMANDS = {"ssh", "scp", "rsync", "sftp", "curl", "wget", "http", "https", "mysql", "mariadb", "psql", "docker", "kubectl"}
 FORBIDDEN_OPERATORS = {";", "&&", "||", "&", ";;", "(", ")", "<<<", "\n", "&|", ";&", "|&&"}
 ZSH_FLAGS = re.compile(r"\$\{[#^~=+]*\(([^)]*)\)")  # `${(flags)name}`
-ZSH_QUALIFIER = re.compile(r"\((?:#q|[N.^/@*%=-]{0,3}(?:e[^\w|)\s(]|\+\w))")  # `(e:…:)`, `(N.e/…/)`, `(+f)`, `(#q…)`
+# a qualifier that runs code, whatever precedes it in the parentheses (`(oe:…:)`, `([1,2]e:…:)`, `(Lk+0e:…:)`, `(o+f)`, `(#q…)`):
+# an `e` followed by a separator, or `+` and a letter. Parentheses of `+(a|b)`, `*(.)`, `(L0)`, `(e|f)` do not contain them.
+ZSH_QUALIFIER = re.compile(r"\((?:#q|[^()\s|]*?(?:e[^\w|)\s(]|\+[A-Za-z_]))")
 CD_MATCHES = 64  # directories a `cd PATTERN` is followed into
 REDIRECTS = {">", ">>", ">&", "&>", "&>>", ">|", "<", "<<", "<>", "<&"}
 QUOTED_REDIRECT = re.compile(r"\d*[<>]+[&|]?\d*|&>>?")  # a quoted/escaped word of this shape is not a redirection
@@ -553,6 +555,7 @@ class Gate:
     def __init__(self, cfg: dict, cwd: str):
         self.cfg = cfg
         self.cwd = cwd or os.getcwd()
+        self._cd_overflow = False
         self.sensitive = config.sensitive_dirs(cfg)
         self.protected = config.protected_dirs(cfg)
         self.exempt = [config.expand(k) for k in cfg["sources"].get("exempt_directories", [])]
@@ -1549,28 +1552,58 @@ class Gate:
             i += 1
         return None
 
-    def _cd_matches(self, stage: list[str], bases: list[str]) -> list[str]:
+    @staticmethod
+    def _without_text_bodies(command: str) -> str:
+        """The command without the bodies of heredocs that are not scripts: the program that reads the body is not a shell
+        (`python3 - <<EOF`, `timeout 5 python3 - <<EOF`, `cat <<EOF`), so no glob in it is expanded."""
+        out: list[str] = []
+        end: list[str] = []
+        for line in command.split("\n"):
+            if end:
+                if line.strip() == end[0]:
+                    end.pop(0)
+                    out.append(line)
+                continue
+            out.append(line)
+            for m in HEREDOC.finditer(line):
+                words = re.split(r"[|;&()]", line[: m.start()])[-1].split()
+                words = [w for w in words if w not in SHELL_KEYWORDS and not re.match(r"^\w+=", w)]
+                while words and (
+                    Path(words[0]).name in DIRECT_LAUNCHERS or words[0].startswith("-") or re.fullmatch(r"[\d.]+[smhd]?", words[0])
+                ):
+                    words.pop(0)
+                if words and Path(words[0]).name not in {*SHELLS, "eval", "source", "."} | LAUNCHERS:
+                    end.append(m.group(2))
+        return "\n".join(out)
+
+    def _cd_matches(self, stage: list[str], bases: list[str], variables: dict | None = None) -> list[str]:
         """The directories a `cd`/`pushd` with a pattern (`cd ../Sens*`, `cd ../Sens[i]tive-data`, `cd ../{a,b}`,
-        `cd ~+/..`) may reach from each base directory: the pattern is expanded on disk (at most CD_MATCHES). []
-        for anything that is not a pattern (a literal target is `_cd_target`'s)."""
-        if stage[0] not in ("cd", "pushd") or self._cd_target(stage) is not None:
+        `cd ~+/..`) or with a variable of known value (`x=..; cd $x/Sens*`) may reach from each base directory: the pattern
+        is expanded on disk. [] for anything else (a literal target is `_cd_target`'s). More than CD_MATCHES hits:
+        `self._cd_overflow` is set and the command is refused (fail closed)."""
+        got = self._cd_operands(stage)
+        if got is None or len(got[1]) != 1 or self._cd_target(stage) is not None:
             return []
-        args = [a for a in stage[1:] if not a.startswith("-") or a == "-"]
-        if len(args) != 1:
-            return []
-        target = args[0]
+        target = str(got[1][0])
+        substituted = False
+        for name, value in (variables or {}).items():
+            replaced = re.sub(r"\$\{%s\}|\$%s(?!\w)" % (name, name), lambda _m, v=value: v, target)
+            substituted = substituted or replaced != target
+            target = replaced
         plus = target.startswith("~+/") or target == "~+"  # $PWD
         if plus:
             target = "." + target[2:]
-        if not target or target[0] in "-+" or re.search(r"[$`\\()!]", target) or not (plus or re.search(r"[*?\[{]", target)):
+        if not target or target[0] in "-+" or re.search(r"[$`\\()!]", target) or not (plus or substituted or re.search(r"[*?\[{]", target)):
             return []
         found: list[str] = []
         for base in bases:
             for variant in expand_braces(target):
-                for hit in sorted(glob.glob(_path(variant, base)))[:CD_MATCHES]:
+                for hit in glob.glob(_path(variant, base)):
                     if os.path.isdir(hit) and hit not in found:
                         found.append(hit)
-        return found[:CD_MATCHES]
+        if len(found) > CD_MATCHES:
+            self._cd_overflow = True
+        return sorted(found)[:CD_MATCHES]
 
     def _invocations(self, command: str, names: set[str], depth: int = 0) -> list[list[str] | None]:
         """Where the command RUNS one of `names` (matched by the base name, also glued from quotes): the argv of each
@@ -2217,27 +2250,59 @@ class Gate:
         return True
 
     @staticmethod
-    def _cd_target(stage: list[str]) -> str | None:
-        """The literal directory of `cd X` / `cd -L|-P X` / `pushd X` (redirections ignored), None for anything else —
-        `cd -`, `cd ~-`, `cd $X`, a glob, `pushd -n X`, `pushd +1`, a second operand."""
-        if stage[0] not in ("cd", "pushd"):
+    def _static_assignments(tokens: list[str]) -> dict[str, str]:
+        """`NAME=value` words that stand alone as a command (`x=..; cd $x/Q*`) with a plain value, for names assigned exactly
+        once in the line; anything else (a second assignment, a `$`, a quote, a glob) is not known."""
+        seen: dict[str, str | None] = {}
+        previous = None
+        for t in [*tokens]:
+            m = re.fullmatch(r"([A-Za-z_]\w*)=([\w./~+-]*)", str(t))
+            if m and (previous is None or previous in FORBIDDEN_OPERATORS or previous in ("|", "|&")):
+                seen[m.group(1)] = None if m.group(1) in seen else m.group(2)
+            elif re.search(r"\b[A-Za-z_]\w*\+?=", str(t)):
+                name = str(t).split("=", 1)[0].rstrip("+")
+                if re.fullmatch(r"[A-Za-z_]\w*", name):
+                    seen[name] = None  # assigned in some other way: unknown
+            previous = t
+        return {k: v for k, v in seen.items() if v is not None}
+
+    @staticmethod
+    def _cd_operands(stage: list[str]) -> tuple[str, list[str]] | None:
+        """(`cd`|`pushd`, its operands) of a stage that is a `cd` / `pushd`, also behind `command` / `builtin`; None for any
+        other stage. Not operands: redirections (`>/dev/null`, `2>&1`, `&>f`), the options `--`, `-L`, `-P`, and a comment
+        (an unquoted word that starts with `#` ends the command)."""
+        words = list(stage)
+        while words and words[0] in ("command", "builtin"):
+            words.pop(0)
+            if words and words[0] == "-p":
+                words.pop(0)
+        if not words or words[0] not in ("cd", "pushd"):
             return None
-        args, skip = [], 0
-        for j, a in enumerate(stage[1:], 1):  # without redirections (`cd x 2>/dev/null`, `cd x &>f`)
-            follows = stage[j + 1] if j + 1 < len(stage) else ""
+        name, args, skip = words[0], [], 0
+        for j, a in enumerate(words[1:], 1):  # without redirections (`cd x 2>/dev/null`, `cd x &>f`)
+            follows = words[j + 1] if j + 1 < len(words) else ""
             if skip:
                 skip -= 1
+            elif a.startswith("#") and not getattr(a, "quoted", False):
+                break  # a comment: the rest of the line is not an argument
             elif a in REDIRECTS or re.fullmatch(r"\d?>&?|&>>?", a):
                 skip = 1  # the file after it
             elif a.isdigit() and (follows in REDIRECTS or re.fullmatch(r"\d?>&?|&>>?", follows)):
                 skip = 2  # the descriptor, the operator and the file
             else:
                 args.append(a)
-        while args and (args[0] == "--" or (stage[0] == "cd" and args[0] in ("-L", "-P"))):
+        while args and (args[0] == "--" or (name == "cd" and args[0] in ("-L", "-P"))):
             args.pop(0)
-        if len(args) > 1:
+        return name, args
+
+    @staticmethod
+    def _cd_target(stage: list[str]) -> str | None:
+        """The literal directory of `cd X` / `cd -L|-P X` / `pushd X` (redirections ignored), None for anything else —
+        `cd -`, `cd ~-`, `cd $X`, a glob, `pushd -n X`, `pushd +1`, a second operand."""
+        got = Gate._cd_operands(stage)
+        if got is None or len(got[1]) > 1:
             return None
-        target = args[0] if args else "~"
+        target = got[1][0] if got[1] else "~"
         if not target or target[0] in "-+" or re.search(r"[$`*?\[\]{}\\()!]", target):
             return None
         if "~" in target and target != "~" and not target.startswith("~/"):
@@ -2258,6 +2323,7 @@ class Gate:
         result: list[list[str]] = []
         stage: list[str] = []
         depth = 0
+        variables = self._static_assignments(tokens)
         for t in [*tokens, ";"]:
             if t in ("(", ")") and self._find_paren(stage, t, depth):
                 depth += 1 if t == "(" else -1
@@ -2269,7 +2335,7 @@ class Gate:
             depth = 0
             if stage:
                 target = self._cd_target(stage)
-                matches = self._cd_matches(stage, sure if narrow else seen) if target is None else []
+                matches = self._cd_matches(stage, sure if narrow else seen, variables) if target is None else []
                 if matches:  # `cd ../Sens*`: where it may lead is added; what follows is checked there too
                     narrow = False
                     seen += [d for d in matches if d not in seen]
@@ -2838,11 +2904,8 @@ class Gate:
         tokens = self._tokens(command)
         if reason := self._human_only(command, tokens):
             return reason
-        outside, _, _, body = self._heredoc_text(command)
-        in_bodies = set(body.split("\n")) if body else set()  # globs are not expanded in a heredoc body, parameters are
-        found = self._zsh_code(outside) or self._zsh_code(
-            "\n".join(ln for ln in outside.split("\n") if ln not in in_bodies), flags=False
-        )
+        # parameters are expanded in an unquoted heredoc body, globs never; a body fed to a shell is a script
+        found = self._zsh_code(self._heredoc_text(command)[0]) or self._zsh_code(self._without_text_bodies(command), flags=False)
         if found:
             return f"piigate: command denied — {found}; the gate cannot see what it would read. {HINT}"
         if reason := self._marker_only_rmdir(tokens):
@@ -2858,6 +2921,7 @@ class Gate:
             if calls and (reason := self.unfiltered_bash(entry, command, tokens, calls)):
                 return reason
         self._names_seen = set()
+        self._cd_overflow = False
         if tokens is None:
             kind, _ = self._touches(command, command.split())
             kind = kind or ("sensitive" if self._names_seen else None)
@@ -2867,6 +2931,11 @@ class Gate:
                 )
             return None
         kind, what = self._touches(command, tokens)
+        if self._cd_overflow:
+            return (
+                f"piigate: command denied — a `cd` with a pattern names more than {CD_MATCHES} directories; the gate cannot "
+                f"check them all. {HINT}"
+            )
         if kind is None and self._names_seen and not self._names_flow_ok(command, tokens):
             return (
                 "piigate: command denied — the names of files in a sensitive data directory are passed on (xargs, a "

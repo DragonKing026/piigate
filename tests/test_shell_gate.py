@@ -533,25 +533,62 @@ class TestRound7(Base):
 
 
 class TestOldGateZshCode(Base):
-    """The old gate (`Gate`) refuses the zsh syntax that runs code, and only that. (Here, not in test_filter.py: these
-    lines are zsh-only and the bash corpus of test_filter.py must parse in both grammars.)"""
+    """The old gate (`Gate`) refuses the zsh syntax that runs code, and only that; `AstGate` too. (Here, not in
+    test_filter.py: these lines are zsh-only and the bash corpus of test_filter.py must parse in both grammars.)"""
 
-    def test_zsh_code_syntax_is_refused_where_it_is_code(self):
+    DENY = (
+        "echo ${(e)x}", "echo ${(%)x}", "echo ${${(e)x}}", "echo ${(e)${x}}", "echo ${y:-${(e)x}}", 'echo "${(e)x}"',
+        "echo ${(@e)x}", "echo *(e:ls:)", "echo *(e/ls/)", "echo *(e,ls,)", "echo *(e!ls!)", "echo *.csv(e:ls:)", "echo *(+f)",
+        "echo *(#qe:ls:)", "echo *(N.e:ls:)", "ls *(oe:'touch M':)", "ls *(Oe:'touch M':)", "ls *(ne:'touch M':)",
+        "ls *(N,e:'touch M':)", "ls *(Nonoe:'touch M':)", "ls *([1]e:'touch M':)", "ls *([1,2]e:'touch M':)",
+        "ls *([-1]e:'touch M':)", "ls *(Nom[1]e:'touch M':)", "ls *(m-1e:'touch M':)", "ls *(Lk+0e:'touch M':)",
+        "ls ../w/*(oe:'touch M':)", "ls *(o+f)", "ls *(on+f)", "ls *(On+f)", "ls *(N,o+f)", "ls *([1]+f)", "ls a(e:'touch M':)",
+    )
+    ALLOW = (
+        "echo '${(e)x}'", "echo ${(j:,:)x}", "echo ${(@)x}", "echo *(.)", "echo *.csv(N)", "echo +(a|b)", "echo @(ab|e:x)",
+        'git commit -m "fix(e: x)"', "grep 'def f(e: str)' a.py", "python3 -c 'print(e)'", "echo $(echo hi)", "(echo hi)",
+        "echo \\*\\(e:x\\)", 'echo "a(e:b)"', "python3 - <<'EOF'\ndef f(e: str): pass\nEOF",
+        "echo $((1+2))", "ls *(N)", "ls *(.om[1,3])", "ls *(L0)", "ls *(oN)", "ls *.(jpg|png)", "case x in (a) echo;; esac",
+        "echo a(e|f)", "f(){ :; }", "echo '*(e:x:)'", 'echo "*(e:x:)"', "python3 -c 'print(c.name, e)'",
+        "python3 - <<EOF\nprint(c.name, 1)\nEOF", "timeout 5 python3 - <<EOF\nprint(c.name, 1)\nEOF", "cat <<EOF\nf(e: x)\nEOF",
+    )
+
+    def test_the_old_gate_refuses_code_syntax_and_only_that(self):
         b = self.old()
-        for command in (
-            "echo ${(e)x}", "echo ${(%)x}", "echo ${${(e)x}}", "echo ${(e)${x}}", "echo ${y:-${(e)x}}", 'echo "${(e)x}"',
-            "echo ${(@e)x}", "echo *(e:ls:)", "echo *(e/ls/)", "echo *(e,ls,)", "echo *(e!ls!)", "echo *.csv(e:ls:)", "echo *(+f)",
-            "echo *(#qe:ls:)", "echo *(N.e:ls:)",
-        ):
+        for command in self.DENY:
             with self.subTest(command=command):
                 self.assertIsNotNone(gate.Gate.bash(b, command, True))
-        for command in (
-            "echo '${(e)x}'", "echo ${(j:,:)x}", "echo ${(@)x}", "echo *(.)", "echo *.csv(N)", "echo +(a|b)", "echo @(ab|e:x)",
-            'git commit -m "fix(e: x)"', "grep 'def f(e: str)' a.py", "python3 -c 'print(e)'", "echo $(echo hi)", "(echo hi)",
-            "echo \\*\\(e:x\\)", 'echo "a(e:b)"', "python3 - <<'EOF'\ndef f(e: str): pass\nEOF",
-        ):
+        for command in self.ALLOW:
             with self.subTest(command=command):
                 self.assertIsNone(gate.Gate.bash(b, command, True))
+
+    def test_the_tree_gate_refuses_it_too(self):
+        for dialect in ("bash", "zsh"):
+            for command in self.DENY:
+                with self.subTest(command=command, dialect=dialect):
+                    self.assertIsNotNone(self.ast(dialect).bash(command))
+
+    def test_what_is_refused_really_runs_in_zsh(self):
+        """With a real zsh (only `touch` of a marker file): each `touch M` line makes M; so does `+f` with a function."""
+        import shutil
+
+        import shell_zsh_cases as zc
+
+        if not shutil.which("zsh"):
+            self.skipTest("zsh not installed")
+        for command in self.DENY:
+            if "touch M" not in command and "+f" not in command:
+                continue
+            line = ("f() { touch M; return 0; }; " if "+f" in command else "") + command
+            with self.subTest(command=command):
+                folder = TMP / ("real-" + str(abs(hash(command))))
+                (folder / "w").mkdir(parents=True, exist_ok=True)
+                (folder / "w" / "a").write_text("x")
+                (folder / "w" / "M").unlink(missing_ok=True)
+                self.assertFalse(zc.refusal(line, folder / "w"), zc.refusal(line, folder / "w"))
+                zc.run_limited(["zsh", "-f", "-c", line], folder / "w", {"PATH": "/usr/bin:/bin", "HOME": str(folder)})
+                self.assertTrue((folder / "w" / "M").exists())
+                self.assertIsNotNone(gate.Gate.bash(self.old(), line, True))
 
 
 class TestMonotonicity(Base):

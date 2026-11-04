@@ -1382,7 +1382,7 @@ class _Walker:
             return self.unknown_dir(st)
         tilde = True
         resolved = None
-        if args and args[0].kinds - {"param"} and not (args[0].kinds & {"tilde", "glob", "brace", "cmd", "proc", "arith", "zsh"}):
+        if args and args[0].kinds - {"param"} and not (args[0].kinds & {"tilde", "brace", "cmd", "proc", "arith", "zsh"}):
             variants = self.words_of(args[0]) if self.model is not None else None
             if variants and all(len(v) == 1 for v in variants):
                 resolved = [v[0] for v in variants]
