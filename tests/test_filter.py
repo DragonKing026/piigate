@@ -2724,6 +2724,17 @@ class TestFalseAlarms(unittest.TestCase):
             with self.subTest(command):
                 self.assertIsNotNone(b.bash(command))
 
+    def test_computed_operands_pass_without_a_sensitive_source(self):
+        """Issue #22: without a sensitive directory a substitution as a file operand and `… | xargs <reader>` pass."""
+        for where in (self.public, self.phi):
+            b = self.gate(where)
+            for command in (
+                "cat $(echo packages.tsv)", "grep x $(git ls-files)", "echo $(date)", "git ls-files | xargs grep -l x",
+                'cat "$(echo compose.yml)"', "echo compose.yml | xargs cat", "wc -l $(ls)",
+            ):
+                with self.subTest(where=where.name, command=command):
+                    self.assertIsNone(b.bash(command))
+
     def test_human_only_word_after_a_substitution(self):
         """Issue #26: a command substitution elsewhere does not turn the word into a call; a call stays denied
         wherever `piigate` runs (also in or after a substitution, built at run time, under a launcher)."""
@@ -3413,6 +3424,36 @@ class TestContentNotNames(unittest.TestCase):
             with self.subTest(command):
                 self.assertIsNotNone(b.bash(command))
         self.assertIsNone(b.bash(f"git commit -m 'mentions {S}' && ./build.sh"))
+
+    def test_computed_operands_of_readers_with_a_sensitive_source(self):
+        """Issue #22: a word built by a substitution is an unknown path for a command that reads files, `… | xargs
+        <reader>` likewise — denied while a sensitive directory exists; text arguments and patterns pass."""
+        b = self.gate()
+        S = "Sensitive-data"
+        for command in (
+            "cat $(echo Sens*/x.txt)", 'cat "$(echo Sens*/x.txt)"', "cat `echo Sens*/x.txt`", "echo Sens*/x.txt | xargs cat",
+            f"cat $(echo {S}/x.txt)", f"cat $(printf %s {S}/x.txt)", f"cat \"$(echo {S})/x.txt\"", f"head -n 2 $(echo {S}/x.txt)",
+            f"cat < $(echo {S}/x.txt)", f"cp $(echo {S}/x.txt) /tmp/y", f"cat $(echo $(echo {S}/x.txt))",
+            f"grep secret $(echo {S}/x.txt)", "grep -e secret $(git ls-files)", f"env X=1 cat $(echo {S}/x.txt)",
+            f"echo {S}/x.txt | xargs -I{{}} cat {{}}", "git ls-files | xargs grep secret", "echo a | xargs -n1 -P2 wc -l",
+            f"echo hi; cat $(echo {S}/x.txt)", "ls | xargs -0 cat", f"cat <(echo {S}/x.txt)",
+        ):
+            with self.subTest(command):
+                self.assertIsNotNone(b.bash(command))
+        reason = b.bash("cat $(echo Sens*/x.txt)")
+        self.assertIn("a file operand built by a command substitution", reason)
+        self.assertNotIn("multi-line", reason)
+        for command in (  # not a file operand, or no reader
+            "echo $(date)", 'echo "$(date) $(whoami)"', 'grep "$(echo needle)" clean/a.csv', "grep -c \"$(date +%Y)\" clean/a.csv",
+            "git commit -q -m \"$(date)\"", "git commit -m \"$(cat <<'EOF'\nmessage\nEOF\n)\"", "mkdir $(date +%s)",
+            "echo hi | xargs echo", "echo hi | xargs -n1 printf %s", 'sed -e "s/$(echo a)/b/" clean/a.csv',
+            "cat clean/a.csv > \"$(echo /tmp/o)\"", "X=$(date); echo \"$X\"", "cat 'a$(b'", "cat clean/a.csv | head -n $(echo 2)",
+        ):
+            with self.subTest(command):
+                self.assertIsNone(b.bash(command), b.bash(command))
+        # no regression of the older rules: a literal path and a quoted heredoc
+        self.assertIsNotNone(b.bash(f"cat {S}/x.txt"))
+        self.assertIsNone(b.bash("f=/tmp/x/a.sh; cat > \"$f\" <<'SH'\necho ok\nSH\nbash \"$f\""))
 
     def test_script_from_a_quoted_heredoc_is_read_by_its_body(self):
         """Issue #27: the target of a redirection is not text built at run time; a quoted heredoc is judged by its body,

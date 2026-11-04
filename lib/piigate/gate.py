@@ -184,7 +184,25 @@ def ssh_valid(arguments: list[str]) -> bool:
     return True
 
 
+# commands that read the files named by their operands (and what `xargs` runs): an operand built by a substitution is a
+# path the gate cannot know
+READERS = {
+    "cat", "tac", "head", "tail", "less", "more", "bat", "batcat", "wc", "sort", "uniq", "cut", "sed", "awk", "gawk", "nl",
+    "od", "xxd", "hexdump", "strings", "jq", "yq", "mlr", "column", "fold", "fmt", "rev", "paste", "join", "comm", "diff",
+    "cmp", "md5sum", "sha1sum", "sha256sum", "sha512sum", "b2sum", "cksum", "grep", "egrep", "fgrep", "zgrep", "rg", "rga",
+    "ag", "ack", "tar", "zip", "unzip", "gzip", "gunzip", "zcat", "bzcat", "xzcat", "cp", "mv", "install", "rsync", "scp",
+    "source", ".", "python", "python3", "node", "ruby", "perl", "php", "bash", "sh", "zsh", "sqlite3", "duckdb",
+}
+PATTERN_FIRST = {"grep", "egrep", "fgrep", "zgrep", "rg", "rga", "ag", "ack", "sed", "awk", "gawk", "jq", "yq"}  # 1st operand: pattern/program
+# options whose value is the next word and is not a path (a count, a pattern, a separator)
+VALUE_OPTIONS = {
+    "head": {"-n", "-c"}, "tail": {"-n", "-c"}, "sort": {"-k", "-t"}, "cut": {"-d", "-f", "-c"}, "uniq": {"-f", "-s", "-w"},
+    "sed": {"-e"}, "awk": {"-F", "-v"}, "gawk": {"-F", "-v"}, "jq": {"--arg", "--argjson"},
+    **{c: {"-e", "-m", "-A", "-B", "-C"} for c in ("grep", "egrep", "fgrep", "zgrep", "rg", "rga", "ag", "ack")},
+}
+XARGS_WITH_VALUE = {"-I", "-n", "-P", "-L", "-s", "-d", "-E", "-a", "--max-args", "--max-procs", "--max-lines", "--delimiter"}
 UNVETTABLE = "a script written from text built at run time and then run in the same command"
+COMPUTED = "a file operand built by a command substitution or by xargs"
 PDFTOTEXT_WITH_VALUE = {"-f", "-l", "-r", "-x", "-y", "-W", "-H", "-enc", "-eol", "-opw", "-upw", "-fixed", "-margin"}
 OUTPUT_OPTIONS = re.compile(r"^(?:-o|-O|--output(?:=.*)?|--out(?:=.*)?|-o.+|--output-file(?:=.*)?)$")
 SEARCHERS = {
@@ -2126,6 +2144,8 @@ class Gate:
                         kinds.setdefault("sensitive", f"{hit} (a file that runs later, in a command naming a sensitive path)")
         if self._unvettable_script(tokens):
             kinds.setdefault("sensitive", UNVETTABLE)
+        if self._computed_operand(command):
+            kinds.setdefault("sensitive", COMPUTED)
         paths_text = self._marker_text(tokens, text)
         for z in self.markers:
             if z in paths_text:
@@ -2716,6 +2736,65 @@ class Gate:
                 return True
         return False
 
+    def _sensitive_exists(self) -> bool:
+        """A sensitive source exists: a directory of the configuration or of the project is there on disk."""
+        return any(os.path.isdir(d) for d in [*self.sensitive, *self.project_sensitive])
+
+    def _computed_operand(self, command: str, depth: int = 0) -> bool:
+        """A command that reads files gets an operand built by a substitution (`cat $(echo …)`, `cat "$(…)"`, backticks,
+        `<(…)`) or through `xargs` (`… | xargs cat`) — a path the gate cannot know, like a variable path. Only when a
+        sensitive source exists (#22); text arguments and patterns (`grep "$(date)" x`) are not operands."""
+        if depth > 8 or not self._sensitive_exists():
+            return False
+        text = self._strip_heredocs(command)
+        masked, position = [], 0
+        for start, end, inner in self._substitution_spans(text):
+            masked += [text[position:start], "\x01"]
+            position = end
+            if self._computed_operand(inner, depth + 1):
+                return True
+        masked.append(text[position:])
+        lex = shlex.shlex("".join(masked), posix=True, punctuation_chars=";&|()\n")
+        lex.whitespace = " \t\r"
+        lex.whitespace_split = True
+        lex.commenters = ""
+        try:
+            tokens = list(lex)
+        except ValueError:
+            return False  # unparsable quotes are denied elsewhere
+        stages: list[list[str]] = [[]]
+        for t in tokens:
+            if re.fullmatch(r"[;&|()\n]+", t):
+                stages.append([])
+            else:
+                stages[-1].append(t)
+        for stage in stages:
+            for core in self._strip_prefixes([stage]) if stage else []:
+                cmd = Path(core[0]).name
+                if cmd == "xargs":
+                    rest, k = core[1:], 0
+                    while k < len(rest) and rest[k].startswith("-"):
+                        k += 2 if rest[k] in XARGS_WITH_VALUE else 1
+                    if k < len(rest) and Path(rest[k]).name in READERS:
+                        return True
+                    continue
+                if cmd not in READERS:
+                    continue
+                options = {t for t in core[1:] if t in ("-e", "-f", "--regexp", "--file")}
+                pattern_first = cmd in PATTERN_FIRST and not options
+                values = VALUE_OPTIONS.get(cmd, set())
+                for i, t in enumerate(core[1:], 1):
+                    if re.fullmatch(r"\d*(?:>>?|>\||&>>?)", core[i - 1]) or core[i - 1] in values:
+                        continue  # a write target, or the value of an option (a count, a pattern)
+                    if t.startswith("-") and "=" not in t:
+                        continue
+                    if pattern_first and not t.startswith("-"):
+                        pattern_first = False
+                        continue
+                    if "\x01" in t:
+                        return True
+        return False
+
     @staticmethod
     def _runs_piigate(stage: list[str]) -> int | None:
         """Index of `piigate` / `cli.py` when the stage may run it: it is the command word, or the command word is a
@@ -2822,6 +2901,12 @@ class Gate:
                 f"piigate: command denied — {UNVETTABLE}: its text is not a literal, so it cannot be checked for a "
                 "sensitive path built at run time. Write the script from a quoted heredoc (<<'EOF') or run it in "
                 f"a separate command. {HINT}"
+            )
+        if kind == "sensitive" and what == COMPUTED:  # no path is named: the operand's value is not known here
+            return (
+                f"piigate: command denied — {COMPUTED} (`cat $(…)`, `… | xargs cat`): the gate cannot tell which files it "
+                "reads, and a sensitive data directory exists. Name the files literally, or read them through the "
+                f"piigate tools. {HINT}"
             )
         p = _path(what, self.cwd) if kind == "sensitive" else ""
         if p and not _inside(p, self.sensitive) and _ancestor(p, self.sensitive):
