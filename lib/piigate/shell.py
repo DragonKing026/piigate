@@ -21,6 +21,8 @@ import shutil
 import subprocess
 from dataclasses import dataclass, field
 
+DIALECTS = ("bash", "zsh")  # the grammar shfmt is asked for (`-ln`); the agent's Bash tool may run either shell
+DEFAULT_DIALECT = "bash"
 SHFMT_TIMEOUT = 5.0  # seconds; a pathological input must not hang the hook
 MAX_DEPTH = 4  # nesting of `bash -c '…'` / `eval` scripts that is parsed
 MAX_BYTES = 256 * 1024  # larger commands are refused (fail closed) instead of being parsed
@@ -123,13 +125,15 @@ def _shfmt_binary() -> str:
     raise ShfmtMissing("shfmt not found")
 
 
-def ast(command: str) -> dict:
+def ast(command: str, dialect: str = DEFAULT_DIALECT) -> dict:
     """The raw shfmt JSON syntax tree of the command (stdin only, no files, working directory `/`)."""
+    if dialect not in DIALECTS:
+        raise ParseError(f"unknown dialect {dialect!r}")
     if len(command.encode("utf-8", "replace")) > MAX_BYTES:
         raise ParseError("command too long")
     try:
         done = subprocess.run(
-            [_shfmt_binary(), "-ln", "bash", "--to-json"],
+            [_shfmt_binary(), "-ln", dialect, "--to-json"],
             input=command.encode("utf-8", "surrogateescape"),
             capture_output=True,
             timeout=SHFMT_TIMEOUT,
@@ -154,6 +158,27 @@ def ast(command: str) -> dict:
 
 
 # ------------------------------------------------------------------------------------------------ words
+#
+# shfmt writes the JSON of a Go struct with `omitempty`: a field that holds the zero value is NOT in the output. That
+# is how the tree says "empty": `''` is {"Type": "SglQuoted"} without "Value", `""` is a DblQuoted without "Parts", an
+# empty heredoc has no "Hdoc", `a=` has an Assign without "Value". Each access below is one of two kinds:
+#   - a TEXT field (Lit/SglQuoted Value, DblQuoted/Hdoc Parts, Assign Value) — absent means the empty string / list
+#     (`_text`, `.get(..., "")`);
+#   - a STRUCTURE field (Type of a node, Op and Word of a redirection, X/Y/Op of BinaryCmd, Body of a function, Name of
+#     an assignment) — absent means a tree this module does not understand: `_need` raises ParseError (fail closed).
+
+
+def _need(node: dict, key: str):
+    """A structure field: it is always present in a tree this module understands."""
+    try:
+        return node[key]
+    except (KeyError, TypeError) as e:
+        raise ParseError(f"unexpected syntax tree: no {key!r}") from e  # never the node: it holds the command
+
+
+def _text(node: dict, key: str = "Value") -> str:
+    """A text field: absent = empty (`omitempty`)."""
+    return node.get(key) or ""
 
 
 def _unescape(raw: str) -> str:
@@ -221,9 +246,20 @@ def _has_brace(raw: str) -> bool:
     return False
 
 
-def _param_text(p: dict) -> str:
-    name = (p.get("Param") or {}).get("Value", "")
-    return "$" + name if p.get("Short") else "${" + name + "}"
+def _param_text(p: dict, kinds: set[str]) -> str:
+    """`$x`, `${x}`; with an operand (`${x:-Sensitive/a.csv}`, `${x/a/b}`) the operand stays in the text — it is what the
+    shell substitutes, and a path in it must stay visible to the gate. An unquoted operand with a glob is globbed."""
+    name = _text(p.get("Param") or {})
+    if p.get("Short"):
+        return "$" + name
+    inner = name
+    exp, repl = p.get("Exp") or {}, p.get("Repl") or {}
+    for prefix, operand in ((_text(exp, "Op"), exp.get("Word")), ("/", repl.get("Orig")), ("/", repl.get("With"))):
+        if operand is not None:
+            w = _word(operand)
+            kinds |= w.kinds - {"param"}
+            inner += prefix + w.text
+    return "${" + inner + "}"
 
 
 def _find_subst(node):
@@ -247,10 +283,10 @@ def _word(node: dict) -> Word:
     texts: list[str] = []
     kinds: set[str] = set()
     quoting: set[str] = set()
-    for i, p in enumerate(node.get("Parts", [])):
-        t = p["Type"]
+    for i, p in enumerate(node.get("Parts") or []):
+        t = _need(p, "Type")
         if t == "Lit":
-            raw = p["Value"]
+            raw = _text(p)
             quoting.add("none")
             texts.append(_unescape(raw))
             if _has_glob(raw):
@@ -261,12 +297,12 @@ def _word(node: dict) -> Word:
                 kinds.add("tilde")
         elif t == "SglQuoted":
             quoting.add("single")
-            texts.append(_ansi_c(p["Value"]) if p.get("Dollar") else p["Value"])
+            texts.append(_ansi_c(_text(p)) if p.get("Dollar") else _text(p))
         elif t == "DblQuoted":
             quoting.add("double")
-            for q in p.get("Parts", []):
-                if q["Type"] == "Lit":
-                    texts.append(_unescape_dq(q["Value"]))
+            for q in p.get("Parts") or []:
+                if _need(q, "Type") == "Lit":
+                    texts.append(_unescape_dq(_text(q)))
                 else:
                     texts.append(_expansion_text(q, kinds))
         else:
@@ -281,10 +317,10 @@ def _word(node: dict) -> Word:
 
 
 def _expansion_text(p: dict, kinds: set[str]) -> str:
-    t = p["Type"]
+    t = _need(p, "Type")
     if t == "ParamExp":
         kinds.add("param")
-        return _param_text(p)
+        return _param_text(p, kinds)
     if t == "CmdSubst":
         kinds.add("cmd")
         return "$(…)"
@@ -296,33 +332,33 @@ def _expansion_text(p: dict, kinds: set[str]) -> str:
         return p.get("Op", "<(") + "…)"
     if t == "ExtGlob":
         kinds.add("extglob")
-        return (p.get("Op") or "") + (p.get("Pattern") or {}).get("Value", "") + ")"
+        return _text(p, "Op") + _text(p.get("Pattern") or {}) + ")"
     raise ParseError(f"unsupported word part {t}")
 
 
 def _heredoc(redir: dict) -> Heredoc:
-    delim_node = redir["Word"]
-    quoted = any(p["Type"] != "Lit" or "\\" in p["Value"] for p in delim_node["Parts"])
+    delim_node = _need(redir, "Word")
+    quoted = any(_need(p, "Type") != "Lit" or "\\" in _text(p) for p in _need(delim_node, "Parts"))
     delimiter = _word(delim_node).text
     pieces: list[str] = []
     kinds: set[str] = set()
-    for p in (redir.get("Hdoc") or {}).get("Parts", []):
-        if p["Type"] == "Lit":
-            pieces.append(p["Value"] if quoted else re.sub(r"\\([$`\\])", r"\1", p["Value"]))
+    for p in (redir.get("Hdoc") or {}).get("Parts") or []:  # no "Hdoc" / "Parts": an empty body
+        if _need(p, "Type") == "Lit":
+            pieces.append(_text(p) if quoted else re.sub(r"\\([$`\\])", r"\1", _text(p)))
         else:
             pieces.append(_expansion_text(p, kinds))
     body = "".join(pieces)
-    if redir["Op"] == "<<-":
+    if _need(redir, "Op") == "<<-":
         body = re.sub(r"(?m)^\t+", "", body)
     return Heredoc(body, delimiter, quoted)
 
 
 def _redirect(r: dict, inherited: bool = False) -> Redirect:
-    op = r["Op"]
-    fd = (r.get("N") or {}).get("Value")
+    op = _need(r, "Op")
+    fd = _text(r.get("N") or {}) or None
     if op in ("<<", "<<-"):
         return Redirect(op, None, _heredoc(r), fd, inherited)
-    return Redirect(op, _word(r["Word"]), None, fd, inherited)
+    return Redirect(op, _word(_need(r, "Word")), None, fd, inherited)
 
 
 # ------------------------------------------------------------------------------------------------ walking
@@ -409,7 +445,8 @@ def _stdin_interpreter(argv: list[Word]) -> str:
 
 
 class _Walker:
-    def __init__(self, session_cwd: str, depth: int = 0):
+    def __init__(self, session_cwd: str, depth: int = 0, dialect: str = DEFAULT_DIALECT):
+        self.dialect = dialect
         self.session = os.path.normpath(session_cwd)
         self.calls: list[Call] = []
         self.dry = 0
@@ -424,7 +461,7 @@ class _Walker:
     # -- substitutions found in some JSON (words, redirects, heredocs…)
     def substs(self, node, st: _State, parent: Call | None) -> None:
         for s in _find_subst(node):
-            origin = "`" if s.get("Backquotes") else {"CmdSubst": "$(", "ProcSubst": s.get("Op", "<(")}[s["Type"]]
+            origin = "`" if s.get("Backquotes") else {"CmdSubst": "$(", "ProcSubst": s.get("Op", "<(")}[_need(s, "Type")]
             before = len(self.calls)
             self.stmts(s.get("Stmts") or [], _State(st.sure, st.seen, st.known), True, (), origin)
             if parent is not None:
@@ -448,7 +485,7 @@ class _Walker:
         return self.cmd(s.get("Cmd"), st, sub, redirs, origin, s, own)
 
     def cmd(self, c, st, sub, redirs, origin, stmt, own) -> _State:
-        t = c["Type"] if c else None
+        t = _need(c, "Type") if c else None
         inherited = tuple(Redirect(r.op, r.target, r.heredoc, r.fd, True) for r in redirs)
         if t is None:  # `> file`, `<<EOF` with no command
             call = self.emit(Call([], list(redirs), st.sure, sub, origin=origin, cwd_known=st.known))
@@ -492,7 +529,7 @@ class _Walker:
             return _join(outs)
         if t == "FuncDecl":
             wide = frozenset({*st.seen, self.session})
-            self.stmt(c["Body"], _State(wide, wide, False), sub, inherited, "function")
+            self.stmt(_need(c, "Body"), _State(wide, wide, False), sub, inherited, "function")
             return st
         if t == "TimeClause" or t == "CoprocClause":
             if c.get("Stmt"):
@@ -524,14 +561,14 @@ class _Walker:
         return _State(st.sure | again.sure, again.seen, again.known)
 
     def binary(self, c, st, sub, redirs, origin) -> _State:
-        op = c["Op"]
+        op = _need(c, "Op")
         if op in ("|", "|&"):
             return self.pipeline(c, st, sub, redirs, origin)
-        x = self.stmt(c["X"], st, sub, redirs, origin)
+        x = self.stmt(_need(c, "X"), st, sub, redirs, origin)
         if op == "&&":
-            return self.stmt(c["Y"], _State(x.sure, x.seen, x.known), sub, redirs, origin)
+            return self.stmt(_need(c, "Y"), _State(x.sure, x.seen, x.known), sub, redirs, origin)
         # `||`: the right side runs where the left one failed - anywhere the left side went
-        y = self.stmt(c["Y"], _State(x.seen, x.seen, x.known), sub, redirs, origin)
+        y = self.stmt(_need(c, "Y"), _State(x.seen, x.seen, x.known), sub, redirs, origin)
         return _State(x.sure | y.sure, y.seen, x.known and y.known)
 
     def pipeline(self, c, st, sub, redirs, origin) -> _State:
@@ -539,9 +576,9 @@ class _Walker:
 
         def flatten(n):
             cmd = n.get("Cmd")
-            if cmd and cmd["Type"] == "BinaryCmd" and cmd["Op"] in ("|", "|&") and not n.get("Redirs"):
-                flatten(cmd["X"])
-                flatten(cmd["Y"])
+            if cmd and cmd.get("Type") == "BinaryCmd" and _need(cmd, "Op") in ("|", "|&") and not n.get("Redirs"):
+                flatten(_need(cmd, "X"))
+                flatten(_need(cmd, "Y"))
             else:
                 stages.append(n)
 
@@ -575,20 +612,20 @@ class _Walker:
         return self.after_call(call, st)
 
     def assign(self, a: dict) -> Assign:
-        array = tuple(_word(e["Value"]) for e in (a.get("Array") or {}).get("Elems", []) if e.get("Value"))
-        value = _word(a["Value"]) if a.get("Value") else None
-        return Assign((a.get("Name") or {}).get("Value", ""), value, array, bool(a.get("Append")))
+        array = tuple(_word(e["Value"]) for e in (a.get("Array") or {}).get("Elems") or [] if e.get("Value"))
+        value = _word(a["Value"]) if a.get("Value") else None  # `a=` has no "Value": the empty string
+        return Assign(_text(_need(a, "Name")), value, array, bool(a.get("Append")))
 
     def builtin_like(self, c, t, st, sub, redirs, origin, stmt) -> _State:
         words: list[Word] = []
         if t == "DeclClause":
-            words.append(Word((c.get("Variant") or {}).get("Value", "declare"), "none", False))
+            words.append(Word(_text(c.get("Variant") or {}) or "declare", "none", False))
             for a in c.get("Args") or []:
                 if a.get("Name") and (a.get("Value") or a.get("Array")):
                     v = _word(a["Value"]) if a.get("Value") else Word("(…)", "none", False)
-                    words.append(Word(a["Name"]["Value"] + "=" + v.text, v.quoting, v.expands, v.kinds))
+                    words.append(Word(_text(a["Name"]) + "=" + v.text, v.quoting, v.expands, v.kinds))
                 elif a.get("Name"):
-                    words.append(Word(a["Name"]["Value"], "none", False))
+                    words.append(Word(_text(a["Name"]), "none", False))
                 elif a.get("Value"):
                     words.append(_word(a["Value"]))
         else:
@@ -613,9 +650,9 @@ class _Walker:
         if self.depth >= MAX_DEPTH:
             raise ParseError("scripts nested too deeply")
         text = " ".join(w.text for w in words)
-        inner = _Walker(self.session, self.depth + 1)
+        inner = _Walker(self.session, self.depth + 1, self.dialect)
         inner.dry = self.dry
-        inner.stmts(ast(text).get("Stmts") or [], _State(st.sure, st.seen, st.known), True, (), origin)
+        inner.stmts(ast(text, self.dialect).get("Stmts") or [], _State(st.sure, st.seen, st.known), True, (), origin)
         call.substitutions.extend(_toplevel(inner.calls))
         if not self.dry:
             self.calls.extend(inner.calls)
@@ -693,15 +730,16 @@ def _find_words(node) -> list[dict]:
     return found
 
 
-def parse(command: str, *, cwd: str) -> list[Call]:
+def parse(command: str, *, cwd: str, dialect: str = DEFAULT_DIALECT) -> list[Call]:
     """Every simple command in the line (also nested ones), in source order, parents before their substitutions.
 
     Raises ParseError when the line cannot be parsed with certainty. Nothing else escapes: a tree shape this module did
-    not expect, or nesting deeper than the Python stack, is a ParseError too (the caller denies on it)."""
-    walker = _Walker(cwd)
+    not expect, or nesting deeper than the Python stack, is a ParseError too (the caller denies on it).
+    `dialect` is the grammar shfmt reads (`bash` | `zsh`); scripts nested in `-c` / `eval` are read in the same one."""
+    walker = _Walker(cwd, dialect=dialect)
     start = frozenset({walker.session})
     try:
-        walker.stmts(ast(command).get("Stmts") or [], _State(start, start), False, (), "top")
+        walker.stmts(ast(command, dialect).get("Stmts") or [], _State(start, start), False, (), "top")
     except ParseError:
         raise
     except (RecursionError, KeyError, TypeError, ValueError, IndexError, AttributeError) as e:

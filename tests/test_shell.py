@@ -477,6 +477,110 @@ class TestFailClosed(Base):
         self.assertEqual(parse("# nothing"), [])
 
 
+class TestEmptyFields(Base):
+    """shfmt omits the zero value of a field (`omitempty`): an empty `''` has no "Value". That is an empty word, not a
+    broken tree — and a tree that really lacks a structure field is a ParseError, never a KeyError."""
+
+    def test_empty_single_quotes_next_to_text(self):
+        (call,) = parse("jq -n ''Sens*/*.json")  # the case that crashed with KeyError: 'Value'
+        self.assertEqual(texts(call), ["jq", "-n", "Sens*/*.json"])
+        self.assertIn("glob", call.argv[2].kinds)
+
+    def test_empty_words_as_arguments(self):
+        for command, shape in (
+            ("cat ''", ["cat", ""]),
+            ('cat ""', ["cat", ""]),
+            ("cat $''", ["cat", ""]),
+            ('cat $""', ["cat", ""]),
+            ("cat '' ''", ["cat", "", ""]),
+            ("cat ''x''", ["cat", "x"]),
+        ):
+            with self.subTest(command):
+                (call,) = parse(command)
+                self.assertEqual(texts(call), shape)
+                self.assertTrue(all(w.static for w in call.argv))
+
+    def test_empty_word_is_still_quoted(self):
+        (call,) = parse("cat ''")
+        self.assertEqual(call.argv[1].quoting, "single")
+        (call,) = parse('cat ""')
+        self.assertEqual(call.argv[1].quoting, "double")
+
+    def test_empty_heredoc(self):
+        (call,) = parse("cat <<EOF\nEOF")
+        self.assertEqual(heredoc(call), shell.Heredoc("", "EOF", False))
+        (call,) = parse("python3 - <<'EOF'\nEOF")
+        self.assertEqual(heredoc(call), shell.Heredoc("", "EOF", True))
+        (call,) = parse("cat <<-EOF\n\tEOF")
+        self.assertEqual(heredoc(call).body, "")
+
+    def test_empty_redirect_target_and_assignment(self):
+        (call,) = parse("cat x > ''")
+        self.assertEqual(call.redirects[0].target.text, "")
+        (a, b) = parse("a=; b= cmd")
+        self.assertEqual(a.assigns[0].value, None)
+        self.assertEqual(b.assigns[0].name, "b")
+        self.assertEqual(texts(b), ["cmd"])
+        (call,) = parse("a='' cmd")
+        self.assertEqual(call.assigns[0].value.text, "")
+
+    def test_empty_substitution_and_expansion(self):
+        (call,) = parse('echo "$()" ${x:-} "${x}"')
+        self.assertEqual(texts(call)[0], "echo")
+        (call,) = parse("echo ``")
+        self.assertEqual(texts(call), ["echo", "$(…)"])
+
+    def test_empty_pieces_in_every_position(self):
+        for command in (
+            "''", '""', "'' ''", "'' | cat", "echo '' && cat ''", "( '' )", "{ ''; }", "for f in ''; do cat ''; done",
+            "case '' in '') cat '';; esac", "f() { cat ''; }", "[[ '' == '' ]]", "echo $(cat '')", "x='' ; y=\"\"",
+            "cat <<''\nx\n\n", "cat <<\"\"\n\n",
+        ):
+            with self.subTest(command):
+                parse(command)
+
+    def test_missing_structure_field_is_a_parse_error(self):
+        """A tree without a required field is refused (fail closed), not crashed on."""
+        with self.assertRaises(shell.ParseError):
+            shell._word({"Parts": [{"Value": "x"}]})  # a part without its Type
+        with self.assertRaises(shell.ParseError):
+            shell._redirect({"Word": {"Parts": []}})  # a redirection without its Op
+        with self.assertRaises(shell.ParseError):
+            shell._redirect({"Op": ">"})  # a redirection without a target
+        with self.assertRaises(shell.ParseError):
+            shell._need({}, "Body")
+
+    def test_parameter_operand_stays_visible(self):
+        """`${x:-Sensitive/a.csv}`: the default is what the shell substitutes — its path must reach the gate."""
+        (call,) = parse("cat ${x:-Sensitive-data/a.csv}")
+        self.assertIn("Sensitive-data/a.csv", call.argv[1].text)
+        (call,) = parse("cat ${x:-*.csv}")
+        self.assertIn("glob", call.argv[1].kinds)
+        (call,) = parse("echo ${x/a/b}")
+        self.assertEqual(call.argv[1].text, "${x/a/b}")
+
+
+class TestDialect(Base):
+    def test_default_is_bash_and_unknown_is_refused(self):
+        with self.assertRaises(shell.ParseError):
+            shell.parse("cat x", cwd=CWD, dialect="fish")
+
+    def test_the_same_line_in_both_dialects(self):
+        for dialect in shell.DIALECTS:
+            (call,) = shell.parse("cat 'a b'", cwd=CWD, dialect=dialect)
+            self.assertEqual(texts(call), ["cat", "a b"])
+
+    def test_zsh_only_syntax(self):
+        with self.assertRaises(shell.ParseError):
+            shell.parse("cat =(cat s.csv)", cwd=CWD)  # bash: a syntax error
+        calls = shell.parse("cat =(cat s.csv)", cwd=CWD, dialect="zsh")
+        self.assertEqual([c.name for c in calls], ["cat", "cat"])
+
+    def test_nested_script_uses_the_dialect(self):
+        calls = shell.parse("bash -c 'cat =(cat s.csv)'", cwd=CWD, dialect="zsh")
+        self.assertEqual([c.name for c in calls], ["bash", "cat", "cat"])
+
+
 class TestCorpus(Base):
     def test_every_command_of_the_gate_tests_parses(self):
         import shell_corpus
@@ -486,6 +590,13 @@ class TestCorpus(Base):
         for case in cases:
             with self.subTest(command=case.command[:60], test=case.test):
                 shell.parse(case.command, cwd=CWD)
+
+    def test_the_corpus_has_no_refusal_left(self):
+        import shell_corpus
+
+        cases = shell_corpus.extract()
+        measured = shell_corpus.measure(cases)
+        self.assertEqual(measured["parsed"], measured["total"], measured["failed"])
 
 
 if __name__ == "__main__":
