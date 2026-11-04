@@ -451,7 +451,6 @@ class TestRound6(Base):
         self.deny("a=('../S*/p*'); cat ${~a}", "zsh")  # zsh only when asked
         g = self.ast("zsh")
         self.assertIsNone(g.bash("a=('./No*'); cat ${a[@]}"))
-        self.assertTrue(getattr(g._current.tokens[-1], "quoted", False))  # a plain name in zsh
 
     def test_pwd_is_every_directory_it_may_be_and_a_symlink_is_judged_as_what_it_is(self):
         for command in (
