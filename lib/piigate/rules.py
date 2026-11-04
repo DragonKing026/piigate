@@ -299,14 +299,22 @@ ACRONYM_TAIL = re.compile(rf"[{UPPER}]+(?![{LOWER}])")
 _TLD_RE = re.compile(r"[^\W\d_]{2,}|xn--[A-Za-z0-9-]+")
 
 
+# a version written as a domain: `1.2.3`, `v7.13.1`, `1.2.3-next.4`, `1.2.3.beta`, `1.0.0-rc.1` — the whole domain, so
+# that `1.2.pl` is not one
+_VERSION_DOMAIN_RE = re.compile(
+    r"v?\d+(?:\.\d+)+(?:[-.](?:alpha|beta|rc|next|dev|pre|canary|snapshot|final)(?:[.-]?\d+)*)?", re.IGNORECASE
+)
+
+
 def email_valid(address: str) -> bool:
-    """Whether what follows the last `@` can be a domain: the last label (TLD) is made of letters, and it is not a
-    version (`pkg@1.2.3`, `module/v7@v7.13.1`, `pkg@1.2.3-next.4`, `pkg@1.2.3.beta`)."""
-    labels = address.rsplit("@", 1)[-1].strip(".").split(".")
+    """Whether what follows the last `@` can be a domain: the last label (TLD) is made of letters, and the whole of it
+    is not a version (`pkg@1.2.3`, `module/v7@v7.13.1`, `pkg@1.2.3-next.4`, `pkg@1.2.3.beta`); `jan@1.2.pl` is an
+    address."""
+    domain = address.rsplit("@", 1)[-1].strip(".")
+    labels = domain.split(".")
     if len(labels) < 2 or not _TLD_RE.fullmatch(labels[-1]):
         return False
-    numeric = [s for s in labels[:-1] if re.fullmatch(r"v?\d+", s)]
-    return not (len(labels) > 2 and len(numeric) == len(labels) - 1)
+    return not _VERSION_DOMAIN_RE.fullmatch(domain)
 
 
 # ISO 8601 / RFC 3339 timestamps (2026-11-02T20:11:01Z, 2026-11-02 20:11:01+01:00): a technical value (release time,

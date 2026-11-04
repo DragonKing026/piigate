@@ -4659,6 +4659,12 @@ class TestEmailVersions(unittest.TestCase):
         "eslint-plugin-lit-a11y@5.1.3",
         "nazwa@wersja",
         "pkg@1.2.3.beta",
+        "pkg@1.2.3-rc.1",
+        "pkg@v1.0.0-canary.3",
+        "pkg@2.0.0.final",
+        "pkg@1.2.beta",
+        "pkg@1.0.0-snapshot",
+        "pkg@1.0.0-pre.2",
     )
     ADDRESSES = (
         "jan.kowalski@firma.pl",
@@ -4667,6 +4673,10 @@ class TestEmailVersions(unittest.TestCase):
         "biuro@163.com",  # a numeric label next to a TLD is a real provider
         "jan+tag@mail.firma.com.pl",
         "ola@xn--e1afmkfd.xn--p1ai",
+        "jan@1.2.pl",  # numeric labels in front of a TLD are not a version (#24 review)
+        "jan@10.20.30.pl",
+        "jan@1.2.3.com",
+        "jan@v1.2.pl",
     )
 
     def test_rules_do_not_take_versions_for_addresses(self):
