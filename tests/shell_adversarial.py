@@ -451,13 +451,9 @@ KNOWN: dict[str, str] = {
     "is parsed apart and does not see it (the text stays `${USER}`). README: NOT covered",
     "shell-variable-file": "`$SHELL ./hook`: the program is a FILE written earlier (D5). README: covered (\"a script run by a later call\")",
     "shell-variable-stdin-file": "`$SHELL < hook`: the program is read from a file written earlier (D5). README: covered",
-    "script-printf-then-run": "D5: the script is written with `printf > w1.sh` and run: the gate reads the written text as words and the exact name, but the glob "
-    "inside the text is not a path it can match. README: covered (\"a script written earlier\")",
     "script-tee-then-run": "D5: written with `tee`, then run; same as `script-printf-then-run`. README: covered",
     "script-cp-then-run": "D5: written, COPIED (`cp`) to another name, then run: the name that runs is not the name that was written. README: NOT spelled out",
     "script-symlink-then-run": "D5: a symlink to a script written earlier (`ln -s`). README: covered (\"a script run by a later call\")",
-    "script-exact-name-glob-inside": "D5: the script is written to the exact name `w6.sh` and run by it, but its text names the path only as a glob "
-    "(`../S*/p*`) that is inside a quoted string: the text is judged as words, not run. README: covered (\"assembled at run time\")",
     "script-written-then-run-by-pattern": "D5: the script is written to s1.sh in the line and run as `s?.sh` (a pattern in the name). The gate matches a "
     "written file by its EXACT name; but the exact name is no safer when the text only holds a glob (`script-exact-name-glob-inside`), and the "
     "text may be written by `printf`, `tee`, `cp`, `ln -s` (see the `script-*` cases). README: covered (\"a script written earlier\", "

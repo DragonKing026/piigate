@@ -592,7 +592,12 @@ class TestWordValuesAgainstARealShell(Base):
                 g = self.ast(dialect)
                 g.bash(self.PREFIX + "cat " + word)
                 tokens = g._current.tokens if g._current else []
-                words = tokens[tokens.index("cat") + 1 :] if "cat" in tokens else []
+                words = []
+                if "cat" in tokens:  # the words of `cat WORD`: up to the next separator (the assignments' words follow as stages)
+                    for t in tokens[tokens.index("cat") + 1 :]:
+                        if str(t) in (";", "|", "&"):
+                            break
+                        words.append(t)
                 if any("$" in str(t) for t in words):
                     continue  # not resolved (bash splits `x$y`): the text stays as written, never a wrong value
                 made = "".join(f"[{t}]" for t in words) or "[]"  # printf with no argument prints one empty field
