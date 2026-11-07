@@ -320,6 +320,11 @@ through the full text filter.
   A path or code put together while the command runs is not followed: a value read, computed or assigned more than once
   (`read`, a command substitution, `export`/`declare`, a branch, a second assignment), and code held in the value of a
   variable that the shell later expands as a pattern or runs.
+  Data moved or linked by an earlier command is not followed either. Moving or copying a directory that holds a
+  sensitive directory (`mv`, `cp -r`, `git worktree move`, also under `node_modules` or `.git`) and making a symlink to it
+  (`ln -s ..`) pass; a later recursive read from the new place (`grep -r`, `grep -R`, `tar ch`, `cp -rL`, `rsync -aL`)
+  is checked only by the directory walk of [Using it](#using-it), which follows no symlinks, skips `.git` and
+  `node_modules` and stops after three levels.
   The gate is a seat belt against mistakes and shortcuts, not a sandbox.
 - **The syntax-tree front-end (shadow mode only, not the gate).** A second Bash front-end, built on the syntax tree of the
   bundled `shfmt`, judges commands next to the gate in [shadow mode](#shadow-mode); it decides nothing. It reads the
