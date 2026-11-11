@@ -31,7 +31,7 @@ try:
 except shell.ParseError:
     AVAILABLE = False
 
-SCHEMA_DAY_KEYS = set(shadow.CATEGORIES) | {"causes", "reasons", "ms"}
+SCHEMA_DAY_KEYS = set(shadow.CATEGORIES) | {"causes", "reasons", "parse_kinds", "ms"}
 
 
 @unittest.skipUnless(AVAILABLE, "no pinned shfmt for this platform")
@@ -87,6 +87,55 @@ class TestShadow(unittest.TestCase):
         self.assertEqual(c["old-deny-new-allow"], 1)
         day = next(iter(shadow.read()["days"].values()))
         self.assertEqual(day["causes"], {"subshell-cd": 1})
+
+    def day(self) -> dict:
+        return next(iter(shadow.read()["days"].values()))
+
+    def test_parse_error_kinds_and_reasons_are_counted_and_reported(self):
+        unique = "Qzxv9817uniq"
+        for command in (f'echo "{unique}', f"echo {unique} 'x", "cat ../Sensitive-data/people.csv", "(cd ../Sensitive-data); cat people.csv", "cat '>' notes.md"):
+            self.watch(command)
+        day = self.day()
+        self.assertEqual(day["parse_kinds"], {"syntax-error:zsh": 2})  # $SHELL is zsh here: one dialect
+        self.assertEqual(day["reasons"]["old-deny-new-allow"], {"sensitive-dir": 1})
+        report = shadow.report()
+        self.assertIn("kinds of parse-error: {'syntax-error:zsh': 2}", report)
+        self.assertIn("reasons of the old gate in old-deny-new-allow: {'sensitive-dir': 1}", report)
+        self.assertIn("reasons of the new gate in old-allow-new-deny:", report)
+        self.assertNotIn(unique, Path(shadow.path()).read_text(encoding="utf-8") + report)
+
+    def test_kind_labels_are_fixed_and_never_from_the_text(self):
+        label = shell._kind_label
+        self.assertEqual(shell.ParseError("syntax error: Qzxv at 1:2", "syntax-error", "bash").kind, "syntax-error:bash")
+        self.assertEqual(label("syntax-error", "Qzxv"), "syntax-error:other")
+        self.assertEqual(label("unsupported-word-part", "ParamExp"), "unsupported-word-part:ParamExp")
+        self.assertEqual(label("unsupported-word-part", "Qzxv"), "unsupported-word-part:other")
+        self.assertEqual(label("unsupported-command-type", "CoprocClause"), "unsupported-command-type:CoprocClause")
+        self.assertEqual(label("too-long", "bash"), "too-long")  # a suffix only where the kind has a list
+        self.assertEqual(label("Qzxv"), "other")
+        self.assertEqual(shell.ParseError("x").kind, "other")
+        self.assertEqual(shell.ShfmtMissing("x").kind, "shfmt-missing")
+        for name in ("syntax-error:bash", "syntax-error:zsh", "unsupported-command-type:other", "unsupported-word-part:BraceExp"):
+            self.assertIn(name, shadow.parse_labels())
+        for kind in shell.PARSE_KINDS:
+            self.assertIn(kind, shadow.parse_labels())
+
+    def test_other_parse_kinds_end_to_end(self):
+        self.watch("ls " + "a" * (shell.MAX_BYTES + 1))
+        with mock.patch.object(shell, "SHFMT_TIMEOUT", 0.001), mock.patch.object(shell, "_run_shfmt", side_effect=shell.subprocess.TimeoutExpired("shfmt", 1)):
+            self.watch("ls")
+        self.assertEqual(self.day()["parse_kinds"], {"too-long": 1, "shfmt-timeout": 1})
+
+    def test_old_file_without_the_new_fields_and_unknown_keys(self):
+        old = {"version": 1, "days": {"2026-11-01": {"same-allow": 3, "causes": {}, "reasons": {}, "ms": {"<=5": 3}}}}
+        Path(shadow.path()).parent.mkdir(parents=True, exist_ok=True)
+        Path(shadow.path()).write_text(json.dumps(old), encoding="utf-8")
+        self.assertEqual(shadow.read()["days"]["2026-11-01"]["parse_kinds"], {})
+        self.assertIn("kinds of parse-error: —", shadow.report())
+        evil = {"version": 1, "days": {"2026-11-01": {"parse_kinds": {"syntax-error:bash": 2, "cat secret.csv": 5, "too-long": -1, "other": "x", "walk-error": True}}}}
+        Path(shadow.path()).write_text(json.dumps(evil), encoding="utf-8")
+        self.assertEqual(shadow.read()["days"]["2026-11-01"]["parse_kinds"], {"syntax-error:bash": 2})
+        self.assertNotIn("secret", shadow.report())
 
     def test_the_file_holds_numbers_only(self):
         """A command with a (synthetic) PESEL and a surname: not one fragment of it in the file; the keys are fixed."""

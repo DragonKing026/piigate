@@ -40,6 +40,31 @@ REASON_LABELS = (
     "sensitive-dir", "filter-files", "unfiltered-tool", "data-file", "ssh-query", "mcp-piigate", "marker-dir", "human-only",
     "cannot-parse", "code-the-tree-cannot-read", "zsh-syntax", "other",
 )
+# the kind of a parse-error (`shell.PARSE_KINDS`; `syntax-error:<dialect>`, `unsupported-…:<shfmt node type>` or `:other`)
+_PARSE_LABELS: tuple | None = None
+
+
+def parse_labels() -> tuple:
+    """The allowed labels, built on first use: this module must not import the syntax-tree front-end at load time (the hook
+    imports this module for every Bash command; the front-end is imported only in the forked child)."""
+    global _PARSE_LABELS
+    if _PARSE_LABELS is None:
+        from . import shell
+
+        _PARSE_LABELS = tuple(
+            dict.fromkeys(
+                [
+                    *shell.PARSE_KINDS,
+                    *(f"syntax-error:{d}" for d in shell.DIALECTS),
+                    *(f"unsupported-word-part:{t}" for t in (*shell.WORD_PART_TYPES, "other")),
+                    *(f"unsupported-command-type:{t}" for t in (*shell.COMMAND_TYPES, "other")),
+                    "syntax-error:other",
+                ]
+            )
+        )
+    return _PARSE_LABELS
+
+
 MS_BUCKETS = ("<=5", "<=10", "<=25", "<=50", "<=100", "<=250", "<=500", ">500")
 
 
@@ -80,7 +105,7 @@ def path() -> str:
 
 
 def _empty_day() -> dict:
-    return {**dict.fromkeys(CATEGORIES, 0), "causes": {}, "reasons": {}, "ms": {}}
+    return {**dict.fromkeys(CATEGORIES, 0), "causes": {}, "reasons": {}, "parse_kinds": {}, "ms": {}}
 
 
 def _counts(value, allowed) -> dict:
@@ -102,6 +127,7 @@ def clean(loaded) -> dict:
             day.update(_counts(d, CATEGORIES))
             day["causes"] = _counts(d.get("causes"), CAUSES)
             day["ms"] = _counts(d.get("ms"), MS_BUCKETS)
+            day["parse_kinds"] = _counts(d.get("parse_kinds"), parse_labels())
             reasons = d.get("reasons")
             if isinstance(reasons, dict):
                 day["reasons"] = {
@@ -170,7 +196,7 @@ def _update(change) -> bool:
         os.close(fd)
 
 
-def _bump(day: dict, category: str, ms: float | None = None, cause: str | None = None, old: str | None = None, new: str | None = None) -> None:
+def _bump(day: dict, category: str, ms: float | None = None, cause: str | None = None, old: str | None = None, new: str | None = None, kind: str | None = None) -> None:
     day[category] = day.get(category, 0) + 1
     if ms is not None:
         b = day.setdefault("ms", {})
@@ -178,15 +204,21 @@ def _bump(day: dict, category: str, ms: float | None = None, cause: str | None =
     if cause:
         c = day.setdefault("causes", {})
         c[cause] = c.get(cause, 0) + 1
+    if kind and category == "parse-error":
+        k = day.setdefault("parse_kinds", {})
+        k[kind] = k.get(kind, 0) + 1
     label = old if category == "old-deny-new-allow" else new if category == "old-allow-new-deny" else None
     if label:
         r = day.setdefault("reasons", {}).setdefault(category, {})
         r[label] = r.get(label, 0) + 1
 
 
-def record(category: str, ms: float | None = None, cause: str | None = None, old: str | None = None, new: str | None = None) -> bool:
+def record(
+    category: str, ms: float | None = None, cause: str | None = None, old: str | None = None, new: str | None = None,
+    kind: str | None = None,
+) -> bool:
     today = time.strftime("%Y-%m-%d")
-    return _update(lambda data: _bump(data["days"].setdefault(today, _empty_day()), category, ms, cause, old, new))
+    return _update(lambda data: _bump(data["days"].setdefault(today, _empty_day()), category, ms, cause, old, new, kind))
 
 
 def classify_cause(cfg: dict, cwd: str, command: str, files: bool, dialect: str | None = None) -> str:
@@ -204,8 +236,8 @@ def classify_cause(cfg: dict, cwd: str, command: str, files: bool, dialect: str 
     return "other"
 
 
-def judge(cfg: dict, cwd: str, command: str, files: bool, old_reason: str | None) -> tuple[str, float, str | None, str | None, str | None]:
-    """(category, ms, cause, old label, new label) of one command — the work of the child."""
+def judge(cfg: dict, cwd: str, command: str, files: bool, old_reason: str | None) -> tuple[str, float, str | None, str | None, str | None, str | None]:
+    """(category, ms, cause, old label, new label, parse kind) of one command — the work of the child."""
     from . import shell, shell_gate
 
     shell.SHFMT_TIMEOUT = SHFMT_TIMEOUT_S
@@ -214,16 +246,17 @@ def judge(cfg: dict, cwd: str, command: str, files: bool, old_reason: str | None
     new_reason = gate.bash(command, files)
     ms = (time.perf_counter() - start) * 1000
     if gate.internal_error:
-        return "shadow-error", ms, None, None, None
+        return "shadow-error", ms, None, None, None, None
     if gate.parse_error:
-        return "parse-error", ms, None, None, None
+        kind = gate.parse_kind if gate.parse_kind in parse_labels() else "other"  # a fixed label, whatever the gate holds
+        return "parse-error", ms, None, None, None, kind
     if old_reason is None and new_reason is None:
-        return "same-allow", ms, None, None, None
+        return "same-allow", ms, None, None, None, None
     if old_reason is not None and new_reason is not None:
-        return "same-deny", ms, None, None, None
+        return "same-deny", ms, None, None, None, None
     if old_reason is not None:
-        return "old-deny-new-allow", ms, classify_cause(cfg, cwd, command, files), _label(old_reason), None
-    return "old-allow-new-deny", ms, None, None, _label(new_reason)
+        return "old-deny-new-allow", ms, classify_cause(cfg, cwd, command, files), _label(old_reason), None, None
+    return "old-allow-new-deny", ms, None, None, _label(new_reason), None
 
 
 def _drop_tmp() -> None:
@@ -269,8 +302,8 @@ def _child(cfg: dict, cwd: str, command: str, files: bool, old_reason: str | Non
     signal.signal(signal.SIGALRM, too_slow)
     signal.setitimer(signal.ITIMER_REAL, BUDGET_S)
     try:
-        category, ms, cause, old, new = judge(cfg, cwd, command, files, old_reason)
-        record(category, ms, cause, old, new)
+        category, ms, cause, old, new, kind = judge(cfg, cwd, command, files, old_reason)
+        record(category, ms, cause, old, new, kind)
     except Exception:  # noqa: BLE001 — the shadow must never matter; it only counts that it failed
         try:
             record("shadow-error")
@@ -317,6 +350,10 @@ def read() -> dict:
         return clean(None)
 
 
+def _sorted(counts: dict) -> dict | str:
+    return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))) or "—"
+
+
 def report() -> str:
     """The numbers, as text: totals and the last days — nothing else exists in the file."""
     data = read()
@@ -326,16 +363,26 @@ def report() -> str:
     total = dict.fromkeys(CATEGORIES, 0)
     causes: dict[str, int] = {}
     ms: dict[str, int] = {}
+    reasons: dict[str, dict[str, int]] = {"old-deny-new-allow": {}, "old-allow-new-deny": {}}
+    kinds: dict[str, int] = {}
     for d in days.values():
         for c in CATEGORIES:
             total[c] += int(d.get(c, 0))
         for k, v in (d.get("causes") or {}).items():
             causes[k] = causes.get(k, 0) + int(v)
+        for cat, labels in (d.get("reasons") or {}).items():
+            for k, v in labels.items():
+                reasons[cat][k] = reasons[cat].get(k, 0) + int(v)
+        for k, v in (d.get("parse_kinds") or {}).items():
+            kinds[k] = kinds.get(k, 0) + int(v)
         for k, v in (d.get("ms") or {}).items():
             ms[k] = ms.get(k, 0) + int(v)
     lines = [f"shadow: {len(days)} day(s), {min(days)} … {max(days)}"]
     lines += [f"  {c:20} {total[c]}" for c in CATEGORIES]
     lines.append(f"  causes of old-deny-new-allow: {causes or '—'}")
+    lines.append(f"  reasons of the old gate in old-deny-new-allow: {_sorted(reasons['old-deny-new-allow'])}")
+    lines.append(f"  reasons of the new gate in old-allow-new-deny: {_sorted(reasons['old-allow-new-deny'])}")
+    lines.append(f"  kinds of parse-error: {_sorted(kinds)}")
     lines.append(f"  time (ms) histogram: {dict(sorted(ms.items()))}")
     return "\n".join(lines)
 

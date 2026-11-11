@@ -359,12 +359,13 @@ at most 60 days, a few KB, in a directory created with mode 0700; a busy lock or
   `shadow-error`, `shadow-timeout`;
 - for `old-deny-new-allow`, the cause as a fixed code (`subshell-cd`, `pipeline-cd`, `absolute-cd`, `known-value-resolution`, `other`);
 - for the two disagreement counts, the old (or new) reason as one of a dozen fixed labels (`sensitive-dir`, `human-only`, …);
+- for `parse-error`, the kind of the error as a fixed label (`syntax-error:bash`, `syntax-error:zsh`, `too-long`, `shfmt-timeout`, `unsupported-word-part:<shfmt node type>`, …; a node type only from a closed list, else `other`; never the shfmt message);
 - a histogram of the time in milliseconds, in fixed buckets.
 
 Never stored: the command, a path, a file or variable name, an argument, or the text of a reason.
 
 ```bash
-piigate shadow          # the totals (counts only; also allowed for the agent)
+piigate shadow          # the totals, the reasons and the parse-error kinds (counts only; also allowed for the agent)
 piigate shadow-on       # sets "shell_shadow": true in ~/.config/piigate/config.json (human only)
 piigate shadow-off      # sets it back to false (human only)
 piigate shadow-reset    # deletes the counts (human only)

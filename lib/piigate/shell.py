@@ -49,12 +49,50 @@ WRAPPER_VALUE_OPTIONS = {
 }
 
 
+# the kinds of a ParseError (a fixed list: the shadow mode counts them, so a kind is never built from the command or from a
+# message). A kind may carry one suffix after a colon, from a closed list too: the dialect of a `syntax-error`, the shfmt
+# node type of an `unsupported-word-part` / `unsupported-command-type` (a node type names a grammar element, not the command).
+PARSE_KINDS = (
+    "syntax-error", "too-long", "shfmt-timeout", "cannot-run-shfmt", "shfmt-missing", "memfd", "unknown-dialect",
+    "invalid-json", "unexpected-output", "empty-parse", "unexpected-tree", "unsupported-word-part",
+    "unsupported-command-type", "too-deep", "recursive-function", "walk-error", "nul-byte", "other",
+)
+WORD_PART_TYPES = (
+    "Lit", "SglQuoted", "DblQuoted", "ParamExp", "CmdSubst", "ArithmExp", "ProcSubst", "ExtGlob", "BraceExp",
+)
+COMMAND_TYPES = (
+    "CallExpr", "IfClause", "WhileClause", "ForClause", "CaseClause", "Block", "Subshell", "BinaryCmd", "FuncDecl",
+    "ArithmCmd", "TestClause", "DeclClause", "LetClause", "TimeClause", "CoprocClause", "TestDecl",
+)
+
+
+def _kind_label(kind: str, sub: str | None = None) -> str:
+    """`kind` or `kind:sub` — only when both are on the fixed lists (`sub` is checked against the list of its kind)."""
+    allowed = {
+        "syntax-error": DIALECTS, "unsupported-word-part": WORD_PART_TYPES, "unsupported-command-type": COMMAND_TYPES,
+    }
+    if kind not in PARSE_KINDS:
+        return "other"
+    if sub is None:
+        return kind
+    return f"{kind}:{sub}" if sub in allowed.get(kind, ()) else f"{kind}:other" if kind in allowed else kind
+
+
 class ParseError(Exception):
-    """The command could not be parsed with certainty — the caller must treat it as unknown (deny)."""
+    """The command could not be parsed with certainty — the caller must treat it as unknown (deny).
+
+    `kind` is a fixed label (`PARSE_KINDS`, optionally `kind:sub` — see `_kind_label`), never derived from the message."""
+
+    def __init__(self, message: str = "", kind: str = "other", sub: str | None = None):
+        super().__init__(message)
+        self.kind = _kind_label(kind, sub)
 
 
 class ShfmtMissing(ParseError):
     """No `shfmt` binary with a pinned checksum (bundled as bin/shfmt-<os>-<arch>; nothing else is trusted)."""
+
+    def __init__(self, message: str = ""):
+        super().__init__(message, "shfmt-missing")
 
 
 @dataclass(frozen=True)
@@ -213,7 +251,7 @@ def _run_shfmt(command: bytes, dialect: str) -> subprocess.CompletedProcess:
         try:
             fd = _sealed_memfd(data)
         except (OSError, AttributeError) as e:
-            raise ParseError(f"cannot seal the verified shfmt in memory: {e}") from e
+            raise ParseError(f"cannot seal the verified shfmt in memory: {e}", "memfd") from e
         try:
             return subprocess.run(
                 [f"/proc/self/fd/{fd}", *args], input=command, capture_output=True, timeout=SHFMT_TIMEOUT,
@@ -229,26 +267,26 @@ def _run_shfmt(command: bytes, dialect: str) -> subprocess.CompletedProcess:
 def ast(command: str, dialect: str = DEFAULT_DIALECT) -> dict:
     """The raw shfmt JSON syntax tree of the command (stdin only, no files, working directory `/`)."""
     if dialect not in DIALECTS:
-        raise ParseError(f"unknown dialect {dialect!r}")
+        raise ParseError(f"unknown dialect {dialect!r}", "unknown-dialect")
     if len(command.encode("utf-8", "replace")) > MAX_BYTES:
-        raise ParseError("command too long")
+        raise ParseError("command too long", "too-long")
     try:
         done = _run_shfmt(command.encode("utf-8", "surrogateescape"), dialect)
     except subprocess.TimeoutExpired as e:
-        raise ParseError("shfmt timed out") from e
+        raise ParseError("shfmt timed out", "shfmt-timeout") from e
     except OSError as e:
-        raise ParseError(f"cannot run shfmt: {e.strerror}") from e
+        raise ParseError(f"cannot run shfmt: {e.strerror}", "cannot-run-shfmt") from e
     if done.returncode != 0:
         message = done.stderr.decode("utf-8", "replace").strip().splitlines()
-        raise ParseError("syntax error: " + (message[0][:200] if message else f"shfmt exit {done.returncode}"))
+        raise ParseError("syntax error: " + (message[0][:200] if message else f"shfmt exit {done.returncode}"), "syntax-error", dialect)
     try:
         tree = json.loads(done.stdout)
     except ValueError as e:
-        raise ParseError("shfmt returned invalid JSON") from e
+        raise ParseError("shfmt returned invalid JSON", "invalid-json") from e
     if not isinstance(tree, dict) or tree.get("Type") != "File":
-        raise ParseError("unexpected shfmt output")
+        raise ParseError("unexpected shfmt output", "unexpected-output")
     if not tree.get("Stmts") and any(line.strip() and not line.lstrip().startswith("#") for line in command.splitlines()):
-        raise ParseError("shfmt found no command in a line that is not a comment")  # a parser that says "nothing" is lying
+        raise ParseError("shfmt found no command in a line that is not a comment", "empty-parse")  # a parser that says "nothing" is lying
     return tree
 
 
@@ -268,7 +306,7 @@ def _need(node: dict, key: str):
     try:
         return node[key]
     except (KeyError, TypeError) as e:
-        raise ParseError(f"unexpected syntax tree: no {key!r}") from e  # never the node: it holds the command
+        raise ParseError(f"unexpected syntax tree: no {key!r}", "unexpected-tree") from e  # never the node: it holds the command
 
 
 def _text(node: dict, key: str = "Value") -> str:
@@ -591,7 +629,7 @@ def _expansion_text(p: dict, kinds: set[str]) -> str:
         if _ZSH_QUALIFIER_CODE.search("(" + _text(p.get("Pattern") or {}) + ")"):
             kinds.add("zsh-code")
         return _text(p, "Op") + _text(p.get("Pattern") or {}) + ")"
-    raise ParseError(f"unsupported word part {t}")
+    raise ParseError(f"unsupported word part {t}", "unsupported-word-part", t)
 
 
 def _heredoc(redir: dict) -> Heredoc:
@@ -1090,7 +1128,7 @@ class _Walker:
             return st
         if t in ("DeclClause", "TestClause", "ArithmCmd", "LetClause"):
             return self.builtin_like(c, t, st, sub, redirs, origin, stmt)
-        raise ParseError(f"unsupported command type {t}")
+        raise ParseError(f"unsupported command type {t}", "unsupported-command-type", t)
 
     def if_clause(self, c, st, sub, inh, origin) -> _State:
         cond = self.stmts(c.get("Cond") or [], st, sub, inh, origin) if c.get("Cond") else st
@@ -1104,7 +1142,7 @@ class _Walker:
 
     def loop(self, body, st: _State) -> _State:
         if self.loops >= MAX_LOOP_NESTING:
-            raise ParseError("loops nested too deeply")
+            raise ParseError("loops nested too deeply", "too-deep")
         self.loops += 1
         try:
             self.dry += 1
@@ -1200,9 +1238,9 @@ class _Walker:
         """The body of a function, walked again where it is called: with the directory of the call, its commands in the
         pipeline of the call, its `cd` carried on (a function runs in the calling shell)."""
         if name in self.stack:
-            raise ParseError("recursive function")
+            raise ParseError("recursive function", "recursive-function")
         if len(self.stack) >= MAX_CALL_DEPTH:
-            raise ParseError("functions called too deeply")
+            raise ParseError("functions called too deeply", "too-deep")
         inherited = tuple(Redirect(r.op, r.target, r.heredoc, r.fd, True) for r in redirs)
         # `$1 $2 "$@"` of the body are the arguments of this call when each of them is known
         args: list[str] | None = []
@@ -1321,7 +1359,7 @@ class _Walker:
         """A script given as text (`-c`, `eval`, `trap`, a here-string to a shell, `functions[f]=…`): walked like the line."""
         global _SRC
         if self.depth >= MAX_DEPTH:
-            raise ParseError("scripts nested too deeply")
+            raise ParseError("scripts nested too deeply", "too-deep")
         inner = _Walker(self.session, self.depth + 1, self.dialect, self.model)
         if in_this_shell:  # `eval` runs in this shell: it knows the functions (and the arguments) of the line
             inner.functions, inner.positional = self.functions, self.positional
@@ -1564,7 +1602,7 @@ def parse(command: str, *, cwd: str, dialect: str = DEFAULT_DIALECT) -> list[Cal
     except ParseError:
         raise
     except (RecursionError, KeyError, TypeError, ValueError, IndexError, AttributeError) as e:
-        raise ParseError(f"cannot walk the syntax tree ({type(e).__name__})") from e
+        raise ParseError(f"cannot walk the syntax tree ({type(e).__name__})", "walk-error") from e
     finally:
         _SRC = saved_src
     result.extend(walker.calls)

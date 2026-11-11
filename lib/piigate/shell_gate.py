@@ -89,6 +89,7 @@ class AstGate(gate.Gate):
         self._dialects = [dialect] if dialect else self.dialects_for_shell()
         self.dialect = self._dialects[0]
         self.parse_error = ""
+        self.parse_kind = ""  # a fixed label of the parse error (`shell.PARSE_KINDS`), for the shadow's count
         self.internal_error = ""
         self._cache: dict[str, _Parsed] = {}
         self._index: dict[int, int] = {}
@@ -408,7 +409,7 @@ class AstGate(gate.Gate):
         else:
             view = command  # nothing to cut: the checks that read the line as text (recipes, `$` in a tool call) get it as written
         if any("\x00" in str(t) for t in tokens):
-            raise shell.ParseError("a NUL byte in a word")
+            raise shell.ParseError("a NUL byte in a word", "nul-byte")
         composed = all_text + "".join("\n" + b.text for b in bodies if not b.stripped)
         return _Parsed(command, calls, tokens, stage_calls, bodies, view, composed, dynamic_body, rest)
 
@@ -462,19 +463,19 @@ class AstGate(gate.Gate):
     def bash(self, command: str, files: bool = True) -> str | None:
         """Judged in the grammar of `$SHELL`; when the shell is unknown, in both — refused if either refuses."""
         reason = None
-        errors = []
+        errors: list[tuple[str, str]] = []
         for dialect in self._dialects:
             self.dialect = dialect
             self._cache = {}
             reason = self._bash_in(command, files)
             if reason:
                 return reason
-            errors.append(self.parse_error)
-        self.parse_error = next((e for e in errors if e), "")
+            errors.append((self.parse_error, self.parse_kind))
+        self.parse_error, self.parse_kind = next((e for e in errors if e[0]), ("", ""))
         return None
 
     def _bash_in(self, command: str, files: bool = True) -> str | None:
-        self.parse_error = self.internal_error = ""
+        self.parse_error = self.parse_kind = self.internal_error = ""
         self._current = None
         if "\x00" in command:
             return super().bash(command, files)
@@ -483,6 +484,7 @@ class AstGate(gate.Gate):
                 self._current = self._store(command)
             except shell.ParseError as e:
                 self.parse_error = str(e)
+                self.parse_kind = e.kind
                 return f"piigate: command denied — it cannot be parsed with certainty ({e}). {gate.HINT}"
             for b in self._current.bodies:  # a body written to a file may be run by another call: its text is checked for the
                 if b.stripped and re.search(r"PIIGATE_\w+|XDG_DOCUMENTS_DIR", b.text) or any(  # filter's own files whether or not
