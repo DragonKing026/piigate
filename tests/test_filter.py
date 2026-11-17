@@ -947,6 +947,57 @@ class TestMailIdentifiers(unittest.TestCase):
         self.assertEqual(hook_module.mail_handles({"id": "account4"}, PseudonymMap()), {"id": "account4"})
 
 
+class TestMcpWrap(unittest.TestCase):
+    """Issue #39: MCP errors skip PostToolUse; `piigate mcp-wrap` turns them into ordinary results."""
+
+    def exchange(self, requests: list[dict]) -> list[dict]:
+        server = ["python3", "-I", str(TESTS_DIR / "fake_mail_mcp.py")]
+        w = subprocess.run(
+            [str(ROOT / "bin" / "piigate"), "mcp-wrap", "--", *server],
+            input="".join(json.dumps(r) + "\n" for r in requests),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        self.assertEqual(w.returncode, 0, w.stderr)
+        return [json.loads(x) for x in w.stdout.splitlines()]
+
+    def test_error_becomes_result(self):
+        from piigate import mcp_wrap
+
+        init = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}}
+        bad = {"jsonrpc": "2.0", "id": "a", "method": "tools/call",
+               "params": {"name": "getMessage", "arguments": {"messageId": "x", "folderPath": "imap://nonexistent/INBOX"}}}
+        search = {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "searchMessages", "arguments": {"query": "R"}}}
+        answers = {json.dumps(a["id"]): a for a in self.exchange([init, bad, search])}
+        error = answers['"a"']["result"]
+        self.assertFalse(error["isError"])  # PostToolUse runs → the output filter sees it
+        self.assertEqual(error["content"][0]["text"], mcp_wrap.NOTE)
+        self.assertIn("Folder not found: imap://nonexistent/INBOX", error["content"][1]["text"])
+        self.assertNotIn("isError", answers["3"]["result"])  # a normal result passes unchanged
+        self.assertIn("serverInfo", answers["1"]["result"])
+
+    def test_jsonrpc_error_and_other_lines(self):
+        import threading
+
+        from piigate import mcp_wrap
+
+        lock, calls = threading.Lock(), {json.dumps(7)}
+        line = json.dumps({"jsonrpc": "2.0", "id": 7, "error": {"code": -32602, "message": "Folder not found: x"}}).encode()
+        converted = json.loads(mcp_wrap.convert(line, calls, lock))
+        self.assertNotIn("error", converted)
+        self.assertIn("Folder not found: x", converted["result"]["content"][0]["text"])
+        self.assertEqual(calls, set())
+        # not a response to tools/call (initialize, a notification, not JSON): byte for byte
+        for raw in (line, b'{"jsonrpc":"2.0","method":"notifications/x"}\n', b"not json\n"):
+            self.assertEqual(mcp_wrap.convert(raw, set(), lock), raw)
+
+    def test_check(self):
+        w = subprocess.run([str(ROOT / "bin" / "piigate"), "mcp-wrap", "--check"], capture_output=True, timeout=30, check=False)
+        self.assertEqual(w.returncode, 0)
+
+
 @unittest.skipUnless(
     shutil.which("docker") and os.environ.get("PIIGATE_TEST_DB") == "1",
     "local database test: PIIGATE_TEST_DB=1 (throwaway postgres:17-alpine container)",

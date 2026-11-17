@@ -219,6 +219,7 @@ In Bash (pipelines from servers):
 ssh prod 'bin/console dbal:run-sql "SELECT …"' 2>&1 | piigate table   # structure + safe values (ids, codes, statuses)
 some-command 2>&1 | piigate text [--source mail]                       # text with pseudonyms
 piigate status                                                         # engine, config, decision log (no content)
+piigate mcp-wrap -- node mcp-bridge.cjs                                # in .mcp.json: mail MCP errors through the filter
 piigate reverse report.md                                              # HUMAN only: pseudonyms → originals (password)
 ```
 
@@ -287,8 +288,10 @@ through the full text filter.
 
 - **Not 100%.** NER and rules miss nicknames, surnames in lower case without a known first name, unusual formats, data in
   images and scans (PDFs without a text layer are refused — there is no OCR). Tables are safer than text.
-- **Mail MCP errors are not filtered.** Claude Code passes an MCP result with `isError` to the model without the
-  PostToolUse hook, so a mail server that echoes its input in an error ("Folder not found: …") shows that input as is.
+- **Mail MCP errors skip the hook.** Claude Code passes an MCP error (a result with `isError`, a JSON-RPC `error`) to
+  the model through `PostToolUseFailure`, which cannot rewrite it. Run the mail server through `piigate mcp-wrap --
+  SERVER…` (in `.mcp.json`): it turns errors into ordinary results with a leading note, so the filter covers them.
+  Without the wrapper a server that echoes its input in an error shows that input as is.
   For this reason the gate never restores content pseudonyms (a name, PESEL or address typed into a mail tool's
   parameters stays a pseudonym) — only `MAILREF_n` handles of mail identifiers, which have their own numbering. A
   restored identifier (a Message-ID, which the sender chooses, or the folder URI with the account) can still be echoed

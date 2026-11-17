@@ -31,6 +31,8 @@ piigate — sensitive data (PHI/PII) through a filter before it reaches the mode
                                                  a summary without it, an answer + an anonymized copy
   piigate analyze --mail "QUERY" [--number N] [--question "…"]
                                                  the same for a Thunderbird mail (with attachments)
+  piigate mcp-wrap -- SERVER [ARGS…]             run a mail MCP server so its errors go through the output filter
+                                                 (in .mcp.json; `--check`: the wrapper is available)
   piigate status                                 Presidio, Ollama, configuration, number of pseudonyms
   piigate project                                project filters (.claude/piigate.json): in force and pending
   piigate project approve                        HUMAN ONLY: the current project file becomes the approved snapshot
@@ -309,6 +311,15 @@ def status(cfg: dict) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["mcp-wrap"]:  # stdio pass-through in front of an MCP server: its own argument syntax (after --)
+        from piigate import mcp_wrap
+
+        if argv[1:] == ["--check"]:  # a launcher checks this exact line (an older piigate would not print it)
+            print("piigate mcp-wrap: available")
+            return 0
+        rest = argv[1:]
+        return mcp_wrap.run(rest[1:] if rest[:1] == ["--"] else rest)
     p = argparse.ArgumentParser(prog="piigate", add_help=False, usage=HELP)
     p.add_argument("command", nargs="?", default="help")
     p.add_argument("file", nargs="?")
