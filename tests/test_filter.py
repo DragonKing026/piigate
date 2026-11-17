@@ -872,6 +872,60 @@ class TestReverse(unittest.TestCase):
         self.assertEqual(w.stdout, "")
 
 
+class TestMailIdentifiers(unittest.TestCase):
+    """Issue #33: a Message-ID and the account part of an IMAP folder URI look like e-mail addresses, so the filter
+    pseudonymizes them; the gate restores them in identifier fields, so the message found by a search can be opened."""
+
+    MESSAGE_ID = "Xq7f3k2LmZ9a0000TONGRB00Yc@mailer.przyklad-firma.test"
+    FOLDER = "imap://rozliczenia%40przyklad-firma.test@mail.przyklad-firma.test/Recepty"
+    TOOL = "mcp__plugin_thunderbird-mcp_thunderbird-mail__"
+
+    def gate_input(self, name: str, tool_input: dict) -> dict | None:
+        data = {"hook_event_name": "PreToolUse", "cwd": str(TMP), "tool_name": self.TOOL + name, "tool_input": tool_input}
+        return hook("gate", data)
+
+    def test_search_result_opens(self):
+        if not PRESIDIO:
+            self.skipTest(PRESIDIO_SKIP)
+        p = dt.PATIENTS[2]
+        found = [{"id": self.MESSAGE_ID, "threadId": 7, "subject": "Recepty", "author": f"{p['first_name']} <{p['email']}>",
+                  "folderPath": self.FOLDER}]
+        data = mcp_mail("")
+        data["tool_name"] = self.TOOL + "searchMessages"
+        data["tool_input"] = {"query": "Recepty"}
+        # json.dumps without ensure_ascii=False: \uXXXX escapes, as from an ASCII-only serializer — names still caught
+        data["tool_response"] = [{"type": "text", "text": json.dumps(found)}]
+        shown = hook("filter", data)["hookSpecificOutput"]["updatedToolOutput"][0]["text"]
+        row = json.loads(shown)[0]
+        self.assertEqual(leaks(shown), [])
+        self.assertNotIn("przyklad-firma", shown)  # the model sees no address
+        self.assertRegex(row["id"], r"^EMAIL_\d+$")
+
+        result = self.gate_input("getMessage", {"messageId": row["id"], "folderPath": row["folderPath"], "bodyFormat": "text"})
+        out = result["hookSpecificOutput"]
+        self.assertNotIn("permissionDecision", out)  # the normal permission flow stays
+        self.assertEqual(out["updatedInput"], {"messageId": self.MESSAGE_ID, "folderPath": self.FOLDER, "bodyFormat": "text"})
+
+        result = self.gate_input("getMessages", {"messages": [{"messageId": row["id"], "folderPath": row["folderPath"]}]})
+        self.assertEqual(result["hookSpecificOutput"]["updatedInput"]["messages"], [{"messageId": self.MESSAGE_ID, "folderPath": self.FOLDER}])
+        result = self.gate_input("batchGetMessageHeaders", {"messageIds": [row["id"]], "folderPath": row["folderPath"]})
+        self.assertEqual(result["hookSpecificOutput"]["updatedInput"]["messageIds"], [self.MESSAGE_ID])
+
+        # free text is not restored: a pseudonym in a search query stays a pseudonym
+        self.assertIsNone(self.gate_input("searchMessages", {"query": row["id"], "folderPath": "imap://x/INBOX"}))
+
+        # only pseudonyms seen in identifier fields are restored: an MCP error reaches the model unfiltered and may
+        # echo the input ("Folder not found: …"), so a sender's address or a name typed there stays a pseudonym
+        sender = re.search(r"EMAIL_\d+", row["author"]).group(0)
+        person = PseudonymMap().pseudonym("PERSON", "PERSON", f"{p['first_name']} {p['surname']}")
+        for typed in (sender, person, f"imap://{person}/INBOX"):
+            self.assertIsNone(self.gate_input("getMessage", {"messageId": typed, "folderPath": typed}), typed)
+
+    def test_no_pseudonyms_no_change(self):
+        self.assertIsNone(self.gate_input("getMessage", {"messageId": "abc@host.test", "folderPath": "imap://x/INBOX"}))
+        self.assertIsNone(self.gate_input("getMessage", {"messageId": "EMAIL_99999", "folderPath": "imap://x/INBOX"}))
+
+
 @unittest.skipUnless(
     shutil.which("docker") and os.environ.get("PIIGATE_TEST_DB") == "1",
     "local database test: PIIGATE_TEST_DB=1 (throwaway postgres:17-alpine container)",
@@ -1106,6 +1160,32 @@ class TestAnonymization(unittest.TestCase):
         self.assertEqual(leaks(report), [])
         self.assertIn("attachments: 2", report)
         self.assertIn(dt.PATIENTS[0]["pesel"], tool_input.read_text(encoding="utf-8"))  # the model saw the original
+
+    def test_mail_query_several_servers(self):
+        """Issue #33: `anonymization.mail_mcp` may list several servers; one that does not answer is skipped."""
+        if not PRESIDIO:
+            self.skipTest(PRESIDIO_SKIP)
+        fake = ["python3", "-I", str(TESTS_DIR / "fake_mail_mcp.py")]
+        self.cfg["anonymization"]["mail_mcp"] = [["false"], [str(TMP / "no-such-server")], fake]
+        mail = analysis.fetch_mail("Recepty", None, self.cfg, PseudonymMap())
+        self.assertIsInstance(mail, tuple)
+        self.assertEqual(mail[0], "message.eml")
+        self.cfg["anonymization"]["mail_mcp"] = [fake, fake]  # two mailboxes with a hit each → a list to choose from
+        listing = analysis.fetch_mail("Recepty", None, self.cfg, PseudonymMap())
+        self.assertIn("2 messages match", listing)
+        self.assertEqual(leaks(listing), [])
+        self.cfg["anonymization"]["mail_mcp"] = [["false"]]
+        with self.assertRaisesRegex(FilterError, "no message found.*server skipped: .*no response"):
+            analysis.fetch_mail("Recepty", None, self.cfg, PseudonymMap())
+        # a hung server is skipped after the time limit, and no server process is left behind
+        self.cfg["anonymization"]["mail_mcp"] = [["sleep", "30"], fake]
+        with unittest.mock.patch.object(analysis.MailClient, "TIMEOUT_S", 1):
+            self.assertIsInstance(analysis.fetch_mail("Recepty", None, self.cfg, PseudonymMap()), tuple)
+        left = subprocess.run(["pgrep", "-f", "-x", "sleep 30"], capture_output=True, text=True, check=False).stdout
+        self.assertEqual(left, "")
+        self.cfg["anonymization"]["mail_mcp"] = [fake, "python3"]
+        with self.assertRaisesRegex(FilterError, "list of argvs"):
+            analysis.fetch_mail("Recepty", None, self.cfg, PseudonymMap())
 
     def test_analyze_when_agent_down(self):
         if not PRESIDIO:

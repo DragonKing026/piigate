@@ -84,7 +84,10 @@ same value always gets the same mask or pseudonym, also across sessions.
 - **PHI places only** — file content is checked only in projects that opt in (`.claude/piigate.json`, even `{}`), outside
   git repositories and in fresh or non-public repos. Ordinary repositories are not slowed down. Sensitive directories, mail,
   SQL over SSH, piigate's own files and the sensors are always on.
-- **Output filter** (PostToolUse) — mail MCP results go through the text filter; Read/Bash results that mention a data
+- **Output filter** (PostToolUse) — mail MCP results go through the text filter (a Message-ID or an IMAP folder URI
+  comes back as `EMAIL_n`; the gate restores such pseudonyms — only those seen in identifier fields of a mail result —
+  in identifier parameters (`messageId`, `messageIds`, `folderPath`, `messages[]`), so the found message opens, while
+  the model sees only the pseudonym); Read/Bash results that mention a data
   file are re-checked; every Bash/Read/Grep result goes through the sensors (PESEL, IBAN/NRB, card numbers with checksums).
 - **Tables vs text** — tables are never "detected": only their structure and deterministic masks are shown, so the agent
   can count, join and group without seeing values. Free text is pseudonymized: Polish rules (PESEL, NIP, REGON, KRS,
@@ -262,6 +265,8 @@ Defaults: [config.json](config.json). Yours (merged; lists replace): `~/.config/
 | `ollama.*` | optional second pass by a local model (`enabled`, `url` — loopback only, `model`, `sources`) |
 | `analysis.agent_command` | command for `piigate_analyze` (argv; see below) |
 | `unfiltered_tools` | tools whose output bypasses the filter (e.g. a local LLM subagent): denied on sensitive directories |
+| `mail_mcp` | regexes of mail MCP tool names whose output is pseudonymized (a list in your config replaces the default — list every mail server) |
+| `anonymization.mail_mcp` | argv of the mail MCP server for `mail_query`, or a list of argvs (several mailboxes, searched in order) |
 | `sensors.*` | PESEL / account / card masking in every result |
 
 Example of a personal config (never commit it): [examples/user-config.json](examples/user-config.json).
@@ -282,6 +287,11 @@ through the full text filter.
 
 - **Not 100%.** NER and rules miss nicknames, surnames in lower case without a known first name, unusual formats, data in
   images and scans (PDFs without a text layer are refused — there is no OCR). Tables are safer than text.
+- **Mail MCP errors are not filtered.** Claude Code passes an MCP result with `isError` to the model without the
+  PostToolUse hook, so a mail server that echoes its input in an error ("Folder not found: …") shows that input as is.
+  For this reason the gate restores only pseudonyms the filter saw in identifier fields of mail results (Message-ID,
+  folder URI) — never a name, PESEL or address typed into a mail tool's parameters. Two Message-IDs that differ only in
+  letter case share one pseudonym, and the gate restores the first one seen.
 - **The content verdict is rules, not NER.** A data file with only unknown surnames without suffixes, e-mails or numbers
   passes as clean. Keep client files in a sensitive directory (always denied).
 - **The gate can be bypassed on purpose.** It analyses the command text: code that assembles a path at run time

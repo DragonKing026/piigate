@@ -85,6 +85,8 @@ def gate(data: dict) -> dict | None:
 
     tool = data.get("tool_name", "")
     cfg = config.load(data.get("cwd") or None)
+    if tool.startswith("mcp__") and any(re.search(w, tool) for w in cfg.get("mail_mcp", [])):
+        return mail_input(data.get("tool_input") or {})
     if tool.startswith("mcp__") and not gate_mod.unfiltered_entry(gate_mod.unfiltered_tools(cfg), tool):
         return None  # the hook matches every MCP tool; only those in `unfiltered_tools` are checked
     reason = gate_mod.Gate(cfg, data.get("cwd", "")).decision(tool, data.get("tool_input") or {})
@@ -94,6 +96,67 @@ def gate(data: dict) -> dict | None:
         _log({"hook": "gate", "tool": tool, "decision": "deny", "reason": denial_kind(reason)})
         return _deny(reason)
     return None
+
+
+# Identifier parameters of mail MCP tools (Thunderbird MCP: getMessage, getMessages, getMessageHeaders,
+# batchGetMessageHeaders, folder tools…). The filter pseudonymizes them in the output — a Message-ID looks like an e-mail
+# address, the account part of `imap://user%40domain@host/…` is one — so they come back as `EMAIL_n` and the tool
+# would not find the message. Only these fields are restored; free text (`query`) keeps its pseudonyms.
+MAIL_ID_FIELDS = frozenset({"messageId", "messageIds", "folderPath", "messages", "contactId", "calendarId"})
+
+
+# identifier fields of mail results (Thunderbird MCP: id, folderPath, dupLocations[].folderPath …)
+MAIL_RESULT_ID_FIELDS = frozenset({"id", "messageId", "folderPath", "dupLocations"})
+
+
+def mark_mail_handles(filtered: str, pseudonym_map) -> None:
+    """Pseudonyms in identifier fields of a filtered mail result → restorable by the gate (`mail_input`)."""
+    try:
+        parsed = json.loads(filtered)
+    except ValueError:
+        return  # not JSON (e.g. a rendered raw source): nothing is restorable
+
+    def walk(v, in_id: bool) -> None:
+        if isinstance(v, str):
+            if in_id:
+                pseudonym_map.mark_handles(v)
+        elif isinstance(v, list):
+            for x in v:
+                walk(x, in_id)
+        elif isinstance(v, dict):
+            for k, x in v.items():
+                walk(x, in_id or k in MAIL_RESULT_ID_FIELDS)
+
+    walk(parsed, False)
+
+
+def mail_input(tool_input: dict) -> dict | None:
+    """PreToolUse of a mail MCP tool: pseudonyms in identifier fields → originals from the local map (`updatedInput`).
+    Only pseudonyms the filter saw in identifier fields of a mail result (`mark_mail_handles`) are restored: an MCP
+    error reaches the model without the PostToolUse filter, and a tool may echo its input there ("Folder not found:
+    …") — a PERSON_n typed into `folderPath` must stay a pseudonym. No permission decision — the normal permission
+    flow stays, evaluated on the restored input."""
+    from piigate.pseudonym_map import PSEUDONYM_RE, PseudonymMap
+
+    ids = {k: v for k, v in tool_input.items() if k in MAIL_ID_FIELDS}
+    if not PSEUDONYM_RE.search(json.dumps(ids, ensure_ascii=False)):
+        return None
+    pseudonym_map = PseudonymMap()
+
+    def restore(v):
+        if isinstance(v, str):
+            return pseudonym_map.reverse_handles(v)
+        if isinstance(v, list):
+            return [restore(x) for x in v]
+        if isinstance(v, dict):  # getMessages: messages[] = {messageId, folderPath}
+            return {k: restore(x) if k in MAIL_ID_FIELDS else x for k, x in v.items()}
+        return v
+
+    updated = {k: restore(v) if k in MAIL_ID_FIELDS else v for k, v in tool_input.items()}
+    if updated == tool_input:
+        return None
+    _log({"hook": "gate", "decision": "mail-ids-restored"})
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": updated}}
 
 
 def _shadow(cfg: dict, data: dict, reason: str | None) -> None:
@@ -165,6 +228,10 @@ def _filtered_mail_block(t: str, cfg: dict, pseudonym_map) -> tuple[str, dict[st
         parsed = None
     raw = [k for k, v in parsed.items() if isinstance(v, str) and files.looks_like_raw_mail(v)] if isinstance(parsed, dict) else []
     if not raw:
+        if parsed is not None and "\\u" in t:
+            # JSON with \uXXXX escapes (an ASCII-only serializer): `Bogumiła` hides the name from the rules and NER,
+            # and a replacement may cut an escape in half — the JSON is filtered with the letters themselves
+            t = json.dumps(parsed, ensure_ascii=False)
         return text.filter_text(t, cfg, source="mail", pseudonym_map=pseudonym_map)
     rest = {k: v for k, v in parsed.items() if k not in raw}
     head, counts = text.filter_text(json.dumps(rest, ensure_ascii=False), cfg, source="mail", pseudonym_map=pseudonym_map)
@@ -214,6 +281,7 @@ def output_filter(data: dict):
             if isinstance(b, dict) and b.get("type") == "text":
                 t, counts = _filtered_mail_block(str(b.get("text", "")), cfg, pseudonym_map)
                 t = _hide_encoded(t)
+                mark_mail_handles(t, pseudonym_map)
                 for k, v in counts.items():
                     overall[k] = overall.get(k, 0) + v
                 blocks.append({"type": "text", "text": t})

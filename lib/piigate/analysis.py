@@ -16,7 +16,9 @@ but stdout is not a JSON object (a small model sometimes answers in prose), piig
 """
 
 import json
+import os
 import re
+import select
 import shutil
 import subprocess
 import tempfile
@@ -234,38 +236,70 @@ def run_agent(directory: Path, question: str, cfg: dict) -> dict:
 # --- mail (Thunderbird MCP) ---------------------------------------------------------------------------
 
 
+def mail_servers(cfg: dict) -> list[list[str]]:
+    """`anonymization.mail_mcp`: the argv of one mail MCP server, or a list of argvs (several mailboxes, e.g. Thunderbird
+    MCP and an IMAP server) — searched in this order."""
+    value = cfg.get("anonymization", {}).get("mail_mcp") or []
+    if value and all(isinstance(c, str) for c in value):
+        value = [value]
+    servers = [[config.expand_tilde(c) for c in s] for s in value if isinstance(s, list) and s and all(isinstance(c, str) for c in s)]
+    if len(servers) != len(value):
+        raise FilterError("anonymization.mail_mcp: an argv (list of strings) or a list of argvs")
+    if not servers:
+        raise FilterError(
+            "anonymization.mail_mcp is not configured (argv of a Thunderbird MCP server, "
+            'e.g. ["node", "/path/to/mcp-bridge.cjs"], or a list of such argvs)'
+        )
+    return servers
+
+
 class MailClient:
     """Minimal stdio MCP client of a Thunderbird MCP server — only searchMessages and getMessage."""
 
-    def __init__(self, cfg: dict):
-        command = [config.expand_tilde(c) for c in cfg.get("anonymization", {}).get("mail_mcp") or []]
-        if not command:
-            raise FilterError(
-                "anonymization.mail_mcp is not configured (argv of a Thunderbird MCP server, "
-                'e.g. ["node", "/path/to/mcp-bridge.cjs"])'
-            )
+    TIMEOUT_S = 60
+
+    def __init__(self, command: list[str]):
         self.p = subprocess.Popen(
             command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            text=True,
         )
         self.n = 0
-        self._rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "piigate", "version": "1"}})
-        self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        self._buffer = b""
+        try:
+            self._rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "piigate", "version": "1"}})
+            self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        except BaseException:
+            self.close()  # a server that failed to start must not be left running
+            raise
 
     def _send(self, o: dict) -> None:
-        self.p.stdin.write(json.dumps(o) + "\n")
+        self.p.stdin.write((json.dumps(o) + "\n").encode("utf-8"))
         self.p.stdin.flush()
+
+    def _line(self) -> bytes:
+        """One line from the server; own buffer over the raw descriptor, so select() sees every pending byte."""
+        deadline = time.monotonic() + self.TIMEOUT_S
+        while b"\n" not in self._buffer:
+            left = deadline - time.monotonic()
+            # a hung server (Thunderbird running but not answering) must not block the search of the other servers
+            if left <= 0 or not select.select([self.p.stdout], [], [], left)[0]:
+                raise FilterError(f"Thunderbird MCP: no response within {self.TIMEOUT_S} s")
+            chunk = os.read(self.p.stdout.fileno(), 1 << 16)
+            if not chunk:
+                raise FilterError("Thunderbird MCP: no response (is Thunderbird running?)")
+            self._buffer += chunk
+        line, self._buffer = self._buffer.split(b"\n", 1)
+        return line
 
     def _rpc(self, rpc_method: str, params: dict):
         self.n += 1
         self._send({"jsonrpc": "2.0", "id": self.n, "method": rpc_method, "params": params})
         while True:
-            line = self.p.stdout.readline()
-            if not line:
-                raise FilterError("Thunderbird MCP: no response (is Thunderbird running?)")
+            line = self._line()
+            if not line.strip():
+                continue
             m = json.loads(line)
             if m.get("id") == self.n:
                 if "error" in m:
@@ -284,6 +318,16 @@ class MailClient:
 
     def close(self) -> None:
         self.p.terminate()
+        try:
+            self.p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.p.kill()
+            self.p.wait()
+        for stream in (self.p.stdin, self.p.stdout):
+            try:
+                stream.close()
+            except OSError:
+                pass
 
 
 def _mail_list(results) -> list[dict]:
@@ -295,29 +339,41 @@ def _mail_list(results) -> list[dict]:
 def fetch_mail(
     query: str, number: int | None, cfg: dict, pseudonym_map: PseudonymMap, *, choice: str = 'piigate analyze --mail "…" --number N'
 ) -> tuple[str, bytes] | str:
-    """(name, EML) of the chosen message or — when several match — a filtered list to choose from (--number)."""
-    mail_query = MailClient(cfg)
+    """(name, EML) of the chosen message or — when several match — a filtered list to choose from (--number).
+    Every server of `anonymization.mail_mcp` is searched; one that fails (e.g. Thunderbird not running) is skipped
+    while another one answers."""
+    clients: list[MailClient] = []
+    mails: list[tuple[MailClient, dict]] = []
+    errors: list[str] = []
     try:
-        mails = _mail_list(mail_query.tool("searchMessages", {"query": query, "maxResults": 20}))
+        for command in mail_servers(cfg):
+            try:
+                client = MailClient(command)
+                clients.append(client)
+                mails += [(client, m) for m in _mail_list(client.tool("searchMessages", {"query": query, "maxResults": 20}))]
+            except (FilterError, OSError, ValueError) as e:
+                errors.append(str(e) if isinstance(e, FilterError) else f"mail server {Path(command[-1]).name}: {type(e).__name__}")
         if not mails:
-            raise FilterError("no message found (searchMessages joins words with AND — try a shorter query)")
+            message = "no message found (searchMessages joins words with AND — try a shorter query)"
+            raise FilterError("; ".join([message, *(f"server skipped: {e}" for e in errors)]))
         if number is None and len(mails) > 1:
             lines = [f"[piigate] {len(mails)} messages match — choose: {choice}"]
-            for i, m in enumerate(mails, 1):
+            for i, (_, m) in enumerate(mails, 1):
                 description = f"{m.get('date', '')} | {m.get('author') or m.get('from', '')} | {m.get('subject', '')}"
                 lines.append(f"  {i}. " + text.filter_text(description, cfg, source="mail", pseudonym_map=pseudonym_map)[0])
             return "\n".join(lines) + "\n"
         if number is not None and not 1 <= number <= len(mails):
             raise FilterError(f"{len(mails)} messages match — --number from 1 to {len(mails)}")
-        m = mails[(number or 1) - 1]
-        resp = mail_query.tool(
+        client, m = mails[(number or 1) - 1]
+        resp = client.tool(
             "getMessage", {"messageId": m.get("id") or m.get("messageId"), "folderPath": m["folderPath"], "rawSource": True}
         )
         if not isinstance(resp, dict) or not resp.get("rawSource"):
             raise FilterError("Thunderbird MCP: no message source (encrypted, or no offline copy)")
         return "message.eml", resp["rawSource"].encode("latin-1", "replace")
     finally:
-        mail_query.close()
+        for client in clients:
+            client.close()
 
 
 # --- the whole analysis -------------------------------------------------------------------------------------------

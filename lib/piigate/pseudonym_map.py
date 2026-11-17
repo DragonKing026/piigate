@@ -58,6 +58,11 @@ class PseudonymMap:
             " digest TEXT PRIMARY KEY, label TEXT NOT NULL, number INTEGER NOT NULL, original TEXT NOT NULL)"
         )
         self._db.execute("CREATE INDEX IF NOT EXISTS idx_label_number ON pseudonyms (label, number)")
+        # pseudonyms the mail filter saw in identifier fields (Message-ID, folder URI) — the only ones the gate may
+        # restore in a mail tool's input (reverse_handles); a name or PESEL typed there stays a pseudonym
+        self._db.execute(
+            "CREATE TABLE IF NOT EXISTS handles (label TEXT NOT NULL, number INTEGER NOT NULL, PRIMARY KEY (label, number))"
+        )
         self._db.commit()
 
     def digest(self, text: str) -> str:
@@ -89,6 +94,28 @@ class PseudonymMap:
         def substitute(m: re.Match) -> str:
             row = self._db.execute(
                 "SELECT original FROM pseudonyms WHERE label = ? AND number = ? ORDER BY rowid LIMIT 1",
+                (m.group(1), int(m.group(2))),
+            ).fetchone()
+            return row[0] if row else m.group(0)
+
+        return PSEUDONYM_RE.sub(substitute, text)
+
+    def mark_handles(self, text: str) -> int:
+        """Mark every pseudonym in `text` (an identifier field of a filtered mail result) as restorable."""
+        pairs = {(m.group(1), int(m.group(2))) for m in PSEUDONYM_RE.finditer(text)}
+        if pairs:
+            with self._db:
+                self._db.executemany("INSERT OR IGNORE INTO handles (label, number) VALUES (?, ?)", sorted(pairs))
+        return len(pairs)
+
+    def reverse_handles(self, text: str) -> str:
+        """`reverse` limited to pseudonyms marked by `mark_handles`. A mail tool may echo its input in an error message,
+        and Claude Code passes MCP errors to the model without the PostToolUse filter — so nothing else is restored."""
+
+        def substitute(m: re.Match) -> str:
+            row = self._db.execute(
+                "SELECT p.original FROM pseudonyms p JOIN handles h ON h.label = p.label AND h.number = p.number"
+                " WHERE p.label = ? AND p.number = ? ORDER BY p.rowid LIMIT 1",
                 (m.group(1), int(m.group(2))),
             ).fetchone()
             return row[0] if row else m.group(0)

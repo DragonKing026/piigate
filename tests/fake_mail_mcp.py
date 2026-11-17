@@ -11,8 +11,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fixtures as dt
 
 P = dt.PATIENTS
+FOLDER = "imap://rozliczenia%40przyklad-firma.test@mail.przyklad-firma.test/INBOX"
 MAIL = {
-    "id": "fake-1",
+    # like Thunderbird MCP: the RFC Message-ID and an IMAP folder URI with the account — both look like e-mail addresses
+    # to the filter (issue #33), so the model gets pseudonyms and the gate has to restore them
+    "id": "fake-1.Xq7f3k2LmZ9a@mailer.przyklad-firma.test",
     "from": f"{P[2]['first_name']} {P[2]['surname']} <{P[2]['email']}>",
     "to": "rozliczenia@przyklad-firma.test",
     "subject": f"Recepty — {P[0]['surname']}, {P[1]['surname']}",
@@ -60,7 +63,12 @@ for line in sys.stdin:
         name = m["params"]["name"]
         arguments = m["params"].get("arguments") or {}
         if name == "searchMessages":
-            result = [{**{k: MAIL[k] for k in ("id", "from", "subject", "date")}, "folderPath": "mailbox://fake/Inbox"}]
+            result = [{**{k: MAIL[k] for k in ("id", "from", "subject", "date")}, "folderPath": FOLDER}]
+        elif (arguments.get("messageId"), arguments.get("folderPath")) != (MAIL["id"], FOLDER):
+            # unknown message or folder (e.g. a pseudonym the gate did not restore): an error, as in the add-on
+            send({"jsonrpc": "2.0", "id": mid, "result": {"isError": True, "content": [{"type": "text", "text": json.dumps(
+                {"error": f"Folder not found: {arguments.get('folderPath')}"})}]}})
+            continue
         elif arguments.get("rawSource"):  # like the add-on: the RFC 2822 source as a Latin-1 string (bytes 1:1)
             import tempfile
 
