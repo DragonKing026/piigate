@@ -873,8 +873,8 @@ class TestReverse(unittest.TestCase):
 
 
 class TestMailIdentifiers(unittest.TestCase):
-    """Issue #33: a Message-ID and the account part of an IMAP folder URI look like e-mail addresses, so the filter
-    pseudonymizes them; the gate restores them in identifier fields, so the message found by a search can be opened."""
+    """Issue #33: a Message-ID and the account part of an IMAP folder URI look like e-mail addresses. Identifier fields
+    of a mail result get opaque MAILREF_n handles; the gate restores only those, so the found message can be opened."""
 
     MESSAGE_ID = "Xq7f3k2LmZ9a0000TONGRB00Yc@mailer.przyklad-firma.test"
     FOLDER = "imap://rozliczenia%40przyklad-firma.test@mail.przyklad-firma.test/Recepty"
@@ -899,7 +899,8 @@ class TestMailIdentifiers(unittest.TestCase):
         row = json.loads(shown)[0]
         self.assertEqual(leaks(shown), [])
         self.assertNotIn("przyklad-firma", shown)  # the model sees no address
-        self.assertRegex(row["id"], r"^EMAIL_\d+$")
+        self.assertRegex(row["id"], r"^MAILREF_\d+$")
+        self.assertRegex(row["folderPath"], r"^MAILREF_\d+$")
 
         result = self.gate_input("getMessage", {"messageId": row["id"], "folderPath": row["folderPath"], "bodyFormat": "text"})
         out = result["hookSpecificOutput"]
@@ -914,16 +915,36 @@ class TestMailIdentifiers(unittest.TestCase):
         # free text is not restored: a pseudonym in a search query stays a pseudonym
         self.assertIsNone(self.gate_input("searchMessages", {"query": row["id"], "folderPath": "imap://x/INBOX"}))
 
-        # only pseudonyms seen in identifier fields are restored: an MCP error reaches the model unfiltered and may
-        # echo the input ("Folder not found: …"), so a sender's address or a name typed there stays a pseudonym
+        # content pseudonyms are never restored: an MCP error reaches the model unfiltered and may echo the input
+        # ("Folder not found: …"), so a sender's address or a name typed there stays a pseudonym
         sender = re.search(r"EMAIL_\d+", row["author"]).group(0)
         person = PseudonymMap().pseudonym("PERSON", "PERSON", f"{p['first_name']} {p['surname']}")
         for typed in (sender, person, f"imap://{person}/INBOX"):
             self.assertIsNone(self.gate_input("getMessage", {"messageId": typed, "folderPath": typed}), typed)
 
+    def test_sender_controlled_message_id(self):
+        """A sender sets the Message-ID to a patient's address: it becomes a MAILREF handle of its own, not the
+        patient's EMAIL_n — restoring the handle does not reveal who EMAIL_n is in other mails."""
+        if not PRESIDIO:
+            self.skipTest(PRESIDIO_SKIP)
+        p = dt.PATIENTS[1]
+        found = [{"id": p["email"], "author": f"Rejestracja <{p['email']}>", "folderPath": self.FOLDER}]
+        data = mcp_mail("")
+        data["tool_name"] = self.TOOL + "searchMessages"
+        data["tool_response"] = [{"type": "text", "text": json.dumps(found, ensure_ascii=False)}]
+        shown = hook("filter", data)["hookSpecificOutput"]["updatedToolOutput"][0]["text"]
+        self.assertEqual(leaks(shown), [])
+        row = json.loads(shown)[0]
+        self.assertRegex(row["id"], r"^MAILREF_\d+$")
+        email_pseudonym = re.search(r"EMAIL_\d+", row["author"]).group(0)
+        self.assertIsNone(self.gate_input("getMessage", {"messageId": email_pseudonym, "folderPath": email_pseudonym}))
+
     def test_no_pseudonyms_no_change(self):
         self.assertIsNone(self.gate_input("getMessage", {"messageId": "abc@host.test", "folderPath": "imap://x/INBOX"}))
         self.assertIsNone(self.gate_input("getMessage", {"messageId": "EMAIL_99999", "folderPath": "imap://x/INBOX"}))
+        self.assertIsNone(self.gate_input("getMessage", {"messageId": "MAILREF_99999", "folderPath": "imap://x/INBOX"}))
+        # an identifier without "@" (an account id) is not a handle and passes unchanged
+        self.assertEqual(hook_module.mail_handles({"id": "account4"}, PseudonymMap()), {"id": "account4"})
 
 
 @unittest.skipUnless(

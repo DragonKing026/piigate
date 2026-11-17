@@ -85,9 +85,9 @@ same value always gets the same mask or pseudonym, also across sessions.
   git repositories and in fresh or non-public repos. Ordinary repositories are not slowed down. Sensitive directories, mail,
   SQL over SSH, piigate's own files and the sensors are always on.
 - **Output filter** (PostToolUse) — mail MCP results go through the text filter (a Message-ID or an IMAP folder URI
-  comes back as `EMAIL_n`; the gate restores such pseudonyms — only those seen in identifier fields of a mail result —
-  in identifier parameters (`messageId`, `messageIds`, `folderPath`, `messages[]`), so the found message opens, while
-  the model sees only the pseudonym); Read/Bash results that mention a data
+  would come back as `EMAIL_n`, so address-like identifier values become opaque `MAILREF_n` handles before filtering;
+  the gate restores only these handles, only in identifier parameters — `messageId`, `messageIds`, `folderPath`,
+  `messages[]`, `accountId` — so the found message opens while the model sees no address); Read/Bash results that mention a data
   file are re-checked; every Bash/Read/Grep result goes through the sensors (PESEL, IBAN/NRB, card numbers with checksums).
 - **Tables vs text** — tables are never "detected": only their structure and deterministic masks are shown, so the agent
   can count, join and group without seeing values. Free text is pseudonymized: Polish rules (PESEL, NIP, REGON, KRS,
@@ -289,9 +289,10 @@ through the full text filter.
   images and scans (PDFs without a text layer are refused — there is no OCR). Tables are safer than text.
 - **Mail MCP errors are not filtered.** Claude Code passes an MCP result with `isError` to the model without the
   PostToolUse hook, so a mail server that echoes its input in an error ("Folder not found: …") shows that input as is.
-  For this reason the gate restores only pseudonyms the filter saw in identifier fields of mail results (Message-ID,
-  folder URI) — never a name, PESEL or address typed into a mail tool's parameters. Two Message-IDs that differ only in
-  letter case share one pseudonym, and the gate restores the first one seen.
+  For this reason the gate never restores content pseudonyms (a name, PESEL or address typed into a mail tool's
+  parameters stays a pseudonym) — only `MAILREF_n` handles of mail identifiers, which have their own numbering. A
+  restored identifier (a Message-ID, which the sender chooses, or the folder URI with the account) can still be echoed
+  in such an error.
 - **The content verdict is rules, not NER.** A data file with only unknown surnames without suffixes, e-mails or numbers
   passes as clean. Keep client files in a sensitive directory (always denied).
 - **The gate can be bypassed on purpose.** It analyses the command text: code that assembles a path at run time

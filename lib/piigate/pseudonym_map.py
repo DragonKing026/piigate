@@ -18,6 +18,8 @@ from pathlib import Path
 from . import config
 
 PSEUDONYM_RE = re.compile(r"\b([A-Z][A-Z_]*[A-Z])_(\d+)\b")
+MAIL_HANDLE = "MAILREF"
+MAIL_HANDLE_RE = re.compile(rf"\b{MAIL_HANDLE}_(\d+)\b")
 
 
 def _prepare_dir() -> Path:
@@ -58,10 +60,10 @@ class PseudonymMap:
             " digest TEXT PRIMARY KEY, label TEXT NOT NULL, number INTEGER NOT NULL, original TEXT NOT NULL)"
         )
         self._db.execute("CREATE INDEX IF NOT EXISTS idx_label_number ON pseudonyms (label, number)")
-        # pseudonyms the mail filter saw in identifier fields (Message-ID, folder URI) — the only ones the gate may
-        # restore in a mail tool's input (reverse_handles); a name or PESEL typed there stays a pseudonym
+        # opaque handles of mail identifiers (Message-ID, folder URI): their own numbers, never shared with the pseudonyms
+        # of content, so restoring one tells nothing about EMAIL_n/PERSON_n elsewhere (issue #33)
         self._db.execute(
-            "CREATE TABLE IF NOT EXISTS handles (label TEXT NOT NULL, number INTEGER NOT NULL, PRIMARY KEY (label, number))"
+            "CREATE TABLE IF NOT EXISTS mail_handles (digest TEXT PRIMARY KEY, number INTEGER NOT NULL UNIQUE, original TEXT NOT NULL)"
         )
         self._db.commit()
 
@@ -100,27 +102,25 @@ class PseudonymMap:
 
         return PSEUDONYM_RE.sub(substitute, text)
 
-    def mark_handles(self, text: str) -> int:
-        """Mark every pseudonym in `text` (an identifier field of a filtered mail result) as restorable."""
-        pairs = {(m.group(1), int(m.group(2))) for m in PSEUDONYM_RE.finditer(text)}
-        if pairs:
-            with self._db:
-                self._db.executemany("INSERT OR IGNORE INTO handles (label, number) VALUES (?, ?)", sorted(pairs))
-        return len(pairs)
+    def mail_handle(self, value: str) -> str:
+        """Opaque handle `MAILREF_<n>` of a mail identifier — exact value (a Message-ID is case-sensitive)."""
+        digest = self.digest("mail-handle\0" + value)
+        row = self._db.execute("SELECT number FROM mail_handles WHERE digest = ?", (digest,)).fetchone()
+        if row:
+            return f"{MAIL_HANDLE}_{row[0]}"
+        with self._db:
+            number = self._db.execute("SELECT COALESCE(MAX(number), 0) + 1 FROM mail_handles").fetchone()[0]
+            self._db.execute("INSERT INTO mail_handles (digest, number, original) VALUES (?, ?, ?)", (digest, number, value))
+        return f"{MAIL_HANDLE}_{number}"
 
-    def reverse_handles(self, text: str) -> str:
-        """`reverse` limited to pseudonyms marked by `mark_handles`. A mail tool may echo its input in an error message,
-        and Claude Code passes MCP errors to the model without the PostToolUse filter — so nothing else is restored."""
+    def reverse_mail_handles(self, text: str) -> str:
+        """`MAILREF_<n>` → the identifier; nothing else is restored (no content pseudonym)."""
 
         def substitute(m: re.Match) -> str:
-            row = self._db.execute(
-                "SELECT p.original FROM pseudonyms p JOIN handles h ON h.label = p.label AND h.number = p.number"
-                " WHERE p.label = ? AND p.number = ? ORDER BY p.rowid LIMIT 1",
-                (m.group(1), int(m.group(2))),
-            ).fetchone()
+            row = self._db.execute("SELECT original FROM mail_handles WHERE number = ?", (int(m.group(1)),)).fetchone()
             return row[0] if row else m.group(0)
 
-        return PSEUDONYM_RE.sub(substitute, text)
+        return MAIL_HANDLE_RE.sub(substitute, text)
 
     def stats(self) -> dict[str, int]:
         return dict(
