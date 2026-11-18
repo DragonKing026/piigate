@@ -113,8 +113,9 @@ def filter_text(
                 pseudonym_map.pseudonym(f.type_, label, value, number=int(p.rsplit("_", 1)[1]))
             else:
                 p = pseudonym_map.pseudonym(f.type_, label, value)
-            for r in own:
-                stems.setdefault(r, p)
+            if rules.person_cue(text, f.start, f.end):  # a bare single word stays local (issue #37)
+                for r in own:
+                    stems.setdefault(r, p)
         else:
             p = pseudonym_map.pseudonym(f.type_, label, value)
         assigned.append((f, p))

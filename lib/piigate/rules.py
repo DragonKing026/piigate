@@ -534,8 +534,18 @@ TECH_NAMES = frozenset(
         "Twig Composer Packagist Docker Traefik Sablier Playwright Puppeteer Mocha Jest Vue Vuex Pinia Svelte Astro "
         "Gulp Grunt Nginx Apache Redis Memcached Kubernetes Terraform Ansible Grafana Prometheus Webpackbar "
         "Axios Lodash Express Laravel Django Flask Selenium Storybook Sass Less Stylelint Husky Lerna Turborepo "
-        "Fedora Debian Ubuntu Alpine Pandoc Hunspell Shellcheck Ripgrep Lighthouse Wireshark"
+        "Fedora Debian Ubuntu Alpine Pandoc Hunspell Shellcheck Ripgrep Lighthouse Wireshark "
+        # search engines, their crawlers and AI assistants (issue #37)
+        "Bing Google DuckDuckGo Yandex Baidu Ecosia Qwant Yahoo IndexNow Bingbot Googlebot Applebot YandexBot "
+        "ChatGPT OpenAI GPTBot OAI-SearchBot Copilot Perplexity PerplexityBot Gemini Claude ClaudeBot Anthropic "
+        "Mistral Grok DeepSeek"
     ).split()
+)
+# generic words of product names (Bing Webmaster Tools, Google Search Console): a several-word hit made only of these
+# and at least one TECH_NAMES word is a product name (issue #37)
+PRODUCT_WORDS = frozenset(
+    "webmaster tools search console analytics ads bot bots crawler crawlers maps cloud workspace drive docs studio "
+    "business profile merchant center tag manager trends news images chat app api ai".split()
 )
 _TOKEN_CHAR = re.compile(r"[\w@./-]")
 _LOWER_IDENTIFIER = re.compile(r"[a-z0-9]+(?:[-_./][a-z0-9]+)*")
@@ -549,8 +559,11 @@ def technical_term(text: str, start: int, end: int, type_: str) -> bool:
     or — for ORG / ADDRESS — a CamelCase product name (CommonJS). A part that is a first name (`jan-kowalski`) or a
     surname by suffix keeps the hit: user names built of a person's name stay masked."""
     value = text[start:end].strip(" \t\r\n,;:()[]\"'.")
-    if not value or re.search(r"\s", value):  # several words — a name or a sentence, not an identifier
+    if not value:
         return False
+    if re.search(r"\s", value):  # several words — a name or a sentence, unless a product name (Bing Webmaster Tools)
+        words = [w.casefold() for w in value.split()]
+        return any(w in TECH_NAMES for w in words) and all(w in TECH_NAMES or w in PRODUCT_WORDS for w in words)
     s, k = start, end
     while s > 0 and _TOKEN_CHAR.match(text[s - 1]):
         s -= 1
@@ -569,6 +582,32 @@ def technical_term(text: str, start: int, end: int, type_: str) -> bool:
     if _LOWER_IDENTIFIER.fullmatch(token) and (scoped or re.search(r"[-_/]", token)):
         return True
     return type_ in ("ORG", "ADDRESS") and bool(_CAMEL_CASE.fullmatch(token))
+
+
+# a form of address or title right before a name (Polish and English), or an initial next to it (J. Kowalski)
+_TITLE_BEFORE = re.compile(
+    r"(?i:\b(?:Pan|Pani|Pana|Panią|Panu|Panem|Państwo|p\.|dr\.?(?:\s+hab\.?)?|lek\.(?:\s*med\.)?|mgr|prof\.?|inż\.?|"
+    r"ks\.|pacjent|pacjenta|pacjentka|pacjentki|pacjentowi|pacjentce|mr\.?|mrs\.?|ms\.?|miss|sir|dear))\s*[:.]?\s*$"
+)
+_INITIAL_BEFORE = re.compile(rf"(?<![{UPPER}{LOWER}])[{UPPER}]\.\s*$")
+_INITIAL_AFTER = re.compile(rf"^\s*[{UPPER}]\.(?![{UPPER}{LOWER}])")
+
+
+def person_cue(text: str, start: int, end: int) -> bool:
+    """Whether a PERSON hit looks like a person beyond the NER guess (issue #37): several capitalized words, a first
+    name from the list or a surname by suffix, a title or form of address before it, an initial next to it. Only such
+    hits pass their pseudonym on to other occurrences of the same word — a single bare word (NER taking "Bing" for a
+    person in a terse list) is replaced where it was found, so one NER mistake does not spread over the whole text."""
+    value = text[start:end]
+    words = re.findall(rf"[{UPPER}{LOWER}]+", value)
+    if sum(1 for w in words if w[0].isupper()) >= 2:
+        return True
+    if any(w.casefold() in first_names() for w in words):
+        return True
+    if any(SURNAME_SUFFIXES.fullmatch(w) and w.casefold() not in NOT_SURNAMES for w in words):
+        return True
+    before = text[max(0, start - 40) : start]
+    return bool(_TITLE_BEFORE.search(before) or _INITIAL_BEFORE.search(before) or _INITIAL_AFTER.match(text[end : end + 4]))
 
 
 def stems(fragment: str) -> list[str]:

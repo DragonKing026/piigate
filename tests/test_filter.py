@@ -2151,6 +2151,67 @@ class TestDetectionEdgeCases(unittest.TestCase):
             found = [t[f.start : f.end] for f in engines.presidio(t, CONFIG)]
         self.assertEqual(found, ["nowak"])  # webpackbar is a known npm package (TECH_NAMES)
 
+    SEO_CARD = (
+        "- One command to send all URLs from sitemap.xml once, for the first backfill.\n"
+        "- If the ping fails, publishing still works normally, we only log it.\n"
+        "- Already OK, no work needed: robots.txt (no Crawl-delay, Bing and ChatGPT bots allowed), no NOARCHIVE tags, "
+        "pages are static HTML so no prerendering.\n"
+    )
+
+    def test_search_engines_are_not_personal_data(self):
+        """Issue #37: Bing / Google / ChatGPT, also in product names, are not PERSON / ORG — the 3-line repro (NER took
+        Bing for a person only with all three lines) and the 2-line one (passed), real Presidio."""
+        if not PRESIDIO:
+            self.skipTest(PRESIDIO_SKIP)
+        lines = self.SEO_CARD.splitlines(keepends=True)
+        products = "- Bing SEO: IndexNow and Bing Webmaster Tools, Google Search Console too.\n"
+        for description, t in {
+            "3 lines": self.SEO_CARD,
+            "2 lines": lines[0] + lines[2],
+            "with product names": self.SEO_CARD + products,
+        }.items():
+            with self.subTest(description):
+                result, counter = text.filter_text(t, CONFIG, pseudonym_map=PseudonymMap())
+                self.assertEqual(result, t)
+                self.assertEqual(counter, {})
+
+    def test_product_names_from_ner_are_dropped(self):
+        """Several-word NER hits made of a known name and generic product words are dropped; a person is not."""
+        from unittest import mock
+
+        p = dt.PATIENTS[1]
+        t = f"Bing Webmaster Tools, Google Search Console i {p['first_name']} Google.\n"
+        person = f"{p['first_name']} Google"
+
+        def span(w, type_):
+            return {"entity_type": type_, "start": t.index(w), "end": t.index(w) + len(w), "score": 0.85}
+
+        canned = [span("Bing Webmaster Tools", "PERSON"), span("Google Search Console", "ORGANIZATION"), span(person, "PERSON")]
+        with mock.patch.object(engines, "_post", return_value=canned):
+            found = [t[f.start : f.end] for f in engines.presidio(t, CONFIG)]
+        self.assertEqual(found, [person])
+
+    def test_single_word_ner_hit_does_not_spread(self):
+        """Issue #37: a bare single-word PERSON hit is replaced where NER found it, not in every occurrence of the word;
+        a hit with a person cue (title, initial, first name, several words) still passes its pseudonym on."""
+        from unittest import mock
+
+        cases = {  # text, the NER hit, how many "Zorbix" stay
+            "bare word": ("Zorbix and Qumo bots allowed. Report from Zorbix. Zorbix again.\n", "Zorbix", 2),
+            "title": ("Dear Mr Zorbix, thanks. Zorbix will call; Zorbixa too.\n", "Zorbix", 0),
+            "initial": ("Signed: J. Zorbix. Then Zorbix replied.\n", "Zorbix", 0),
+            "two words": ("Talia Zorbix wrote. Zorbix again.\n", "Talia Zorbix", 0),
+        }
+        for description, (t, hit, left) in cases.items():
+            with self.subTest(description):
+                i = t.index(hit)
+                end = i + len(hit)
+                canned = [{"entity_type": "PERSON", "start": i, "end": end, "score": 0.85}]
+                with mock.patch.object(engines, "_post", return_value=canned):
+                    result, counter = text.filter_text(t, CONFIG, pseudonym_map=PseudonymMap())
+                self.assertEqual(result.count("Zorbix"), left, result)
+                self.assertIn("PERSON_", result)
+
     def test_first_name_inside_a_product_name(self):
         """MariaDB is not "Maria" + DB (issue #6: a package list in a tools repository was denied as PERSON 2)."""
         row = "mysql,mariadb\tnarzedzia\tmariadb\tmariadb-client\tklient MySQL/MariaDB: mysql, mysqldump\n"
