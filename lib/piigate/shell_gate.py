@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import gate, shell
-from .gate import COPY_COMMANDS, DIRECT_LAUNCHERS, LAUNCHERS, SHELLS, QuotedToken
+from .gate import DIRECT_LAUNCHERS, LAUNCHERS, SHELLS, QuotedToken
 
 OPERATOR_WORD = re.compile(r"[;&|()<>\n]+|\d*[<>]+[&|]?\d*-?")  # a WORD that the flat list would show as an operator
 # commands whose arguments are only text or names for the shell itself — a relative path there reads nothing
