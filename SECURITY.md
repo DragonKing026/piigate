@@ -25,5 +25,7 @@ filter misses for formats the README lists as supported, pseudonym map or key ex
 `reverse`/`project approve` human-confirmation checks.
 
 Known limitations (see README, "Limitations") are not vulnerabilities: e.g. code that assembles a path at
-run time, nicknames, names written in lower case, data inside images. Reports that show a cheap way to
+run time, deliberate obfuscation of a command (environment variables that steer a program such as `LESSOPEN`
+or `PATH`, transformed literals; the Bash gate stops accidental reads, and the output filter and the password on
+`reverse`/`project approve` cover the rest), nicknames, names written in lower case, data inside images. Reports that show a cheap way to
 close one of them are still welcome as regular issues.

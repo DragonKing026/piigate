@@ -305,7 +305,11 @@ through the full text filter.
   passes as clean. Keep client files in a sensitive directory (always denied).
 - **The gate can be bypassed on purpose.** It analyses the command text: code that assembles a path at run time
   (`python -c` with string concatenation, base64, a script written earlier) gets through; only the sensors see the
-  output then. Globs are expanded and each match judged (more than 200 data files — denied as a precaution); `name.*` in
+  output then. The Bash gate stops ordinary, accidental reads, not deliberate obfuscation: text or a path put together
+  at run time, environment variables that steer a program (`LESSOPEN`, `LESS`, `PATH`, `LD_PRELOAD`, `BASH_ENV`,
+  `AWKPATH`), a pager or editor that runs a command typed into it (`less +!cmd`), and transformations of a literal
+  (encodings, `rev`, `sed`) are not chased form by form. What protects there is the output filter and the password
+  on `piigate reverse` / `project approve`. Globs are expanded and each match judged (more than 200 data files — denied as a precaution); `name.*` in
   a heredoc body read by a program other than a shell is text (the shell expands no globs there — a script's own
   `glob('name.*')` is code assembling a path). Text is not read as paths: the title, body and search of `gh issue/pr`
   (not `--body-file`/`-F`), a dotted name used only as a call (`json.dump(`) and `$VAR` in a quoted heredoc body read
