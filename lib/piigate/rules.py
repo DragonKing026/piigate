@@ -58,7 +58,7 @@ def nip_valid(digits: str) -> bool:
 
 
 def luhn_valid(digits: str) -> bool:
-    if not 13 <= len(digits) <= 19:
+    if not 12 <= len(digits) <= 19:
         return False
     total = 0
     for i, c in enumerate(reversed(digits)):
@@ -279,10 +279,8 @@ NIP_RE = re.compile(
 # that names an identity or tax number; the key is looked up here (the quoted form `"nip": "1234567890"` is not affected)
 _JSON_KEY_VALUE_RE = re.compile(r'\\?"([^"\\]{1,80})\\?"\s*:\s*$')
 _JSON_KEY_LIST_RE = re.compile(r'\\?"([^"\\]{1,80})\\?"\s*:\s*\[\s*(?:-?[\d.eE+-]+\s*,\s*)*$')
-_CARD_KEY_RE = re.compile(r"(?<![^\W\d_])(?:cards?|kart\w*|pan|cc|credit\w*|payment\w*|platnos\w*|płatnoś\w*)(?![^\W\d_])")
-_IDENTITY_KEY_RE = re.compile(
-    r"(?<![a-z])(?:nips?|tax(?:es)?|vat|regon|krs|pesel|ssn|id_?number|podatk\w*|identyfikator\w*)(?![a-z])"
-)
+# a substring of the lower-cased key without separators (fail-safe: `private` also matches `vat`, and is kept as a NIP)
+_IDENTITY_KEY_RE = re.compile(r"nip|tax|vat|regon|krs|pesel|ssn|podat|ident|nrid|idnum")
 NIP_CONTEXT_RE = re.compile(r"(?i)\bNIP\s*[:.]?\s*((?:PL)?\s?[\d -]{10,13}\d)")
 REGON_RE = re.compile(r"(?i)\bREGON\s*[:.]?\s*(\d{9}(?:\d{5})?)\b")
 KRS_RE = re.compile(r"(?i)\bKRS\s*[:.]?\s*(?:nr\.?\s*)?(\d{10})\b")
@@ -308,14 +306,27 @@ _CARD_LAYOUTS = (  # longest first: a longer layout is tried before the one that
     rf"\d{{4}}{_CARD_SEP}\d{{8}}{_CARD_SEP}\d{{4}}",
     rf"\d{{4}}(?:{_CARD_SEP}\d{{4}}){{2}}{_CARD_SEP}\d{{1,3}}",
 )
-# contiguous digits; not the tail of an identifier such as `block_1731309170818`
-CARD_RE = re.compile(r"(?<!\d)(?<!\d\.)(?<![A-Za-z]_)\d{13,19}(?!\d)")
+# contiguous digits
+CARD_RE = re.compile(r"(?<!\d)(?<!\d\.)\d{12,19}(?!\d)")
 CARD_LAYOUT_RES = tuple(re.compile(rf"{_CARD_EDGE}{layout}(?!\d|-\d)") for layout in _CARD_LAYOUTS)
 
 
-# issuers start with 2-6 (Mastercard 2221-2720 and 51-55, Amex 34/37, Diners 36/38, JCB 35, Visa 4, Discover/UnionPay/
-# Maestro 5 and 6); numbers starting with 0, 1, 7, 8 or 9 (timestamps in ms, random IDs) are not a card
-CARD_FIRST_DIGITS = "23456"
+# issuer ranges (prefix low, prefix high, prefix length, allowed lengths): a number that fits none is not a card
+# (timestamps in ms, random IDs), a number that fits one and passes Luhn is masked even if it is a counter
+_CARD_ISSUERS = (
+    (4, 4, 1, (13, 16, 19)),  # Visa
+    (51, 55, 2, (16,)), (2221, 2720, 4, (16,)),  # Mastercard
+    (34, 34, 2, (15,)), (37, 37, 2, (15,)),  # Amex
+    (300, 305, 3, range(14, 20)), (36, 36, 2, range(14, 20)), (38, 39, 2, range(14, 20)),  # Diners
+    (6011, 6011, 4, range(16, 20)), (644, 649, 3, range(16, 20)), (65, 65, 2, range(16, 20)),  # Discover
+    (3528, 3589, 4, range(16, 20)),  # JCB
+    (62, 62, 2, range(16, 20)),  # UnionPay
+    (50, 50, 2, range(12, 20)), (56, 69, 2, range(12, 20)),  # Maestro
+)
+
+
+def card_issuer_valid(digits: str) -> bool:
+    return any(lo <= int(digits[:n]) <= hi and len(digits) in lengths for lo, hi, n, lengths in _CARD_ISSUERS)
 
 
 def card_spans(text: str, accept=lambda digits, matched: True) -> list[tuple[int, int]]:
@@ -326,7 +337,7 @@ def card_spans(text: str, accept=lambda digits, matched: True) -> list[tuple[int
     for regex in (CARD_RE, *CARD_LAYOUT_RES):
         for m in regex.finditer(text):
             digits = re.sub(r"\D", "", m.group())
-            if digits[0] in CARD_FIRST_DIGITS and luhn_valid(digits) and accept(digits, m.group()):
+            if card_issuer_valid(digits) and luhn_valid(digits) and accept(digits, m.group()):
                 spans.append(m.span())
     spans.sort(key=lambda span: (span[0], -span[1]))
     result: list[tuple[int, int]] = []
@@ -450,8 +461,8 @@ def _json_number_key(text: str, start: int, end: int) -> str | None:
     return m.group(1) if m else None
 
 
-def _key_matches(regex: re.Pattern, key: str) -> bool:
-    return bool(regex.search(re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", key).lower()))
+def _identity_key(key: str) -> bool:
+    return bool(_IDENTITY_KEY_RE.search(re.sub(r"[\W_]", "", key).lower()))
 
 
 def detect(text: str, *, dates: str = "all", drugs: bool = True) -> list[Fragment]:
@@ -485,17 +496,13 @@ def detect(text: str, *, dates: str = "all", drugs: bool = True) -> list[Fragmen
         if not PESEL_RE.fullmatch(m.group(1)) and pesel_valid(re.sub(r"\D", "", m.group(1))):
             result.append(Fragment(m.start(1), m.end(1), "PESEL", 3))
     for start, end in card_spans(text):
-        if text[start:end].isdigit():  # a JSON number value (a counter, a random ID) is a card only under a card key
-            key = _json_number_key(text, start, end)
-            if key is not None and not _key_matches(_CARD_KEY_RE, key):
-                continue
         result.append(Fragment(start, end, "CARD", 3))
     for m in NIP_RE.finditer(text):
         if not nip_valid(re.sub(r"\D", "", m.group())):
             continue
         if m.group().isdigit():  # a JSON number value under a key that is not an identity or tax number
             key = _json_number_key(text, m.start(), m.end())
-            if key is not None and not _key_matches(_IDENTITY_KEY_RE, key):
+            if key is not None and not _identity_key(key):
                 continue
         result.append(Fragment(m.start(), m.end(), "NIP", 3))
     for regex in (NIP_CONTEXT_RE, REGON_RE, KRS_RE):

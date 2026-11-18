@@ -4963,14 +4963,14 @@ class TestChecksumNumbers(unittest.TestCase):
         rng = random.Random(7)
         blocks = [
             {
-                "id": f"block_{rng.randint(10**12, 10**13)}",
+                "id": f"block_{rng.randint(10**12, 2 * 10**12 - 1)}",  # starts with 1 (like the timestamps): no issuer
                 "position": {"x": round(rng.uniform(-2000, 4000), 4), "y": round(rng.uniform(-2000, 4000), 6)},
                 "options": {
                     "timeout_ms": rng.randint(1000, 9999999999),
                     "weight": rng.random(),
                     "template": f'<div class="step" data-step="{i}"><p>Krok {i}</p></div>',
                     "created": 1731000000000 + rng.randint(0, 10**9),
-                    "seq": rng.randint(10**15, 10**16 - 1),
+                    "seq": rng.randint(10**15, 2 * 10**15 - 1),  # starts with 1: no issuer (a counter that fits one is masked)
                 },
             }
             for i in range(200)
@@ -4988,12 +4988,46 @@ class TestChecksumNumbers(unittest.TestCase):
         for number in ("4111111111111111", "5555555555554444", "378282246310005", "6011111111111117", "3530111333300000",
                        "2221000000000009", "2221 0000 0000 0009", "5555 5555 5555 4444"):
             self.assertIn("CARD", self.kinds(f"karta {number}"), number)
-        self.assertIn("CARD", self.kinds('{"card_number": 4111111111111111}'))
+        for sample in ('{"card_number": 4111111111111111}', '{"cardnumber": 4111111111111111}', '{"ccnum": 4111111111111111}',
+                       '{"value": 4111111111111111}', "pan_4111111111111111", "card_5555555555554444",
+                       '{"id": "block_5555555555554444"}', "user_card_4111111111111111", "cc_4111111111111111",
+                       "PAN_4111111111111111", "order_4111111111111111", '{"card": {"number": 4111111111111111}}',
+                       '{"payment": {"method": "visa", "number": 4111111111111111}}', '{"number": 4111111111111111}'):
+            self.assertIn("CARD", self.kinds(sample), sample)
+
+    def test_digits_after_digit_dot_are_a_conscious_trade_off(self):
+        """User decision (#34): digits right after "digit + dot" are the fractional part of a decimal number, so a
+        card, a NIP or a contiguous PESEL glued to it that way is not found. A printed PESEL layout (6+5, 2-2-2-5) has
+        no such rule — `v1.440514-01458` stays one (test_a_letter_next_to_a_layout_does_not_hide_it)."""
+        self.assertNotIn("CARD", self.kinds("1.4111111111111111"))
+        self.assertNotIn("PESEL", self.kinds("1.44051401359"))
+        self.assertIn("PESEL", self.kinds("v1.440514-01458"))
+
+    def test_card_issuer_lengths(self):
+        def luhn(prefix: str, length: int) -> str:
+            body = prefix + "0" * (length - len(prefix) - 1)
+            return body + next(str(c) for c in range(10) if rules.luhn_valid(body + str(c)))
+
+        from piigate import rules
+
+        good = {"4": (13, 16, 19), "51": (16,), "55": (16,), "2221": (16,), "2720": (16,), "34": (15,), "37": (15,),
+                "300": (14, 19), "305": (14,), "36": (14,), "38": (14,), "6011": (16, 19), "644": (16,), "65": (16,),
+                "3528": (16,), "3589": (19,), "62": (16, 19), "50": (12, 19), "56": (12,), "69": (19,)}
+        for prefix, lengths in good.items():
+            for n in lengths:
+                self.assertIn("CARD", self.kinds(f"karta {luhn(prefix, n)}"), (prefix, n))
+        bad = (("4", 14), ("4", 15), ("51", 15), ("51", 17), ("2221", 13), ("2721", 16), ("34", 16), ("37", 16),
+               ("300", 13), ("3528", 15), ("3590", 16), ("1", 13), ("1", 16),
+               ("0", 16), ("7", 16), ("2", 13), ("9", 19))
+        for prefix, n in bad:
+            self.assertNotIn("CARD", self.kinds(f"karta {luhn(prefix, n)}"), (prefix, n))
 
     def test_bare_json_number_nip(self):
         for sample in ('{"timeout": 1234567819}', '{"values": [5, 1234567819, 7]}', '{\\"timeout\\": 1234567819}'):
             self.assertNotIn("NIP", self.kinds(sample), sample)
-        for sample in ('{"nip": 1234567819}', '{"tax_id": 1234567819}', '{"podatnikNip": 1234567819}',
+        for sample in ('{"taxid": 1234567819}', '{"vatnumber": 1234567819}', '{"nipnumber": 1234567819}',
+                       '{"TaxPayerId": 1234567819}', '{"nr_identyfikacyjny": 5260250274}', '{"podatnik": 5260250274}',
+                       '{"ident": 5260250274}', '{"nip": 1234567819}', '{"tax_id": 1234567819}', '{"podatnikNip": 1234567819}',
                      '{"nips": [1234567819]}', '{"nip": "1234567819"}', '{"x": "1234567819"}', "NIP: 1234567819",
                      "faktura 123-456-78-19", "faktura 1234567819", "nip 123-45-67-819"):
             self.assertIn("NIP", self.kinds(sample), sample)
@@ -5117,7 +5151,7 @@ class TestChecksumNumbers(unittest.TestCase):
             raise AssertionError
 
         for lengths in ((4, 4, 4, 1), (4, 4, 4, 2), (4, 4, 4, 3), (5, 5, 5, 1), (4, 4, 4, 4, 3)):
-            digits = with_check("4111", sum(lengths))
+            digits = with_check({13: "4111", 14: "3611", 15: "3411"}.get(sum(lengths), "4111"), sum(lengths))
             for sep in (" ", "-"):
                 parts, k = [], 0
                 for n in lengths:
