@@ -1116,6 +1116,54 @@ class AstGate(gate.Gate):
             return False
         return super()._no_content(tokens) or self._creates_only(tokens)
 
+    def _unvettable_script(self, tokens: list[str]) -> bool:
+        """The old rule (`echo "$x" > s.sh; bash s.sh`) plus the same text written by a LATER stage of its pipeline: `echo "$x" |
+        tee s.sh; bash s.sh`, `… | cat > s.sh; bash s.sh` (#43). The stage that writes holds no expansion itself — the text comes
+        from the stage before it. Text without an expansion is read by the tree and judged as before."""
+        if super()._unvettable_script(tokens):
+            return True
+        cur = self._current
+        if cur is None or tokens is not cur.tokens:
+            return False
+        stages, writes, _ = self._script_stages(tokens)
+        if not writes or all(self._safe_stage(core) for core in stages[min(k for k, _, _ in writes) + 1 :]):
+            return False
+        for c in cur.calls:
+            if c.name not in ("tee", "cat") or not c.pipes:
+                continue
+            dests = [w for w in c.argv[1:] if not w.text.startswith("-")] if c.name == "tee" else [
+                r.target for r in c.redirects if r.op in (">", ">>") and r.target is not None
+            ]
+            if not any(
+                not d.text.startswith("/dev/") and "proc" not in d.kinds
+                and (re.search(r"\.(?:sh|bash|zsh|ksh|fish|py|pl|rb|js|php|mk)$", d.text) or "." not in os.path.basename(d.text))
+                for d in dests
+            ):
+                continue
+            for pid, stage in c.pipes:
+                for s, f in self._pipeline_stages(cur, pid):
+                    if s < stage and f.name in ("echo", "printf", "cat") and self._builds_text(f):
+                        return True
+        return False
+
+    @staticmethod
+    def _pipeline_stages(p: _Parsed, pid: int) -> list[tuple[int, shell.Call]]:
+        return [(stage, c) for c in p.calls for i, stage in c.pipes if i == pid]
+
+    @staticmethod
+    def _builds_text(f: shell.Call) -> bool:
+        """`echo` / `printf` / `cat` whose text the line builds: an expansion or a brace in an argument, a `%` format of `printf`, a
+        heredoc or a here-string with an expansion."""
+        if any(w.kinds & {"param", "cmd", "proc", "arith", "brace"} for w in f.argv[1:]):
+            return True
+        if any(
+            (r.heredoc is not None and (r.heredoc.subst or r.heredoc.names))
+            or (r.op == "<<<" and r.target is not None and r.target.kinds & {"param", "cmd", "proc", "arith", "brace"})
+            for r in f.redirects
+        ):
+            return True
+        return f.name == "printf" and any("%" in w.text for w in f.argv[1:2])
+
     def _script_stages(self, tokens):
         stages, writes, unsafe = super()._script_stages(tokens)
         cur = next((p for p in self._cache.values() if p.tokens is tokens), None)

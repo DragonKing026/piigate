@@ -1549,6 +1549,34 @@ class TestIssueRegressions(Base):
             with self.subTest(command):
                 self.allow(command)
 
+    def test_43_a_script_written_by_tee_or_cat_from_built_text_and_run_in_the_line_is_code(self):
+        for command in (
+            'echo "$x" | tee s.sh; bash s.sh',
+            'echo "$x" | cat > s.sh; bash s.sh',
+            'echo "$(date)" | tee s.sh; bash s.sh',
+            'echo "$(date)" | cat > s.sh; sh s.sh',
+            'echo p{ii,}gate reverse | tee s.sh; bash s.sh',
+            'printf "%s" "$x" | tee -a s.sh > /dev/null; sh s.sh',
+            'echo "$x" | sort | tee s.sh; bash s.sh',
+            'echo "$x" | tee s.sh | wc -l; python3 s.sh',
+            'cat <<EOF | tee s.sh; bash s.sh\n$x\nEOF',
+            'echo "$x" > s.sh; bash s.sh',  # the rule it is made equal to
+        ):
+            with self.subTest(command):
+                self.deny(command)
+
+    def test_43_a_literal_text_written_by_tee_or_cat_is_judged_as_before(self):
+        for command in (
+            "echo 'ls' | tee s.sh; bash s.sh",
+            "echo 'ls' | cat > s.sh; bash s.sh",
+            'echo "$x" | tee out.txt; cat out.txt',  # nothing runs the file
+            'echo "$x" | tee s.sh',
+            'echo "$x" | cat > notes.txt; wc -l notes.txt',
+        ):
+            with self.subTest(command):
+                self.allow(command)
+        self.deny("echo 'cat ../Sensitive-data/people.csv' | tee s.sh; bash s.sh")
+
 
 if __name__ == "__main__":
     unittest.main()
