@@ -20,6 +20,7 @@ MCP tools of the `piigate` server (absolute paths; the server checks them):
 | a file (CSV/XLSX/ODS → structure; PDF/EML/DOCX/ODT/TXT → text) | `piigate_show(path)` (`rows` — N rows of masks, `attachment` — mail attachment) |
 | a sensitive directory | `piigate_list(directory)`, then `piigate_show(path=directory, number=N)` (file names are masked) |
 | searching a project that contains a sensitive directory (`grep -r`/`rg` from the root is denied) | `piigate_search(pattern, path?, glob=[…], ignore_case, context, limit)` |
+| a mail found by a mail MCP tool (search result with `id`/`folderPath` shown as `MAILREF_n`) must be opened, especially in auto mode, where `getMessage` with a handle is refused | `piigate_mail_get(message_id="MAILREF_n", folder_path="MAILREF_m")` — the same filter as the mail results; handles only, as shown |
 | you need to **understand** the content, not just count it | `piigate_analyze(path=…)` or `piigate_analyze(mail_query="subject words", number=N)`, optional `question` — a local model reads it (30–150 s) |
 | a copy to keep working on | `piigate_anonymize(path, mask_columns=[…])` → files in `<project>/Anonymized-data/…` you read directly |
 | SQL result / command on a server (Bash) | `ssh host '… dbal:run-sql "SELECT …"' 2>&1 \| piigate table` |

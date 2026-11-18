@@ -44,6 +44,8 @@ VALUES = dt.values()
 CONTAINER = {"mode": "container"}  # most tests: Presidio container at the default engine.container_url
 PRESIDIO = engines.presidio_health({**config.load(), "engine": {**config.load()["engine"], **CONTAINER}}, timeout_s=150)
 PRESIDIO = PRESIDIO.startswith("running")
+FAKE_MESSAGE_ID = "fake-1.Xq7f3k2LmZ9a@mailer.przyklad-firma.test"  # as in fake_mail_mcp.py
+FAKE_FOLDER = "imap://rozliczenia%40przyklad-firma.test@mail.przyklad-firma.test/INBOX"
 PIIGATE_SERVER = ["uv", "run", "--quiet", "--script", str(ROOT / "server.py")]
 
 
@@ -126,7 +128,9 @@ class TestPiigateServer(unittest.TestCase):
     def test_tools(self):
         (file_list,) = session(PIIGATE_SERVER, [])
         names = {t.name for t in file_list.tools}
-        self.assertEqual(names, {"piigate_analyze", "piigate_anonymize", "piigate_show", "piigate_list", "piigate_search"})
+        self.assertEqual(
+            names, {"piigate_analyze", "piigate_anonymize", "piigate_show", "piigate_list", "piigate_search", "piigate_mail_get"}
+        )
 
     @unittest.skipUnless(PRESIDIO, "the Presidio container is not reachable")
     def test_no_originals_in_result(self):
@@ -186,6 +190,70 @@ class TestPiigateServer(unittest.TestCase):
                 self.assertIn("[piigate] denied", text(w))
                 self.assertNotIn("tajne", whole(w))
         self.assertFalse((TMP / "gdziekolwiek").exists())
+
+    def handles(self) -> tuple[str, str]:
+        """MAILREF handles of the fake mailbox's message, as the PostToolUse filter hands them out for a search result."""
+        from piigate.pseudonym_map import PseudonymMap
+
+        pseudonym_map = PseudonymMap()  # the same map file the server uses (PIIGATE_DATA_DIR)
+        return pseudonym_map.mail_handle(FAKE_MESSAGE_ID), pseudonym_map.mail_handle(FAKE_FOLDER)
+
+    @unittest.skipUnless(PRESIDIO, "the Presidio container is not reachable")
+    def test_mail_get(self):
+        """Issue #42: a found message opens through the MAILREF handles without any input rewrite (auto mode)."""
+        message_id, folder = self.handles()
+        _, opened = session(PIIGATE_SERVER, [("piigate_mail_get", {"message_id": message_id, "folder_path": folder})])
+        self.assertFalse(opened.is_error, text(opened))
+        self.assertEqual(leaks(whole(opened)), [])
+        self.assertNotIn("przyklad-firma", whole(opened))  # neither the Message-ID nor the account of the folder URI
+        self.assertIn("recepty", text(opened).casefold())  # the message itself came through (subject/body)
+        self.assertIn("MAILREF_", text(opened))
+
+    def test_mail_get_refusals(self):
+        message_id, folder = self.handles()
+        cases = [
+            {"message_id": "MAILREF_99999", "folder_path": folder},  # unknown / expired
+            {"message_id": message_id, "folder_path": "MAILREF_99999"},
+            {"message_id": "EMAIL_1", "folder_path": folder},  # a content pseudonym is not a handle
+            {"message_id": FAKE_MESSAGE_ID, "folder_path": folder},  # a raw identifier
+            {"message_id": message_id, "folder_path": f"imap://x/{folder}"},
+            {"message_id": f"{message_id} {message_id}", "folder_path": folder},
+        ]
+        results = session(PIIGATE_SERVER, [("piigate_mail_get", c) for c in cases])[1:]
+        for arguments, w in zip(cases, results):
+            with self.subTest(arguments=arguments):
+                self.assertTrue(w.is_error)
+                self.assertIn("[piigate] denied", text(w))
+                self.assertNotIn("przyklad-firma", whole(w))  # the refusal never quotes a value
+                self.assertEqual(leaks(whole(w)), [])
+
+    def test_mail_get_several_servers(self):
+        """`anonymization.mail_mcp` as a list: a server that fails to start is skipped, one that does not have the message
+        too; the one that has it answers."""
+        from piigate import FilterError, analysis
+        from piigate.pseudonym_map import PseudonymMap
+
+        message_id, folder = self.handles()
+        fake = ["python3", "-I", str(TESTS_DIR / "fake_mail_mcp.py")]
+        broken = ["python3", "-I", "-c", "import sys; sys.exit(3)"]
+        empty = ["python3", "-I", "-c", (
+            "import json,sys\nfor l in sys.stdin:\n m=json.loads(l); i=m.get('id')\n"
+            " if m.get('method')=='initialize': r={'protocolVersion':'2025-06-18','capabilities':{},'serverInfo':{'name':'x','version':'0'}}\n"
+            " elif m.get('method')=='tools/call': r={'content':[{'type':'text','text':json.dumps({'error':'Message not found'})}]}\n"
+            " else: continue\n"
+            " print(json.dumps({'jsonrpc':'2.0','id':i,'result':r}),flush=True)\n"
+        )]
+        cfg = config.load()
+        pseudonym_map = PseudonymMap()
+        for servers in ([broken, empty, fake], [fake, broken]):
+            with self.subTest(servers=len(servers)):
+                cfg["anonymization"]["mail_mcp"] = servers
+                got = analysis.get_mail(message_id, folder, cfg, pseudonym_map)
+                self.assertIn("subject", got)
+        cfg["anonymization"]["mail_mcp"] = [broken, empty]
+        with self.assertRaises(FilterError) as caught:
+            analysis.get_mail(message_id, folder, cfg, pseudonym_map)
+        self.assertNotIn("przyklad-firma", str(caught.exception))
 
     @unittest.skipUnless(PRESIDIO, "the Presidio container is not reachable")
     def test_search(self):

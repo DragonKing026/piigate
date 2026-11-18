@@ -21,6 +21,7 @@ PIIGATE_FAKE_ENGINE=1 — TEST ONLY: a tiny regex analyzer replaces Presidio (no
 """
 
 import atexit
+import json
 import os
 import re
 import sys
@@ -30,7 +31,7 @@ from typing import Annotated
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 
-from piigate import FilterError, analysis, anonymization, config, engine_socket, engines, files, project, search
+from piigate import FilterError, analysis, anonymization, config, engine_socket, engines, files, project, search, text
 from piigate.pseudonym_map import PseudonymMap
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
@@ -40,7 +41,7 @@ from pydantic import Field
 INSTRUCTIONS = (
     "Sensitive data (PHI/PII: Thunderbird mail, files in the configured sensitive directories such as ~/Sensitive-data, "
     "CSV/XLSX/PDF/EML from clients) — only through these tools; the result is already filtered (pseudonyms PERSON_3, "
-    "ADDRESS_1). piigate_analyze: a local model reads the original and returns the categories of sensitive data, a summary "
+    "ADDRESS_1). piigate_mail_get: open a mail found by a mail MCP tool, given its MAILREF_<n> handles. piigate_analyze: a local model reads the original and returns the categories of sensitive data, a summary "
     "without them, the answer to a question and anonymized copies (you then read those directly, Read). piigate_search: "
     "search the project including sensitive directories — code in plain text, free text with pseudonyms, tables without "
     "values. Ask only about content, numbers and structure — never about the identity of people. A denial means stop: "
@@ -242,6 +243,26 @@ def create_server() -> MCPServer:
                 name, data = file.name, file.read_bytes()
             result = analysis.analyze_data(name, data, cfg, question=question, dest=output_dir, pseudonym_map=pseudonym_map)
             return _result(analysis.report(result), {"needs_choice": False, **result})
+
+        return _run(f)
+
+    @mcp.tool()
+    def piigate_mail_get(
+        message_id: Annotated[str, Field(description="the `id` of a mail search result, as shown: MAILREF_<n>", max_length=100)],
+        folder_path: Annotated[str, Field(description="the `folderPath` of the same result, as shown: MAILREF_<n>", max_length=100)],
+    ) -> CallToolResult:
+        """Opens one mail message found through a mail MCP tool (searchMessages…), whose results show identifiers as
+        MAILREF_<n> handles — through the same filter (pseudonyms, handles, attachment list). It resolves the handles itself,
+        so it works in Claude Code's auto mode, where getMessage with a handle is refused (a hook cannot change a call's input)."""
+
+        def f(cfg):
+            import hook  # lib/hook.py: the same filter as for the output of a mail MCP tool
+
+            pseudonym_map = PseudonymMap()
+            message = analysis.get_mail(message_id, folder_path, cfg, pseudonym_map)
+            shown, counts = hook._filtered_mail_block(json.dumps(message, ensure_ascii=False), cfg, pseudonym_map)
+            shown = hook._hide_encoded(shown) + "\n" + text.summary(counts)
+            return _result(shown, {"report": shown})
 
         return _run(f)
 

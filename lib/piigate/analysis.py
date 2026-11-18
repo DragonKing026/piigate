@@ -26,7 +26,7 @@ import time
 from pathlib import Path
 
 from . import FilterError, anonymization, config, files, table, text
-from .pseudonym_map import PseudonymMap
+from .pseudonym_map import MAIL_HANDLE_RE, PseudonymMap
 from .rules import Fragment
 
 FRAGMENT_TYPES = sorted(anonymization.FRAGMENT_TYPES)
@@ -374,6 +374,46 @@ def fetch_mail(
     finally:
         for client in clients:
             client.close()
+
+
+def resolve_mail_handle(value: str, what: str, pseudonym_map: PseudonymMap) -> str:
+    """`MAILREF_<n>` as the model saw it → the identifier. Anything else is refused without echoing the value."""
+    if not MAIL_HANDLE_RE.fullmatch(value.strip()):
+        raise FilterError(
+            f"{what} is not a MAILREF_<n> handle — pass the `id` / `folderPath` value of a mail search result as it was shown "
+            "(an identifier shown without MAILREF_ can be given to getMessage directly)"
+        )
+    original = pseudonym_map.mail_handle_original(value)
+    if original is None:
+        raise FilterError(f"{what}: unknown or expired MAILREF handle — search for the message again")
+    return original
+
+
+def get_mail(message_id: str, folder_path: str, cfg: dict, pseudonym_map: PseudonymMap) -> dict:
+    """`getMessage` for the identifiers behind two MAILREF handles, on the first server of `anonymization.mail_mcp` that
+    has the message (the handles were given for a result of one of them). The raw result (JSON object); the caller
+    filters it. No input of any other tool is rewritten — this is the way to open a message in Claude Code's auto mode."""
+    arguments = {
+        "messageId": resolve_mail_handle(message_id, "message_id", pseudonym_map),
+        "folderPath": resolve_mail_handle(folder_path, "folder_path", pseudonym_map),
+    }
+    errors: list[str] = []
+    for command in mail_servers(cfg):
+        try:
+            client = MailClient(command)
+        except (FilterError, OSError, ValueError) as e:
+            errors.append(str(e) if isinstance(e, FilterError) else f"mail server {Path(command[-1]).name}: {type(e).__name__}")
+            continue
+        try:
+            resp = client.tool("getMessage", arguments)
+            if isinstance(resp, dict) and not resp.get("error"):
+                return resp
+            errors.append("the message was not found")
+        except (FilterError, OSError, ValueError) as e:
+            errors.append(str(e) if isinstance(e, FilterError) else f"mail server {Path(command[-1]).name}: {type(e).__name__}")
+        finally:
+            client.close()
+    raise FilterError("; ".join(["cannot open the message", *dict.fromkeys(errors)]))
 
 
 # --- the whole analysis -------------------------------------------------------------------------------------------

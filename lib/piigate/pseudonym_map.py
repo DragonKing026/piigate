@@ -122,6 +122,12 @@ class PseudonymMap:
 
         return MAIL_HANDLE_RE.sub(substitute, text)
 
+    def mail_handle_original(self, handle: str) -> str | None:
+        """The identifier behind one exact `MAILREF_<n>` handle; None for anything else (unknown, or not a handle)."""
+        m = MAIL_HANDLE_RE.fullmatch(handle.strip())
+        row = self._db.execute("SELECT original FROM mail_handles WHERE number = ?", (int(m.group(1)),)).fetchone() if m else None
+        return row[0] if row else None
+
     def stats(self) -> dict[str, int]:
         return dict(
             self._db.execute(
