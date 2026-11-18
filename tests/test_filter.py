@@ -922,6 +922,76 @@ class TestMailIdentifiers(unittest.TestCase):
         for typed in (sender, person, f"imap://{person}/INBOX"):
             self.assertIsNone(self.gate_input("getMessage", {"messageId": typed, "folderPath": typed}), typed)
 
+    def test_auto_mode_denies_instead_of_rewriting(self):
+        """Issue #42: auto mode refuses a call whose input a hook changed — so there the gate denies with the way that
+        works (piigate_mail_get); other modes keep the rewrite."""
+        handles = PseudonymMap()
+        arguments = {"messageId": handles.mail_handle(self.MESSAGE_ID), "folderPath": handles.mail_handle(self.FOLDER)}
+
+        def decide(name: str, mode: str | None, tool_input: dict) -> dict | None:
+            data = {"hook_event_name": "PreToolUse", "cwd": str(TMP), "tool_name": self.TOOL + name, "tool_input": tool_input}
+            if mode:
+                data["permission_mode"] = mode
+            return hook("gate", data)
+
+        for mode in (None, "default", "acceptEdits", "plan", "bypassPermissions"):
+            with self.subTest(mode=mode):
+                out = decide("getMessage", mode, arguments)["hookSpecificOutput"]
+                self.assertEqual(out["updatedInput"]["messageId"], self.MESSAGE_ID)
+        out = decide("getMessage", "auto", arguments)["hookSpecificOutput"]
+        self.assertEqual(out["permissionDecision"], "deny")
+        self.assertNotIn("updatedInput", out)
+        self.assertIn("piigate_mail_get", out["permissionDecisionReason"])
+        out = decide("getMessages", "auto", {"messages": [arguments]})["hookSpecificOutput"]
+        self.assertEqual(out["permissionDecision"], "deny")
+        self.assertIn("piigate_mail_get", out["permissionDecisionReason"])
+        for denied in (out, decide("getMessage", "auto", arguments)["hookSpecificOutput"]):
+            self.assertNotIn(self.MESSAGE_ID, json.dumps(denied))
+            self.assertNotIn("przyklad-firma", json.dumps(denied))
+        # nothing to restore → nothing to deny, also in auto mode
+        self.assertIsNone(decide("getMessage", "auto", {"messageId": "abc@host.test", "folderPath": "imap://x/INBOX"}))
+        self.assertIsNone(decide("searchMessages", "auto", {"query": "Recepty"}))
+
+    def test_own_tools_are_not_mail_tools(self):
+        """Review of #42: a broad `mail_mcp` pattern (`mail`) must not catch piigate's own piigate_mail_get — no handle
+        restoring, no second filtering, no auto-mode denial loop. Judged by the server name, so a foreign server's tool of
+        the same name is still a mail tool."""
+        set_config({"mail_mcp": ["mail"]})
+        try:
+            handles = PseudonymMap()
+            arguments = {"message_id": handles.mail_handle(self.MESSAGE_ID), "folder_path": handles.mail_handle(self.FOLDER)}
+            for server in ("mcp__plugin_piigate_piigate__", "mcp__piigate__"):
+                tool = server + "piigate_mail_get"
+                for mode in ("default", "auto"):
+                    data = {"hook_event_name": "PreToolUse", "cwd": str(TMP), "tool_name": tool, "tool_input": arguments,
+                            "permission_mode": mode}
+                    self.assertIsNone(hook("gate", data), (tool, mode))
+                out = {"hook_event_name": "PostToolUse", "cwd": str(TMP), "tool_name": tool, "tool_input": arguments,
+                       "tool_response": [{"type": "text", "text": "x"}]}
+                self.assertIsNone(hook("filter", out), tool)
+            foreign = {"hook_event_name": "PreToolUse", "cwd": str(TMP), "tool_name": "mcp__evil__piigate_mail_get",
+                       "tool_input": {"messageId": arguments["message_id"], "folderPath": arguments["folder_path"]},
+                       "permission_mode": "auto"}
+            self.assertEqual(hook("gate", foreign)["hookSpecificOutput"]["permissionDecision"], "deny")
+            cfg = config.load()
+            self.assertTrue(hook_module.is_mail_tool("mcp__x__mail__getMessage", cfg))
+            self.assertFalse(hook_module.is_mail_tool("mcp__plugin_piigate_piigate__piigate_mail_get", cfg))
+        finally:
+            set_config(None)
+
+    def test_handle_spelling(self):
+        """Review of #42: one spelling per handle — ASCII digits, no leading zeros, no spaces."""
+        handles = PseudonymMap()
+        handle = handles.mail_handle(self.MESSAGE_ID)
+        self.assertEqual(handles.mail_handle_original(handle), self.MESSAGE_ID)
+        number = handle.split("_")[1]
+        for bad in (f" {handle}", f"{handle} ", f"MAILREF_0{number}", "MAILREF_" + number.translate(str.maketrans("0123456789", "٠١٢٣٤٥٦٧٨٩")),
+                    "mailref_" + number, "MAILREF_", "MAILREF_-" + number):
+            with self.subTest(bad=bad):
+                self.assertIsNone(handles.mail_handle_original(bad))
+                if bad.strip() == bad:  # inside a text the surrounding spaces are just text
+                    self.assertEqual(handles.reverse_mail_handles(f"x {bad} y"), f"x {bad} y")
+
     def test_sender_controlled_message_id(self):
         """A sender sets the Message-ID to a patient's address: it becomes a MAILREF handle of its own, not the
         patient's EMAIL_n — restoring the handle does not reveal who EMAIL_n is in other mails."""
@@ -4954,6 +5024,92 @@ class TestChecksumNumbers(unittest.TestCase):
             self.assertEqual(sensors_mask(line), (line, 0), line)
         self.assertEqual(sensors_mask("200 302 200 200 200"), ("200 302 200 200 200", 0))
 
+    def test_config_json_is_not_a_card_or_a_nip(self):
+        """Issue #34: a process configuration (block ids, canvas coordinates, ms timestamps, decimal options) in a
+        SQL INSERT has no card and no NIP, whatever the random digits sum to."""
+        import json
+        import random
+
+        rng = random.Random(7)
+        blocks = [
+            {
+                "id": f"block_{rng.randint(10**12, 2 * 10**12 - 1)}",  # starts with 1 (like the timestamps): no issuer
+                "position": {"x": round(rng.uniform(-2000, 4000), 4), "y": round(rng.uniform(-2000, 4000), 6)},
+                "options": {
+                    "timeout_ms": rng.randint(1000, 9999999999),
+                    "weight": rng.random(),
+                    "template": f'<div class="step" data-step="{i}"><p>Krok {i}</p></div>',
+                    "created": 1731000000000 + rng.randint(0, 10**9),
+                    "seq": rng.randint(10**15, 2 * 10**15 - 1),  # starts with 1: no issuer (a counter that fits one is masked)
+                },
+            }
+            for i in range(200)
+        ]
+        sql = "INSERT INTO workflow_graph (id, graph) VALUES (1, '" + json.dumps({"blocks": blocks}) + "');\n"
+        self.assertEqual(verdict.check_text(sql, CONFIG), {})
+
+    def test_fraction_digits_and_issuer_prefix(self):
+        for sample in ("x = 0.4111111111111111", "x 3.5555555555554444", "0.9400000019", "7.1234563218"):
+            self.assertFalse(self.kinds(sample) & {"CARD", "NIP", "NUMBER", "PESEL"}, sample)
+        for number in ("0000000000000000", "1111111111111117", "7992739871300", "8888 8888 8888 8888 8", "9111-1111-1111-1111"):
+            self.assertNotIn("CARD", self.kinds(f"karta {number}"), number)
+
+    def test_real_test_cards_are_found(self):
+        for number in ("4111111111111111", "5555555555554444", "378282246310005", "6011111111111117", "3530111333300000",
+                       "2221000000000009", "2221 0000 0000 0009", "5555 5555 5555 4444"):
+            self.assertIn("CARD", self.kinds(f"karta {number}"), number)
+        for sample in ('{"card_number": 4111111111111111}', '{"cardnumber": 4111111111111111}', '{"ccnum": 4111111111111111}',
+                       '{"value": 4111111111111111}', "pan_4111111111111111", "card_5555555555554444",
+                       '{"id": "block_5555555555554444"}', "user_card_4111111111111111", "cc_4111111111111111",
+                       "PAN_4111111111111111", "order_4111111111111111", '{"card": {"number": 4111111111111111}}',
+                       '{"payment": {"method": "visa", "number": 4111111111111111}}', '{"number": 4111111111111111}'):
+            self.assertIn("CARD", self.kinds(sample), sample)
+
+    def test_digits_after_digit_dot_are_a_conscious_trade_off(self):
+        """User decision (#34): digits right after "digit + dot" are the fractional part of a decimal number, so a
+        card, a NIP or a contiguous PESEL glued to it that way is not found. A printed PESEL layout (6+5, 2-2-2-5) has
+        no such rule — `v1.440514-01458` stays one (test_a_letter_next_to_a_layout_does_not_hide_it)."""
+        self.assertNotIn("CARD", self.kinds("1.4111111111111111"))
+        self.assertNotIn("PESEL", self.kinds("1.44051401359"))
+        self.assertIn("PESEL", self.kinds("v1.440514-01458"))
+
+    def test_card_shapes(self):
+        """Fail-safe: 14-19 digits starting with 2-6 or 13 digits starting with 4 (and Luhn) are a card; no issuer table."""
+        from piigate import rules
+
+        def luhn(prefix: str, length: int) -> str:
+            body = prefix + "0" * (length - len(prefix) - 1)
+            return body + next(str(c) for c in range(10) if rules.luhn_valid(body + str(c)))
+
+        good = [("4", n) for n in range(13, 20)] + [("2200", 16), ("3095", 14), ("51", 16), ("2221", 16), ("34", 15),
+                ("37", 15), ("300", 14), ("6011", 16), ("3528", 19), ("62", 19), ("50", 14), ("56", 14), ("69", 19),
+                ("2", 14), ("3", 15), ("5", 17), ("6", 18)]
+        for prefix, n in good:
+            self.assertIn("CARD", self.kinds(f"karta {luhn(prefix, n)}"), (prefix, n))
+        bad = [(p, 13) for p in "2356"] + [(p, n) for p in "01789" for n in (13, 14, 16, 19)]
+        for prefix, n in bad:
+            self.assertNotIn("CARD", self.kinds(f"karta {luhn(prefix, n)}"), (prefix, n))
+
+    def test_bare_json_number_nip(self):
+        for sample in ('{"timeout": 1234567819}', '{"values": [5, 1234567819, 7]}', '{\\"timeout\\": 1234567819}'):
+            self.assertNotIn("NIP", self.kinds(sample), sample)
+        for sample in ('{"taxid": 1234567819}', '{"vatnumber": 1234567819}', '{"nipnumber": 1234567819}',
+                       '{"TaxPayerId": 1234567819}', '{"nr_identyfikacyjny": 5260250274}', '{"podatnik": 5260250274}',
+                       '{"ident": 5260250274}', '{"nip": 1234567819}', '{"tax_id": 1234567819}', '{"podatnikNip": 1234567819}',
+                     '{"nips": [1234567819]}', '{"nip": "1234567819"}', '{"x": "1234567819"}', "NIP: 1234567819",
+                     "faktura 123-456-78-19", "faktura 1234567819", "nip 123-45-67-819"):
+            self.assertIn("NIP", self.kinds(sample), sample)
+
+    def test_nested_nip_object_is_a_known_limitation(self):
+        """Known limitation (#34, review): in `{"nip": {"value": 5260250274}}` the nearest key is `value`, which is
+        neutral, so the bare number is not a NIP (main masked it). Quoted or labelled NIPs are still found."""
+        self.assertNotIn("NIP", self.kinds('{"nip": {"value": 5260250274}}'))
+        self.assertIn("NIP", self.kinds('{"nip": {"value": "5260250274"}}'))
+
+    def test_pesel_still_found(self):
+        self.assertIn("PESEL", self.kinds("pesel 44051401359"))
+        self.assertIn("PESEL", self.kinds('{"pesel": 44051401359}'))
+
     def test_cards_are_still_found(self):
         for number in self.CARDS:
             with self.subTest(number):
@@ -5069,7 +5225,7 @@ class TestChecksumNumbers(unittest.TestCase):
             raise AssertionError
 
         for lengths in ((4, 4, 4, 1), (4, 4, 4, 2), (4, 4, 4, 3), (5, 5, 5, 1), (4, 4, 4, 4, 3)):
-            digits = with_check("4111", sum(lengths))
+            digits = with_check({13: "4111", 14: "3611", 15: "3411"}.get(sum(lengths), "4111"), sum(lengths))
             for sep in (" ", "-"):
                 parts, k = [], 0
                 for n in lengths:
