@@ -1578,22 +1578,24 @@ class TestIssueRegressions(Base):
                 self.allow(command)
         self.deny("echo 'cat ../Sensitive-data/people.csv' | tee s.sh; bash s.sh")
 
-    def test_43_awk_is_judged_by_the_tokens_of_its_program_not_by_the_raw_text(self):
-        """False denials: `>` as a comparison and `|` in a regex, a string or `||` are data; a redirection in `print` and a pipe are code."""
+    def test_43_awk_without_print_may_compare_with_greater_than_and_have_a_bar_in_a_regex(self):
+        """False denials: with no `print` in the program a `>` is a comparison and a `|` is `||` or part of a regex (#43)."""
         for command in (
             "echo \"$x\" | awk 'NR>1'",
+            "echo \"$x\" | awk 'NR > 1'",
+            "echo \"$x\" | awk '$3>5'",
             "echo \"$x\" | awk -F'|' '{print $2}'",
             "echo \"$x\" | awk '/a|b/'",
-            "echo \"$x\" | awk '$1 > 5 {print $2}'",
             "echo \"$x\" | awk '$1==\"a\" || $2==\"b\"'",
-            "echo \"$x\" | awk '{ if ($1 > 5) print $1 }'",
-            "echo \"$x\" | awk '{print ($1 > 2)}'",
-            "echo \"$x\" | awk '{print $1 \"|\" $2}'",
             "echo \"$x\" | awk '{print $1/2}'",
             "echo \"$x\" | awk '/[/]x/ {print}'",
         ):
             with self.subTest(command):
                 self.allow(command)
+
+    def test_43_awk_with_print_and_a_greater_than_or_a_bar_anywhere_in_the_text_is_code(self):
+        """`print` writes a file (`>`, `>>`) and starts a command (`|`, `|&`): the raw text decides, no lexer (review: gawk keeps a
+        `[` class open over `/` and a `]` right after `[` or `[^` is a literal, so a scan that closes it at the first `]` hides code)."""
         for command in (
             "echo \"$x\" | awk '{print > \"f\"}'",
             "echo \"$x\" | awk '{print $1 > $2}'",
@@ -1602,11 +1604,16 @@ class TestIssueRegressions(Base):
             "echo \"$x\" | awk '{ if ($1 > 5) print $1; else print $2 > \"f\" }'",
             "echo \"$x\" | awk '{print | \"cmd\"}'",
             "echo \"$x\" | awk '{print $1 | \"sh\"}'",
-            "echo \"$x\" | awk '{\"cmd\" | getline}'",
             "echo \"$x\" | awk '{print |& \"cmd\"}'",
+            "echo \"$x\" | awk '$1 > 5 {print}'",  # not told apart from a redirection
+            "echo \"$x\" | awk '{print $1 \"|\" $2}'",
+            "echo \"$x\" | awk '/a|b/ {print}'",
+            "echo \"$x\" | awk '/[[:alpha:]/\"]/ {print | \"sh\"} #\"'",  # review: a class that holds `/` and `\"`
+            "echo \"$x\" | awk '/[]/\"]/ {print | \"sh\"} #\"'",  # review: `]` right after `[` is a literal
+            "echo \"$x\" | awk '/[^]/\"]/ {print | \"sh\"} #\"'",
+            "echo \"$x\" | awk '{\"cmd\" | getline}'",
             "echo \"$x\" | awk '@load \"x\"'",
-            "echo \"$x\" | awk '{print \"x}'",  # an unterminated string
-            "echo \"$x\" | awk '/abc'",  # an unterminated regex
+            "echo \"$x\" | awk '/@/'",
         ):
             with self.subTest(command):
                 self.deny(command)
