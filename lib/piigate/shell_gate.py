@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import gate, shell
-from .gate import DIRECT_LAUNCHERS, LAUNCHERS, SHELLS, QuotedToken
+from .gate import COPY_COMMANDS, DIRECT_LAUNCHERS, LAUNCHERS, SHELLS, QuotedToken
 
 OPERATOR_WORD = re.compile(r"[;&|()<>\n]+|\d*[<>]+[&|]?\d*-?")  # a WORD that the flat list would show as an operator
 # commands whose arguments are only text or names for the shell itself — a relative path there reads nothing
@@ -116,6 +116,7 @@ class AstGate(gate.Gate):
         self._model: shell.VarModel | None = None
         self._named_dirs: dict[str, str] = {}
         self._current: _Parsed | None = None
+        self._stage_log: list[tuple[list[str], set[int], list, bool]] = []  # per stage judged by the last `_touches` (see `_creates_only`)
 
     # ------------------------------------------------------------------------------------------------ building
 
@@ -694,7 +695,16 @@ class AstGate(gate.Gate):
             result.append(sorted(c.cwds) if c is not None else everywhere)
         return result
 
+    def _touches(self, command: str, tokens: list[str]) -> tuple[str | None, str]:
+        self._stage_log = []
+        return super()._touches(command, tokens)
+
     def _stage_kinds(self, stage, c, text, literal, verbatim, body):
+        found = self._stage_kinds_of(stage, c, text, literal, verbatim, body)
+        self._stage_log.append((list(stage), set(c), list(found), tuple(stage) in self._names_seen))
+        return found
+
+    def _stage_kinds_of(self, stage, c, text, literal, verbatim, body):
         # a word that is one of several known values (a `for` over static words): the stage is judged for each value
         if any(isinstance(t, _TooMany) for t in stage):
             return [("sensitive", "a variable with too many possible values to judge each one")]
@@ -731,12 +741,40 @@ class AstGate(gate.Gate):
                     found.append(r)
         return found
 
+    def _creates_only(self, tokens: list[str]) -> bool:
+        """A compound line (`cd .. && mkdir Sensitive-data/x`, `mkdir -p S/n && echo a > S/n/n.txt`) whose every stage either
+        touches no sensitive source at all (a `cd` included) or only CREATES in it — `mkdir` & co. (the no-output commands of
+        the configuration) and the target of a `>` / `>>` — brings no content back; one stage that reads (`cat`, `ls` of the
+        directory, `<` from it, a name it mentions as an operand) makes the line a read (#32). Stages come from the last `_touches`,
+        each judged in the directories it runs in."""
+        log = self._stage_log
+        cur = self._current
+        if cur is None or tokens is not cur.tokens or len(log) < 2 or self._unvettable_script(tokens):
+            return False
+        if any(t in ("|", "|&", "&", "(", ")", "<<", "<<<") for t in map(str, tokens)):
+            return False  # a pipe, a background job, a group or text fed to a command: not a plain list of commands
+        needles = {Path(k).name.casefold() for k in (*self.sensitive, *self.project_sensitive, *self.markers) if k}
+        if self.sensitive_name:
+            needles.add(self.sensitive_name.casefold())
+        for stage, writes, found, listed in log:
+            cmd = stage[0] if stage else ""
+            if cmd in ("cd", "pushd", "popd") and Path(cmd).name == cmd:
+                continue  # prints nothing: where it goes is the next stage's business (its directory comes from the tree)
+            if not found and not listed and not any(
+                n in str(t).casefold() for i, t in enumerate(stage) if i not in writes for n in needles
+            ):
+                continue  # touches no sensitive source; a write target is not a read
+            if cmd not in COPY_COMMANDS and super()._no_content(stage):
+                continue  # `mkdir -p S/n`, `rm S/x`: no output
+            return False
+        return True
+
     def _no_content(self, tokens: list[str]) -> bool:
         """`rm D/.gitignore '&&' rmdir D`: a word that reads like an operator is still a word, but it is not the one-command
         `cp/mv/rm` the no-output rule is for — it keeps the old decision (the quoted `&&` used to split the command)."""
         if any(str(t).startswith("\\") and OPERATOR_WORD.fullmatch(str(t)[1:]) for t in tokens):
             return False
-        return super()._no_content(tokens)
+        return super()._no_content(tokens) or self._creates_only(tokens)
 
     def _script_stages(self, tokens):
         stages, writes, unsafe = super()._script_stages(tokens)

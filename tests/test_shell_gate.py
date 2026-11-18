@@ -1099,6 +1099,41 @@ class TestIssueRegressions(Base):
             with self.subTest(command):
                 self.allow(command)
 
+    # -- #32: stages that only create are not a read of the sensitive source, in a compound command too
+    def test_32_creating_in_a_sensitive_directory_in_a_compound_command_passes(self):
+        for command in (
+            "cd ../ && mkdir Sensitive-data/nowy",
+            "mkdir x && mkdir -p ../Sensitive-data/new",
+            "mkdir -p ../Sensitive-data/n && echo a > ../Sensitive-data/n/n.txt",
+            "mkdir -p ../Sensitive-data/n; echo a >> ../Sensitive-data/n/n.txt",
+            "mkdir x && rm -r ../Sensitive-data/n",
+            "cd ln && mkdir x && echo a > y.txt",  # `ln` is the symlink into the sensitive directory: only creating there
+        ):
+            with self.subTest(command):
+                self.allow(command)
+                self.assertIsNotNone(self.old().bash(command), command)  # the old gate refuses them: the intended difference
+
+    def test_32_a_stage_that_reads_makes_the_line_a_read(self):
+        for command in (
+            "mkdir a && cat ../Sensitive-data/people.csv",
+            "mkdir -p ../Sensitive-data/n && ls ../Sensitive-data",
+            "echo a > ../Sensitive-data/n.txt && cat ../Sensitive-data/n.txt",
+            "tee ../Sensitive-data/x < ../Sensitive-data/people.csv",
+            "mkdir -p ../Sensitive-data/n && cat < ../Sensitive-data/people.csv",  # `<` from the directory is a read
+            'mkdir -p ../Sensitive-data/n && echo "$(cat ../Sensitive-data/people.csv)"',
+            "mkdir -p ../Sensitive-data/n && echo a > ../Sensitive-data/n/s.sh && bash ../Sensitive-data/n/s.sh",
+            "mkdir -p ../Sensitive-data/n | cat ../Sensitive-data/people.csv",
+            "mkdir -p ../Sensitive-data/n && (cat ../Sensitive-data/people.csv)",
+            "cd .. && mkdir x && cat Sensitive-data/people.csv",
+            "cd ln && mkdir x && cat people.csv",
+            "mkdir -p ../Sensitive-data/n && cat ../Sens*/people.csv",
+            "mkdir -p ../Sensitive-data/n && cat ln/people.csv",
+            "mkdir -p ../Sensitive-data/n && cp ../Sensitive-data/people.csv x",
+            "mkdir -p ../Sensitive-data/n && python3 -c \"print(open('../Sensitive-data/people.csv').read())\"",
+        ):
+            with self.subTest(command):
+                self.deny(command)
+
     # -- #22: a path made by a command substitution is an unknown path for a command that reads files
     def test_22_a_substitution_as_the_operand_of_a_reader_is_refused(self):
         s = "../Sens*/people.csv"
