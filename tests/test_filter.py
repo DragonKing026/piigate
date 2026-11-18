@@ -922,6 +922,76 @@ class TestMailIdentifiers(unittest.TestCase):
         for typed in (sender, person, f"imap://{person}/INBOX"):
             self.assertIsNone(self.gate_input("getMessage", {"messageId": typed, "folderPath": typed}), typed)
 
+    def test_auto_mode_denies_instead_of_rewriting(self):
+        """Issue #42: auto mode refuses a call whose input a hook changed — so there the gate denies with the way that
+        works (piigate_mail_get); other modes keep the rewrite."""
+        handles = PseudonymMap()
+        arguments = {"messageId": handles.mail_handle(self.MESSAGE_ID), "folderPath": handles.mail_handle(self.FOLDER)}
+
+        def decide(name: str, mode: str | None, tool_input: dict) -> dict | None:
+            data = {"hook_event_name": "PreToolUse", "cwd": str(TMP), "tool_name": self.TOOL + name, "tool_input": tool_input}
+            if mode:
+                data["permission_mode"] = mode
+            return hook("gate", data)
+
+        for mode in (None, "default", "acceptEdits", "plan", "bypassPermissions"):
+            with self.subTest(mode=mode):
+                out = decide("getMessage", mode, arguments)["hookSpecificOutput"]
+                self.assertEqual(out["updatedInput"]["messageId"], self.MESSAGE_ID)
+        out = decide("getMessage", "auto", arguments)["hookSpecificOutput"]
+        self.assertEqual(out["permissionDecision"], "deny")
+        self.assertNotIn("updatedInput", out)
+        self.assertIn("piigate_mail_get", out["permissionDecisionReason"])
+        out = decide("getMessages", "auto", {"messages": [arguments]})["hookSpecificOutput"]
+        self.assertEqual(out["permissionDecision"], "deny")
+        self.assertIn("piigate_mail_get", out["permissionDecisionReason"])
+        for denied in (out, decide("getMessage", "auto", arguments)["hookSpecificOutput"]):
+            self.assertNotIn(self.MESSAGE_ID, json.dumps(denied))
+            self.assertNotIn("przyklad-firma", json.dumps(denied))
+        # nothing to restore → nothing to deny, also in auto mode
+        self.assertIsNone(decide("getMessage", "auto", {"messageId": "abc@host.test", "folderPath": "imap://x/INBOX"}))
+        self.assertIsNone(decide("searchMessages", "auto", {"query": "Recepty"}))
+
+    def test_own_tools_are_not_mail_tools(self):
+        """Review of #42: a broad `mail_mcp` pattern (`mail`) must not catch piigate's own piigate_mail_get — no handle
+        restoring, no second filtering, no auto-mode denial loop. Judged by the server name, so a foreign server's tool of
+        the same name is still a mail tool."""
+        set_config({"mail_mcp": ["mail"]})
+        try:
+            handles = PseudonymMap()
+            arguments = {"message_id": handles.mail_handle(self.MESSAGE_ID), "folder_path": handles.mail_handle(self.FOLDER)}
+            for server in ("mcp__plugin_piigate_piigate__", "mcp__piigate__"):
+                tool = server + "piigate_mail_get"
+                for mode in ("default", "auto"):
+                    data = {"hook_event_name": "PreToolUse", "cwd": str(TMP), "tool_name": tool, "tool_input": arguments,
+                            "permission_mode": mode}
+                    self.assertIsNone(hook("gate", data), (tool, mode))
+                out = {"hook_event_name": "PostToolUse", "cwd": str(TMP), "tool_name": tool, "tool_input": arguments,
+                       "tool_response": [{"type": "text", "text": "x"}]}
+                self.assertIsNone(hook("filter", out), tool)
+            foreign = {"hook_event_name": "PreToolUse", "cwd": str(TMP), "tool_name": "mcp__evil__piigate_mail_get",
+                       "tool_input": {"messageId": arguments["message_id"], "folderPath": arguments["folder_path"]},
+                       "permission_mode": "auto"}
+            self.assertEqual(hook("gate", foreign)["hookSpecificOutput"]["permissionDecision"], "deny")
+            cfg = config.load()
+            self.assertTrue(hook_module.is_mail_tool("mcp__x__mail__getMessage", cfg))
+            self.assertFalse(hook_module.is_mail_tool("mcp__plugin_piigate_piigate__piigate_mail_get", cfg))
+        finally:
+            set_config(None)
+
+    def test_handle_spelling(self):
+        """Review of #42: one spelling per handle — ASCII digits, no leading zeros, no spaces."""
+        handles = PseudonymMap()
+        handle = handles.mail_handle(self.MESSAGE_ID)
+        self.assertEqual(handles.mail_handle_original(handle), self.MESSAGE_ID)
+        number = handle.split("_")[1]
+        for bad in (f" {handle}", f"{handle} ", f"MAILREF_0{number}", "MAILREF_" + number.translate(str.maketrans("0123456789", "٠١٢٣٤٥٦٧٨٩")),
+                    "mailref_" + number, "MAILREF_", "MAILREF_-" + number):
+            with self.subTest(bad=bad):
+                self.assertIsNone(handles.mail_handle_original(bad))
+                if bad.strip() == bad:  # inside a text the surrounding spaces are just text
+                    self.assertEqual(handles.reverse_mail_handles(f"x {bad} y"), f"x {bad} y")
+
     def test_sender_controlled_message_id(self):
         """A sender sets the Message-ID to a patient's address: it becomes a MAILREF handle of its own, not the
         patient's EMAIL_n — restoring the handle does not reveal who EMAIL_n is in other mails."""

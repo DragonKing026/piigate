@@ -79,14 +79,24 @@ def error_result(tool: str, response, message: str):
     return [{"type": "text", "text": message}]
 
 
+# Tools of piigate's own MCP server (`mcp__plugin_piigate_piigate__…` from the plugin, `mcp__piigate__…` registered by hand)
+# are never "mail tools", whatever `mail_mcp` matches (a pattern such as `mail` would catch piigate_mail_get): they filter
+# their own output, and the gate must not rewrite their input. Judged by the server part of the name, not by `piigate_*`.
+OWN_SERVER_RE = re.compile(r"^mcp__(?:plugin_piigate_piigate|piigate)__")
+
+
+def is_mail_tool(tool: str, cfg: dict) -> bool:
+    return tool.startswith("mcp__") and not OWN_SERVER_RE.match(tool) and any(re.search(w, tool) for w in cfg.get("mail_mcp", []))
+
+
 def gate(data: dict) -> dict | None:
     from piigate import gate as gate_mod
     from piigate import config
 
     tool = data.get("tool_name", "")
     cfg = config.load(data.get("cwd") or None)
-    if tool.startswith("mcp__") and any(re.search(w, tool) for w in cfg.get("mail_mcp", [])):
-        return mail_input(data.get("tool_input") or {})
+    if is_mail_tool(tool, cfg):
+        return mail_input(data.get("tool_input") or {}, tool=tool, permission_mode=data.get("permission_mode"))
     if tool.startswith("mcp__") and not gate_mod.unfiltered_entry(gate_mod.unfiltered_tools(cfg), tool):
         return None  # the hook matches every MCP tool; only those in `unfiltered_tools` are checked
     reason = gate_mod.Gate(cfg, data.get("cwd", "")).decision(tool, data.get("tool_input") or {})
@@ -122,11 +132,19 @@ def mail_handles(parsed, pseudonym_map):
     return walk(parsed, False)
 
 
-def mail_input(tool_input: dict) -> dict | None:
+AUTO_MODE_DENIAL = (
+    "[piigate] In auto mode the MAILREF handles cannot be restored (a hook that changes a call's input makes auto mode "
+    "refuse it). {instead}"
+)
+
+
+def mail_input(tool_input: dict, tool: str = "", permission_mode: str | None = None) -> dict | None:
     """PreToolUse of a mail MCP tool: `MAILREF_n` handles in identifier parameters → the identifiers (`updatedInput`).
     Content pseudonyms are never restored: an MCP error reaches the model without the PostToolUse filter (#39), and a
     tool may echo its input there ("Folder not found: …"). No permission decision — the normal permission flow stays,
-    evaluated on the restored input."""
+    evaluated on the restored input. In auto mode (`permission_mode` of the hook input) Claude Code refuses every call
+    whose input a hook changed (issue #42), so instead of `updatedInput` the call is denied with the way that works:
+    `piigate_mail_get`, which resolves the handles itself."""
     from piigate.pseudonym_map import MAIL_HANDLE_RE, PseudonymMap
 
     ids = {k: v for k, v in tool_input.items() if k in MAIL_ID_FIELDS}
@@ -146,6 +164,16 @@ def mail_input(tool_input: dict) -> dict | None:
     updated = {k: restore(v) if k in MAIL_ID_FIELDS else v for k, v in tool_input.items()}
     if updated == tool_input:
         return None
+    if permission_mode == "auto":
+        instead = (
+            "Instead: piigate_mail_get(message_id=<the id as shown>, folder_path=<the folderPath as shown>) — it opens the "
+            "message with the same filter."
+            if tool.endswith("getMessage")
+            else "Open one message with piigate_mail_get(message_id=<the id as shown>, folder_path=<the folderPath as shown>); "
+            "other mail tools need the identifiers, so ask the user to run this step outside auto mode."
+        )
+        _log({"hook": "gate", "decision": "mail-ids-auto-mode-denied"})
+        return _deny(AUTO_MODE_DENIAL.format(instead=instead))
     _log({"hook": "gate", "decision": "mail-ids-restored"})
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": updated}}
 
@@ -247,7 +275,7 @@ def output_filter(data: dict):
     tool = data.get("tool_name", "")
     resp = data.get("tool_response")
     inp = data.get("tool_input") or {}
-    mail = any(re.search(w, tool) for w in cfg.get("mail_mcp", []))
+    mail = is_mail_tool(tool, cfg)
     unfiltered = gate_mod.unfiltered_entry(gate_mod.unfiltered_tools(cfg), tool)
     if tool.startswith("mcp__") and not mail and not unfiltered:
         return None  # the hook matches every MCP tool; only mail and `unfiltered_tools` outputs are filtered

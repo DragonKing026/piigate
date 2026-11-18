@@ -346,13 +346,13 @@ def fetch_mail(
     mails: list[tuple[MailClient, dict]] = []
     errors: list[str] = []
     try:
-        for command in mail_servers(cfg):
+        for server, command in enumerate(mail_servers(cfg), 1):  # (not `number`: the chosen message)
             try:
                 client = MailClient(command)
                 clients.append(client)
                 mails += [(client, m) for m in _mail_list(client.tool("searchMessages", {"query": query, "maxResults": 20}))]
             except (FilterError, OSError, ValueError) as e:
-                errors.append(str(e) if isinstance(e, FilterError) else f"mail server {Path(command[-1]).name}: {type(e).__name__}")
+                errors.append(str(e) if isinstance(e, FilterError) else f"mail server #{server}: {type(e).__name__}")
         if not mails:
             message = "no message found (searchMessages joins words with AND — try a shorter query)"
             raise FilterError("; ".join([message, *(f"server skipped: {e}" for e in errors)]))
@@ -374,6 +374,50 @@ def fetch_mail(
     finally:
         for client in clients:
             client.close()
+
+
+def resolve_mail_identifier(value: str, what: str, pseudonym_map: PseudonymMap) -> str:
+    """A `message_id` / `folder_path` as the model saw it in a search result: a `MAILREF_<n>` handle → the identifier; a value
+    without "@" (the filter shows those as they are) → itself. A value with "@" must be a handle — nothing the model typed
+    is passed on as an address. Refusals never echo the value."""
+    if "MAILREF" in value.upper():
+        original = pseudonym_map.mail_handle_original(value)
+        if original is None:
+            raise FilterError(f"{what}: not a known MAILREF_<n> handle (unknown, expired or misspelled) — search for the message again")
+        return original
+    if "@" in value or not value.strip() or any(c in value for c in "\r\n\0"):
+        raise FilterError(
+            f"{what} is not a MAILREF_<n> handle — pass the `id` / `folderPath` value of a mail search result as it was shown "
+            "(an identifier shown without MAILREF_ is given as it is)"
+        )
+    return value
+
+
+def get_mail(message_id: str, folder_path: str, cfg: dict, pseudonym_map: PseudonymMap) -> dict:
+    """`getMessage` for the identifiers behind two search-result values (MAILREF handles, or plain values without "@"), on
+    the first server of `anonymization.mail_mcp` that has the message. The raw result (JSON object); the caller filters it.
+    No input of any other tool is rewritten — this is the way to open a message in Claude Code's auto mode."""
+    arguments = {
+        "messageId": resolve_mail_identifier(message_id, "message_id", pseudonym_map),
+        "folderPath": resolve_mail_identifier(folder_path, "folder_path", pseudonym_map),
+    }
+    errors: list[str] = []
+    for number, command in enumerate(mail_servers(cfg), 1):
+        try:
+            client = MailClient(command)
+        except (FilterError, OSError, ValueError) as e:
+            errors.append(str(e) if isinstance(e, FilterError) else f"mail server #{number}: {type(e).__name__}")
+            continue
+        try:
+            resp = client.tool("getMessage", arguments)
+            if isinstance(resp, dict) and not resp.get("error"):
+                return resp
+            errors.append(f"mail server #{number}: the message was not found")
+        except (FilterError, OSError, ValueError) as e:
+            errors.append(str(e) if isinstance(e, FilterError) else f"mail server #{number}: {type(e).__name__}")
+        finally:
+            client.close()
+    raise FilterError("; ".join(["cannot open the message", *dict.fromkeys(errors)]))
 
 
 # --- the whole analysis -------------------------------------------------------------------------------------------

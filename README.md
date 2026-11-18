@@ -87,7 +87,8 @@ same value always gets the same mask or pseudonym, also across sessions.
 - **Output filter** (PostToolUse) — mail MCP results go through the text filter (a Message-ID or an IMAP folder URI
   would come back as `EMAIL_n`, so address-like identifier values become opaque `MAILREF_n` handles before filtering;
   the gate restores only these handles, only in identifier parameters — `messageId`, `messageIds`, `folderPath`,
-  `messages[]`, `accountId` — so the found message opens while the model sees no address); Read/Bash results that mention a data
+  `messages[]`, `accountId` — so the found message opens while the model sees no address; in Claude Code's **auto mode**,
+  which refuses any call whose input a hook changed, the gate denies instead and points to `piigate_mail_get`); Read/Bash results that mention a data
   file are re-checked; every Bash/Read/Grep result goes through the sensors (PESEL, IBAN/NRB, card numbers with checksums).
 - **Tables vs text** — tables are never "detected": only their structure and deterministic masks are shown, so the agent
   can count, join and group without seeing values. Free text is pseudonymized: Polish rules (PESEL, NIP, REGON, KRS,
@@ -210,6 +211,7 @@ data extension, never piigate's own files):
 | `piigate_show` | `path`, `number`, `rows`, `attachment` | table structure + masks, or text with pseudonyms |
 | `piigate_list` | `directory` | files with filtered names and numbers |
 | `piigate_search` | `pattern`, `path`, `glob`, `ignore_case`, `context`, `limit` | code plainly; free text with data pseudonymized (the hit is always masked); tables: file, column, rows, count |
+| `piigate_mail_get` | `message_id`, `folder_path` (the `MAILREF_n` handles of a mail search result) | opens one message found through a mail MCP tool: resolves the handles itself (no rewritten input, so it works in auto mode), asks the server(s) of `anonymization.mail_mcp`, returns the message through the mail output filter; a value without `@` (shown by the filter as it is) is accepted as it is |
 | `piigate_analyze` | `path` or `mail_query`, `number`, `question`, `output_dir` | a local model reads the original: categories of personal data, summary and answer without them, anonymized copies |
 | `piigate_anonymize` | `path`, `number`, `mask_columns`, `output_dir` | anonymized CSV/TXT copies the agent can read directly |
 
@@ -296,6 +298,9 @@ through the full text filter.
   parameters stays a pseudonym) — only `MAILREF_n` handles of mail identifiers, which have their own numbering. A
   restored identifier (a Message-ID, which the sender chooses, or the folder URI with the account) can still be echoed
   in such an error.
+- **The handle map is shared.** `MAILREF_n` handles live in the pseudonym map in the data directory, common to all sessions
+  and projects on this computer (a known limitation, as with the other pseudonyms): a handle from one session opens the
+  same message in another.
 - **The content verdict is rules, not NER.** A data file with only unknown surnames without suffixes, e-mails or numbers
   passes as clean. Keep client files in a sensitive directory (always denied).
 - **The gate can be bypassed on purpose.** It analyses the command text: code that assembles a path at run time
