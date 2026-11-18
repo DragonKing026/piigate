@@ -1618,36 +1618,79 @@ class TestIssueRegressions(Base):
             with self.subTest(command):
                 self.deny(command)
 
-    def test_43_stdin_from_a_file_with_a_built_name_is_not_built_text_for_a_script_or_a_database_client(self):
+    def test_43_stdin_from_a_file_with_a_built_name_is_not_built_text_for_a_script_that_exists_or_a_database_client(self):
+        for name in ("script.py", "app.js", "run.sh", "script.pl"):
+            (self.work / name).write_text("x\n", encoding="utf-8")
         for command in (
             'python3 script.py < "$f"',
             'node app.js < "$f"',
             'python3 -u script.py < "$f"',
+            'python3.11 script.py < "$f"',
             'bash run.sh < "$f"',
             'perl script.pl < "$f"',
+            'python3 ./script.py < "$f"',
+            f'python3 {self.work}/script.py < "$f"',
+            'cd . && python3 script.py < "$f"',
             'psql < "$f"',
             'psql "$url" < "$f"',
+            'psql -h db -U u -d "$d" < "$f"',
+            'psql --host=db --dbname=x < "$f"',
             'mysql -u r db < "$dump"',
+            'mysql -u r -p "$db" < "$dump"',
             'mariadb db < "$dump"',
-            'sqlite3 x.db < "$f"',
-            'docker compose exec -T db psql -U u < "$f"',
-            'docker exec -i db mysql < "$f"',
+            '/usr/bin/psql < "$f"',
         ):
             with self.subTest(command):
                 self.allow(command)
 
     def test_43_stdin_from_a_file_still_runs_as_code_when_the_receiver_takes_its_program_from_it(self):
+        (self.work / "script.py").write_text("x\n", encoding="utf-8")
+        (self.work / "to-dev").symlink_to("/dev/stdin")
+        (self.work / "sub").mkdir()
         for command in (
             'python3 < "$f"',
             'python3 - < "$f"',
             'python3 /dev/stdin < "$f"',
-            "python3 -c 'import os' < \"$f\"",
+            'python3 //dev/stdin < "$f"',
+            'python3 /./dev/stdin < "$f"',
+            'python3 /tmp/../dev/fd/0 < "$f"',
+            'python3 //proc/self/fd/0 < "$f"',
+            'python3 /proc/self/fd/0 < "$f"',
+            'python3 to-dev < "$f"',  # a link into /dev
+            'python3 missing.py < "$f"',  # no such file: it may be written by the line, or be the stdin
+            'python3 sub < "$f"',  # a directory
+            'python3 "$s" < "$f"',
+            'python3 -c "import os" < "$f"',
+            'python3 -ic x script.py < "$f"',
             "perl -e 'x' < \"$f\"",
+            'node - < "$f"',
+            'deno run - < "$f"',
+            'deno script.py < "$f"',
+            'bun run - < "$f"',
+            'bun script.py < "$f"',
             'sh < "$f"',
             'bash -s < "$f"',
-            'docker exec -i db sh < "$f"',
-            'docker exec -i db bash -c psql < "$f"',
+            'bash -s script.py < "$f"',
             'sed -f - < "$f"',
+            'cd sub && python3 script.py < "$f"',  # script.py does not exist in sub
+            'cd "$d" && python3 script.py < "$f"',  # a directory nobody knows
+            'docker exec -i db sh < "$f"',
+            'docker exec -i db mysql < "$f"',  # review: which program reads it in a container cannot be told from the words
+            'docker compose exec -T db psql -U u < "$f"',
+            'docker compose exec -T app python3.11 - psql < "$f"',
+            'docker exec -i app busybox ash -s psql < "$f"',
+            'podman exec -i db psql < "$f"',
+            'kubectl exec -i p -- psql < "$f"',
+            'sqlite3 x.db < "$f"',
+            'psql -f "$f" < "$g"',
+            'psql -c "$q" < "$f"',
+            'psql -qc "select 1" < "$f"',
+            'psql $url < "$f"',  # an unquoted word may be several, options among them
+            'mysql -e "$q" < "$f"',
+            'mysql --init-command="$q" db < "$f"',
+            'mysql --defaults-file=x < "$f"',
+            './psql < "$f"',
+            '/tmp/psql < "$f"',
         ):
             with self.subTest(command):
                 self.deny(command)
@@ -1665,14 +1708,14 @@ class TestIssueRegressions(Base):
                 self.deny(command)
 
     def test_43_the_name_of_the_file_is_still_a_path_the_gate_judges_by_the_rule_of_22(self):
+        (self.work / "script.py").write_text("x\n", encoding="utf-8")
         for command in (
             'python3 script.py < "$(echo ../Sensitive-data/people.csv)"',
             'python3 script.py < "$(echo ../Sens)itive-data/people.csv"',
             "psql < $(echo ../Sensitive-data/people.csv)",
             'psql < "$(echo ../Sens)itive-data/people.csv"',
-            "node app.js < ../Sensitive-data/people.csv",
+            "python3 script.py < ../Sensitive-data/people.csv",
             "python3 script.py < ../Sens*/people.csv",
-            'docker exec -i db mysql < "$(echo ../Sens)itive-data/people.csv"',
         ):
             with self.subTest(command):
                 self.deny(command)

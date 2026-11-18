@@ -98,11 +98,22 @@ FILTER_OPTIONS = {
 # where a program of STDIN_DATA may live when it is named by a path (`/usr/bin/sort`); any other path (`./cat`, `/tmp/x/sort`) is
 # a file the model may have written, not the filter (#43)
 SYSTEM_BINDIRS = ("/usr/bin", "/bin", "/usr/local/bin")
-# `< file` read by one of these is not text the line builds, even when the NAME of the file is built (#43): an interpreter run on a
-# script FILE of its own (`python3 script.py < "$f"`) and the clients of a database. A client that gets the same text from a
-# heredoc or a here-string with an expansion stays refused: `psql` and `mysql` run what they read (`\\!` is a shell command, `system`
-# in sqlite3 `.shell`), so only the text of a file that nobody built is data. The file name is still judged as the path it is (#22).
-DB_CLIENTS = {"psql", "mysql", "mariadb", "sqlite3"}
+# `< file` read by one of these is not text the line builds, even when the NAME of the file is built (#43): an interpreter or a shell run
+# on a script FILE of its own that exists (`python3 script.py < "$f"`) and a local client of a database that has only the options of
+# DB_OPTIONS. A client that gets the same text from a heredoc or a here-string with an expansion stays refused: `psql` and `mysql` run
+# what they read (`\!` is a shell command), so only the text of a file that nobody built is data. Review: no `deno` / `bun` (a
+# subcommand is no script), nothing in a container (`docker exec … psql`: which program reads it cannot be told from the words), no
+# `sqlite3` (a dot-command in an argument runs a shell). The file name is still judged as the path it is (#22).
+FILE_INTERPRETERS = {"python", "python3", "node", "nodejs", "perl", "ruby", "php", "lua"}
+# client -> (flags, options with a value, long options with a value): any other option may run a file or a command (`psql -f`/`-c`,
+# `mysql -e`/`--init-command`/`--defaults-file`)
+DB_OPTIONS = {
+    "psql": (frozenset({"-q", "-A", "-t", "-X", "-w", "-W", "-1", "--quiet", "--no-psqlrc"}), frozenset({"-h", "-p", "-U", "-d"}),
+             frozenset({"--host", "--port", "--username", "--dbname"})),
+    "mysql": (frozenset({"-s", "-B", "-N", "-q", "-p", "--batch", "--silent", "--skip-column-names", "--no-defaults"}),
+              frozenset({"-h", "-P", "-u", "-D"}), frozenset({"--host", "--port", "--user", "--database"})),
+}
+DB_OPTIONS["mariadb"] = DB_OPTIONS["mysql"]
 PYTHON_PLAIN_FLAGS = {"-u", "-B", "-O", "-OO", "-q", "-I", "-s", "-S", "-E"}  # python options that do not run or load code
 NESTED_UNKNOWN = SUBSTITUTION_ORIGINS + ("-c", "eval")  # a call there has arguments the old gate reports as None
 
@@ -737,9 +748,10 @@ class AstGate(gate.Gate):
         return None
 
     def _stdin_file_receiver(self, c: shell.Call, p: _Parsed, rebound: bool) -> bool:
-        """Does `c` read `< file` as data it did not build: an interpreter or shell that runs a script FILE of its own (`python3 script.py`,
-        `node app.js`, `bash run.sh`: the first operand, no option that gives a program), a database client (DB_CLIENTS), `docker exec … psql`?
-        A function, an alias, a name nobody can read or a wrapper that is not `command` / `nice` / `time` is not."""
+        """Does `c` read `< file` as data it did not build: an interpreter or a shell that runs a script FILE of its own (the first
+        operand: a literal, an existing regular file in each directory the call may run in, never under /dev, /proc, /sys, no
+        option but a plain flag of python), or a local database client with the options of DB_OPTIONS only? A function, an alias, a
+        name nobody can read, a name by a path outside the system directories, a wrapper that is not `command` / `nice` / `time` is not."""
         words = shell._effective(c.argv)
         if rebound or not words or not words[0].static or not self._known_location(words[0].text):
             return False
@@ -751,21 +763,59 @@ class AstGate(gate.Gate):
         if name in p.functions:
             return False
         args = words[1:]
-        if name in DB_CLIENTS:
-            return True
-        if name in ("docker", "podman"):
-            texts = [os.path.basename(w.text) for w in args if w.static]
-            return "exec" in texts and bool(DB_CLIENTS & set(texts)) and not (set(texts) & (SHELLS | shell.INTERPRETERS | {"env", "xargs", "sudo"}))
+        if name in DB_OPTIONS:
+            return self._plain_db_client(DB_OPTIONS[name], args)
         base = re.sub(r"[\d.]+$", "", name)
-        if base in shell.INTERPRETERS or name in shell.INTERPRETERS or name in SHELLS:
+        if base in FILE_INTERPRETERS or name in SHELLS:
             k = 0
             while base == "python" and k < len(args) and args[k].static and args[k].text in PYTHON_PLAIN_FLAGS:
                 k += 1
             script = args[k] if k < len(args) else None
-            return (
-                script is not None and script.static and not script.text.startswith(("-", "+", "/dev/", "/proc/")) and script.text != ""
-            )
+            dirs = sorted(c.cwds) if c.cwd_known else []
+            return script is not None and script.static and bool(dirs) and all(self._script_file(script.text, d) for d in dirs)
         return False
+
+    @staticmethod
+    def _script_file(text: str, cwd: str) -> bool:
+        """`text` names an existing regular file (not a device, not a pipe, not a link into /dev or /proc), by the name as written
+        (`//dev/stdin`, `/./dev/stdin`, `/tmp/../dev/fd/0` read as /dev/stdin) and by the real path."""
+        if not text or text.startswith(("-", "+")):
+            return False
+        path = os.path.normpath(os.path.join(cwd, text))
+        path = "/" + path.lstrip("/")  # POSIX keeps a leading `//`
+        try:
+            real = os.path.realpath(path)
+            return not any(x == q or x.startswith(q + "/") for x in (path, real) for q in ("/dev", "/proc", "/sys")) and os.path.isfile(real)
+        except OSError:
+            return False
+
+    @staticmethod
+    def _plain_db_client(spec, args: list[shell.Word]) -> bool:
+        """Only the options of `spec`, the values of those that take one, and operands: a word nobody can read is allowed as an operand
+        or as an option value only in quotes (it is one word then; unquoted it may be several, options among them)."""
+        flags, short_values, long_values = spec
+        k = 0
+        while k < len(args):
+            w = args[k]
+            k += 1
+            if not w.static:
+                if w.quoting not in ("double", "single"):
+                    return False
+                continue
+            t = w.text
+            if t == "--" or t == "-" or not t.startswith("-"):
+                continue
+            name, eq, _ = t.partition("=")
+            if t.startswith("--"):
+                if name in long_values:
+                    k += 0 if eq else 1
+                elif t not in flags:
+                    return False
+            elif t in short_values:
+                k += 1
+            elif t not in flags and not (t[:2] in short_values and len(t) > 2):  # `-hhost`
+                return False
+        return True
 
     def _reads_stdin_as_data(self, c: shell.Call, p: _Parsed, rebound: bool) -> bool:
         """Is `c` a program known to treat what it reads as data and never as code — a program of STDIN_DATA with options that
