@@ -50,6 +50,8 @@ VALUE_OPTIONS = {
     "sed": {"-e"}, "jq": {"--arg", "--argjson", "--slurpfile", "--rawfile"},
 }
 XARGS_VALUE_OPTIONS = {"-I", "-n", "-P", "-L", "-s", "-d", "-E", "-a", "--max-args", "--max-procs", "--delimiter", "--arg-file"}
+# the only commands a compound list may use to touch a sensitive source without reading it (they create, remove or change modes)
+CREATE_COMMANDS = {"mkdir", "rm", "rmdir", "touch", "chmod", "chown", "chgrp"}
 NESTED_UNKNOWN = SUBSTITUTION_ORIGINS + ("-c", "eval")  # a call there has arguments the old gate reports as None
 
 
@@ -743,6 +745,18 @@ class AstGate(gate.Gate):
                     found.append(r)
         return found
 
+    @staticmethod
+    def _prints_or_reads(stage: list[str]) -> bool:
+        """`-v` / `--verbose` prints the names it touches (names in a sensitive directory can be personal data); `touch -r`,
+        `--reference` read the metadata of another file."""
+        cmd = Path(stage[0]).name if stage else ""
+        for t in map(str, stage[1:]):
+            if re.fullmatch(r"-[A-Za-z]*v[A-Za-z]*", t) or (t.startswith("--v") and "--verbose".startswith(t.split("=")[0])):
+                return True
+            if t.startswith("--ref") or (cmd == "touch" and re.fullmatch(r"-[A-Za-z]*r[A-Za-z]*", t)):
+                return True
+        return False
+
     def _creates_only(self, tokens: list[str]) -> bool:
         """A compound line (`cd .. && mkdir Sensitive-data/x`, `mkdir -p S/n && echo a > S/n/n.txt`) whose every stage either
         touches no sensitive source at all (a `cd` included) or only CREATES in it — `mkdir` & co. (the no-output commands of
@@ -766,7 +780,7 @@ class AstGate(gate.Gate):
                 n in str(t).casefold() for i, t in enumerate(stage) if i not in writes for n in needles
             ):
                 continue  # touches no sensitive source; a write target is not a read
-            if cmd not in COPY_COMMANDS and super()._no_content(stage):
+            if cmd in CREATE_COMMANDS and not self._prints_or_reads(stage) and super()._no_content(stage):
                 continue  # `mkdir -p S/n`, `rm S/x`: no output
             return False
         return True

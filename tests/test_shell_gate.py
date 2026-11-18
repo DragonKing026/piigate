@@ -1168,6 +1168,28 @@ class TestIssueRegressions(Base):
                 with self.subTest(command):
                     self.deny(command, ("zsh",))
 
+    def test_c_a_creating_stage_prints_nothing_and_reads_nothing(self):
+        s = "../Sensitive-data"
+        for command in (
+            f"mkdir x && rm -rv {s}",
+            f"mkdir x && rm -v {s}/*",
+            f"mkdir -v {s}/a {s}/b && true",
+            f"cd {s} && rm -rv * && true",
+            f"mkdir x && chmod -R -v 600 {s}",
+            f"mkdir x && chmod --verbose 600 {s}/people.csv",
+            f"mkdir x && touch -r {s}/people.csv l && stat l",
+            f"mkdir x && touch -ar {s}/people.csv l",
+            f"mkdir x && chmod --reference={s}/people.csv x",
+            f"mkdir x && chown --ref {s}/people.csv x",
+            f"cd {s} && sha256sum people.csv && true",  # it does not create: a read
+            f"mkdir x && sha256sum {s}/people.csv",
+        ):
+            with self.subTest(command):
+                self.deny(command)
+        for command in (f"mkdir -p {s}/n && touch {s}/n/f", f"mkdir x && rm -r {s}/n", f"mkdir x && chmod -R 600 {s}"):
+            with self.subTest(command):
+                self.allow(command)
+
     # -- #22: a path made by a command substitution is an unknown path for a command that reads files
     def test_22_a_substitution_as_the_operand_of_a_reader_is_refused(self):
         s = "../Sens*/people.csv"
