@@ -19,7 +19,7 @@ from . import config
 
 PSEUDONYM_RE = re.compile(r"\b([A-Z][A-Z_]*[A-Z])_(\d+)\b")
 MAIL_HANDLE = "MAILREF"
-MAIL_HANDLE_RE = re.compile(rf"\b{MAIL_HANDLE}_(\d+)\b")
+MAIL_HANDLE_RE = re.compile(rf"\b{MAIL_HANDLE}_([0-9]+)\b", re.ASCII)  # ASCII digits only (\d matches ٣ too)
 
 
 def _prepare_dir() -> Path:
@@ -117,15 +117,16 @@ class PseudonymMap:
         """`MAILREF_<n>` → the identifier; nothing else is restored (no content pseudonym)."""
 
         def substitute(m: re.Match) -> str:
-            row = self._db.execute("SELECT original FROM mail_handles WHERE number = ?", (int(m.group(1)),)).fetchone()
-            return row[0] if row else m.group(0)
+            return self.mail_handle_original(m.group(0)) or m.group(0)
 
         return MAIL_HANDLE_RE.sub(substitute, text)
 
     def mail_handle_original(self, handle: str) -> str | None:
         """The identifier behind one exact `MAILREF_<n>` handle; None for anything else (unknown, or not a handle)."""
-        m = MAIL_HANDLE_RE.fullmatch(handle.strip())
-        row = self._db.execute("SELECT original FROM mail_handles WHERE number = ?", (int(m.group(1)),)).fetchone() if m else None
+        m = MAIL_HANDLE_RE.fullmatch(handle)  # no strip, no leading zeros: one spelling per handle
+        if not m or str(int(m.group(1))) != m.group(1):
+            return None
+        row = self._db.execute("SELECT original FROM mail_handles WHERE number = ?", (int(m.group(1)),)).fetchone()
         return row[0] if row else None
 
     def stats(self) -> dict[str, int]:

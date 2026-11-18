@@ -218,6 +218,10 @@ class TestPiigateServer(unittest.TestCase):
             {"message_id": FAKE_MESSAGE_ID, "folder_path": folder},  # a raw identifier
             {"message_id": message_id, "folder_path": f"imap://x/{folder}"},
             {"message_id": f"{message_id} {message_id}", "folder_path": folder},
+            {"message_id": " " + message_id, "folder_path": folder},  # one spelling per handle
+            {"message_id": "MAILREF_007", "folder_path": folder},
+            {"message_id": "MAILREF_\u0663", "folder_path": folder},
+            {"message_id": message_id, "folder_path": "imap://someone@host.test/INBOX"},  # a value with "@" must be a handle
         ]
         results = session(PIIGATE_SERVER, [("piigate_mail_get", c) for c in cases])[1:]
         for arguments, w in zip(cases, results):
@@ -226,6 +230,21 @@ class TestPiigateServer(unittest.TestCase):
                 self.assertIn("[piigate] denied", text(w))
                 self.assertNotIn("przyklad-firma", whole(w))  # the refusal never quotes a value
                 self.assertEqual(leaks(whole(w)), [])
+
+    def test_mail_identifier_plain_values(self):
+        """Review of #42: a value without "@" is shown by the filter as it is (a `mailbox:///…` folder), so it is passed on as
+        it is; a value with "@" has to be a handle."""
+        from piigate import FilterError, analysis
+        from piigate.pseudonym_map import PseudonymMap
+
+        pseudonym_map = PseudonymMap()
+        handle = pseudonym_map.mail_handle(FAKE_MESSAGE_ID)
+        self.assertEqual(analysis.resolve_mail_identifier("mailbox:///INBOX", "folder_path", pseudonym_map), "mailbox:///INBOX")
+        self.assertEqual(analysis.resolve_mail_identifier("12345", "message_id", pseudonym_map), "12345")
+        self.assertEqual(analysis.resolve_mail_identifier(handle, "message_id", pseudonym_map), FAKE_MESSAGE_ID)
+        for bad in ("a@b.test", "", "  ", "x\ny", "MAILREF_99999", "see MAILREF_1"):
+            with self.subTest(bad=bad), self.assertRaises(FilterError):
+                analysis.resolve_mail_identifier(bad, "message_id", pseudonym_map)
 
     def test_mail_get_several_servers(self):
         """`anonymization.mail_mcp` as a list: a server that fails to start is skipped, one that does not have the message
@@ -254,6 +273,7 @@ class TestPiigateServer(unittest.TestCase):
         with self.assertRaises(FilterError) as caught:
             analysis.get_mail(message_id, folder, cfg, pseudonym_map)
         self.assertNotIn("przyklad-firma", str(caught.exception))
+        self.assertIn("mail server #", str(caught.exception))  # a number, never the server's command
 
     @unittest.skipUnless(PRESIDIO, "the Presidio container is not reachable")
     def test_search(self):
