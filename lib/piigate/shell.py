@@ -941,6 +941,14 @@ def _effective(argv: list[Word]) -> list[Word]:
     return words
 
 
+ARGUMENT_RUNNERS = {"xargs", "parallel", "find", "fd", "watch", "flock", "script", "chrt", "taskset", "ionice", "trap", "alias"}
+
+
+def _runs_arguments(argv: list[Word], at: int) -> bool:
+    """The command word (at `at`) is not a plain program: it runs what it is given, or it is not known."""
+    return at >= len(argv) or not argv[at].static or os.path.basename(argv[at].text) in ARGUMENT_RUNNERS
+
+
 def _script_words(argv: list[Word]) -> tuple[str, list[Word]] | None:
     """('bash', [script word]) for `bash -c SCRIPT`, ('eval', args) for eval; None otherwise."""
     words = _effective(argv)
@@ -1338,8 +1346,14 @@ class _Walker:
         i = 0
         done: set[int] = set()  # a script reached from two starting words (`sudo bash -c S`) runs once
         argv = self.resolved_argv(call)
+        command_at = len(argv) - len(_effective(argv))  # where the command itself starts, after `sudo -u x`, `env A=1`, `time`…
         while i < len(argv):
             found = _script_words(argv[i:])
+            if found and found[0] == "eval" and i != command_at and not _runs_arguments(argv, command_at):
+                # `eval` is a builtin: it is the command word, not an argument that a program may be given (`playwright-cli eval
+                # "document.querySelectorAll('.x')"`, `node eval x`); behind a program that runs its arguments (`xargs`) it stays code
+                i += 1
+                continue
             if found and not (found[1] and id(found[1][0]) in done):
                 done.update(id(w) for w in found[1][:1])
                 state = self.run_script(call, st, *found)

@@ -943,5 +943,58 @@ class TestDirectoryModel(Base):
         self.assertEqual((b.piped_stderr, c.piped_stderr), (False, True))
 
 
+class TestIssueRegressions(Base):
+    """Cases of the issues the tree front-end was built for (#22, #26, #27, #32, #34): each denial that was a false alarm
+    now passes, each one that protects stays. The old gate is the reference only where a test says so."""
+
+    def allow(self, command: str, dialects=("bash", "zsh")) -> None:
+        for dialect in dialects:
+            self.assertIsNone(self.ast(dialect).bash(command), (dialect, command))
+
+    def deny(self, command: str, dialects=("bash", "zsh")) -> None:
+        for dialect in dialects:
+            self.assertIsNotNone(self.ast(dialect).bash(command), (dialect, command))
+
+    # -- #34: JavaScript in a quoted argument (`playwright-cli eval "…"`) is text, not `eval` and not a glob qualifier
+    def test_34_eval_as_an_argument_of_a_program_is_not_the_builtin(self):
+        for command in (
+            'playwright-cli eval "document.querySelectorAll(\\".x\\").length"',
+            'playwright-cli eval "[...document.links].map(e=>e.href)"',
+            "playwright-cli eval 'document.querySelectorAll(\".x\").length'",
+            "node eval x.js",
+        ):
+            with self.subTest(command):
+                self.allow(command)
+                self.assertEqual(self.ast("bash").parse_error, "")
+        calls = shell.parse('playwright-cli eval "document.querySelectorAll(1).length"', cwd=str(self.work))
+        self.assertEqual([c.name for c in calls], ["playwright-cli"])  # the text after `eval` is not read as a script
+
+    def test_34_the_real_eval_and_real_qualifiers_are_still_refused(self):
+        self.deny("ls *(e:'echo hi':)", ("zsh",))
+        for command in (
+            "eval 'cat ../Sensitive-data/people.csv'",
+            "env eval 'cat ../Sensitive-data/people.csv'",
+            "command eval 'cat ../Sensitive-data/people.csv'",
+            "xargs eval 'cat ../Sensitive-data/people.csv'",
+            "echo a | xargs -I{} eval 'cat ../Sensitive-data/people.csv'",
+        ):
+            with self.subTest(command):
+                self.deny(command)
+        self.deny("eval 'ls'; cat ../Sensitive-data/people.csv")
+        self.deny("playwright-cli eval 'x'; cat ../Sensitive-data/people.csv")
+
+    # -- #27: a script written from a heredoc and run is judged by what it says; one built from run-time text is refused
+    def test_27_a_script_written_from_a_literal_heredoc_may_run(self):
+        for last in ('bash "$f"', 'wc -l "$f"', "true"):
+            command = f"f=/tmp/pgx/a.sh; cat > \"$f\" <<'SH'\necho ok\nSH\n{last}; rm -f \"$f\""
+            with self.subTest(last):
+                self.allow(command)
+
+    def test_27_a_script_written_from_run_time_text_is_refused(self):
+        for command in ('echo "$x" > s.sh; bash s.sh', "printf '%s' \"$x\" > s.sh; bash s.sh"):
+            with self.subTest(command):
+                self.deny(command)
+
+
 if __name__ == "__main__":
     unittest.main()

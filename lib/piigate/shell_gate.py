@@ -555,6 +555,28 @@ class AstGate(gate.Gate):
         expanded = {w for b in texts if not b.quoted for w in self._body_words(b.text)}
         return p.view, inner - rest, inner - rest - expanded, body
 
+    def _runs_text(self, tokens: list[str] | None) -> bool:
+        """Can the line run text as shell code? The old test looks for `eval` as a word ANYWHERE; here an `eval` that the tree
+        shows as an ARGUMENT of a program (`playwright-cli eval "document.querySelectorAll('.x')"`) is not the builtin: it
+        runs nothing, and the quoted text after it is data, not a glob qualifier (#34). Every `eval` word the old tokenizer
+        sees must be accounted for that way — else the line is judged as before."""
+        cur = self._current
+        if tokens is not None and cur is not None and cur.raw == self._raw:
+            evals = [t for t in tokens if Path(str(t)).name == "eval"]
+            if evals and len(evals) == sum(self._eval_arguments(c) for c in cur.calls):
+                tokens = [t for t in tokens if Path(str(t)).name != "eval"]
+        return super()._runs_text(tokens)
+
+    @staticmethod
+    def _eval_arguments(c: shell.Call) -> int:
+        """How many words `eval` the call has as arguments of a program that is not a launcher (`xargs`, `sudo`, a shell…)."""
+        if not c.argv or not c.argv[0].static:
+            return 0
+        words = shell._effective(c.argv)
+        if not words or not words[0].static or os.path.basename(words[0].text) in LAUNCHERS:
+            return 0
+        return sum(1 for w in words[1:] if w.static and w.text == "eval")
+
     def _stage_dirs(self, command: str, tokens: list[str]) -> list[list[str]]:
         p = self._cache.get(command) or self._lookup(command)
         if p is None or tokens is not p.tokens:
