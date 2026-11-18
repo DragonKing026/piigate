@@ -71,7 +71,7 @@ CREATE_FLAGS = {
 # option included (getopt_long takes `--co` for `--compress-program`), and every word that is not literal and not the value of
 # an option makes it no filter. A program of the list without an entry here has no option that runs anything (grep, cat, wc…).
 STDIN_DATA = shell.DATA_ONLY | {
-    "sort", "tee", "less", "more", "tac", "shuf", "pr", "fmt", "expand", "unexpand", "diff", "cmp", "comm", "jq", "gojq", "sed",
+    "sort", "tee", "less", "more", "tac", "pr", "fmt", "expand", "unexpand", "diff", "cmp", "comm", "jq", "gojq", "sed",
     "awk", "gawk", "mawk", "piigate", "pbcopy", "wl-copy", "xclip", "xsel",
 }
 # name -> (short flags, short options with a value, long flags, long options with the number of words they take)
@@ -120,7 +120,10 @@ PYTHON_PLAIN_FLAGS = {"-u", "-B", "-O", "-OO", "-q", "-I", "-s", "-S", "-E"}  # 
 # of the data receivers and the data filters holds for such a call (#43)
 HARMLESS_ASSIGNMENTS = {"LC_ALL", "LANG", "TZ"}
 # names that, assigned or exported ANYWHERE in the line, change what a data receiver (git, gh, kubectl, openssl) starts
-RECEIVER_ENVIRONMENT = re.compile(r"(?:GIT|GH|KUBE|OPENSSL|LD)_\w*|EDITOR|VISUAL|PAGER|BROWSER|PATH|BASH_ENV|ENV|KUBECONFIG")
+RECEIVER_ENVIRONMENT = re.compile(
+    r"(?:GIT|GH|KUBE|OPENSSL|LD|MYSQL|NODE)_\w*|PG\w*|PYTHON\w*|PERL5\w*|RUBY\w*|LESS\w*|AWK\w*|HOME|XDG_CONFIG_HOME|PSQLRC|"
+    r"EDITOR|VISUAL|PAGER|BROWSER|PATH|BASH_ENV|ENV|KUBECONFIG"
+)
 NESTED_UNKNOWN = SUBSTITUTION_ORIGINS + ("-c", "eval")  # a call there has arguments the old gate reports as None
 
 
@@ -759,7 +762,10 @@ class AstGate(gate.Gate):
         option but a plain flag of python), or a local database client with the options of DB_OPTIONS only? A function, an alias, a
         name nobody can read, a name by a path outside the system directories, a wrapper that is not `command` / `nice` / `time` is not."""
         words = shell._effective(c.argv)
-        if rebound or not words or not words[0].static or self._prefix_assignment(c) or not self._known_location(words[0].text):
+        if (
+            rebound or not words or not words[0].static or self._prefix_assignment(c) or not self._known_location(words[0].text)
+            or self._receiver_environment_changed(p) or self._line_writes(p)
+        ):
             return False
         if len(words) != len(c.argv) and not {
             os.path.basename(w.text) for w in c.argv[: len(c.argv) - len(words)] if w.static
@@ -845,7 +851,7 @@ class AstGate(gate.Gate):
         `piigate text` / `table`), possibly behind `xargs` (judged by what it runs; `xargs` alone runs `echo`)? A function, an
         alias, a name nobody can read, a wrapper that is not `command` / `nice` / `time` is not."""
         words = shell._effective(c.argv)
-        if rebound or not words or not words[0].static or self._prefix_assignment(c):
+        if rebound or not words or not words[0].static or self._prefix_assignment(c) or self._receiver_environment_changed(p):
             return False
         if len(words) != len(c.argv) and not {
             os.path.basename(w.text) for w in c.argv[: len(c.argv) - len(words)] if w.static
@@ -882,6 +888,8 @@ class AstGate(gate.Gate):
         if scanned is None:
             return False
         operands, values = scanned
+        if name in ("less", "more") and any(o.startswith("+") for o in operands):
+            return False  # `less +!cmd`: an operand that starts with `+` is a command of the pager
         if name == "sed":
             programs = [v for o, v in values if o in ("e", "--expression")] or [operands[0] if operands else None]
             return all(t is not None and self._sed_script_ok(t) for t in programs)
@@ -902,6 +910,31 @@ class AstGate(gate.Gate):
                 return True
         return False
 
+    _WRITERS = {"tee", "cp", "mv", "dd", "install", "ln", "truncate", "rsync", "shuf", "sort", "split", "csplit"}
+
+    @classmethod
+    def _line_writes(cls, p: _Parsed) -> bool:
+        """Does the line WRITE a file anywhere: a redirection `>` / `>>` / `>|` / `&>` / `<>` (not to /dev), `tee`, `cp`, `mv`, `dd`,
+        `install`, `ln`, `sed -i`, `curl -o` / `-O`, `wget -O`…? Then a script that the line names may be the one it writes: no `<`
+        exception (#43, review)."""
+        for c in p.calls:
+            if any(
+                r.op in (">", ">>", ">|", "&>", "&>>", "<>")
+                and not (r.target is not None and r.target.static and r.target.text.startswith("/dev/"))
+                for r in c.redirects
+            ):
+                return True
+            texts = [w.text for w in c.argv[1:]]
+            if c.name in cls._WRITERS:
+                return True
+            if c.name == "sed" and any(re.fullmatch(r"-[A-Za-z]*i[A-Za-z]*", t) or t.startswith("--in-place") for t in texts):
+                return True
+            if c.name in ("curl", "wget", "http", "https", "xh", "aria2c") and any(
+                t.startswith(("-o", "-O", "--output", "--remote-name")) for t in texts
+            ):
+                return True
+        return False
+
     @staticmethod
     def _prefix_assignment(c: shell.Call) -> bool:
         """The call has an assignment in front of it that is not a harmless one: `NAME=value cmd`."""
@@ -909,7 +942,8 @@ class AstGate(gate.Gate):
 
     @staticmethod
     def _receiver_environment_changed(p: _Parsed) -> bool:
-        """Does the line assign or export a variable that decides what git, gh, kubectl or openssl start (GIT_EDITOR, EDITOR, PATH…)?"""
+        """Does the line assign or export a variable that decides what a program that reads stdin or a script starts (GIT_EDITOR,
+        EDITOR, PATH, HOME, PYTHONPATH, PSQLRC, NODE_OPTIONS, LESSOPEN…; RECEIVER_ENVIRONMENT)? Used for every data exception (#43)."""
         for c in p.calls:
             if any(RECEIVER_ENVIRONMENT.fullmatch(a.name) for a in c.assigns):
                 return True
@@ -964,7 +998,7 @@ class AstGate(gate.Gate):
         return (
             texts[:1] in (["commit"], ["tag"])
             and self._stdin_flag(texts[1:], "-F", ("--file",))
-            and not self._has_option(texts[1:], "etcC", ("--edit", "--reedit-message", "--reuse-message", "--template", "--exec-path", "--git-dir", "--work-tree"))
+            and not self._has_option(texts[1:], "etcCpi", ("--edit", "--reedit-message", "--reuse-message", "--patch", "--interactive", "--include", "--template", "--exec-path", "--git-dir", "--work-tree"))
         )
 
     @staticmethod
@@ -1354,7 +1388,7 @@ class AstGate(gate.Gate):
         if not writes or all(self._safe_stage(core) for core in stages[min(k for k, _, _ in writes) + 1 :]):
             return False
         for c in cur.calls:
-            if c.name not in ("tee", "cat") or not c.pipes:
+            if c.name not in ("tee", "cat"):
                 continue
             dests = [w for w in c.argv[1:] if not w.text.startswith("-")] if c.name == "tee" else [
                 r.target for r in c.redirects if r.op in (">", ">>") and r.target is not None
@@ -1369,6 +1403,8 @@ class AstGate(gate.Gate):
                 for s, f in self._pipeline_stages(cur, pid):
                     if s < stage and f.name in ("echo", "printf", "cat") and self._builds_text(f):
                         return True
+            if self._builds_text(c):  # the writer holds the text itself: `tee s.sh <<< "$x"`, `cat > s.sh <<EOF … $x … EOF`
+                return True
         return False
 
     @staticmethod

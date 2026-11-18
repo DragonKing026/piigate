@@ -1934,6 +1934,68 @@ class TestIssueRegressions(Base):
                 self.deny(command)
         self.allow("cd .. && mkdir -p Sensitive-data/n && echo a > Sensitive-data/n/n.txt")
 
+    def test_43_review_5_small_fixes(self):
+        (self.work / "script.py").write_text("x\n", encoding="utf-8")
+        (self.work / "app.js").write_text("x\n", encoding="utf-8")
+        for command in (
+            # 1: a write anywhere in the line ends the `<` exception; a writer that holds built text is a script written from it
+            'tee script.py <<<"$x"; python3 script.py',
+            'cat > script.py <<EOF\n$x\nEOF\npython3 script.py < "$f"',
+            'tee s.sh <<EOF\n$x\nEOF\nbash s.sh',
+            'echo "$x" > o.txt; python3 script.py < "$f"',
+            'cp a.py script.py; python3 script.py < "$f"',
+            'mv a.py script.py && python3 script.py < "$f"',
+            'sed -i s/a/b/ script.py; python3 script.py < "$f"',
+            'curl -o script.py u; python3 script.py < "$f"',
+            'dd of=script.py if=a; python3 script.py < "$f"',
+            'install a script.py; python3 script.py < "$f"',
+            'ln -sf a script.py; python3 script.py < "$f"',
+            'echo a | tee x; python3 script.py < "$f"',
+            # 2: shuf -o writes a file
+            'echo "$x" | shuf -o s.sh; sh s.sh',
+            'echo "$x" | shuf',
+            # 3: the environment of the line, also for the `<` exception and the filters
+            'export HOME=/tmp/h; git commit -F - <<<"$x"',
+            'export PYTHONPATH=m; python3 script.py < "$f"',
+            'export PSQLRC=x; psql < "$f"',
+            'export NODE_OPTIONS=x; node app.js < "$f"',
+            'export PATH=.:$PATH; echo "$x" | sort',
+            'PATH=.; echo "$x" | sort',
+            'export LESSOPEN="||-sh %s"; echo "$x" | less',
+            'export XDG_CONFIG_HOME=/tmp/c; psql < "$f"',
+            'export PGSERVICEFILE=x; psql < "$f"',
+            'export MYSQL_HOME=x; mysql < "$f"',
+            'export RUBYOPT=x; ruby script.py < "$f"',
+            'export PERL5OPT=x; perl script.py < "$f"',
+            # 4: git commit -F - with patch / interactive mode
+            'echo "$x" | git commit -p -F -',
+            'echo "$x" | git commit --patch -F -',
+            'echo "$x" | git commit --pa -F -',
+            'echo "$x" | git commit -i -F -',
+            'echo "$x" | git commit --interactive -F -',
+            'echo "$x" | git commit --inter -F -',
+            'echo "$x" | git commit -aiF -',
+            'echo "$x" | git commit -apF -',
+            # 5: an operand that starts with `+` is a command of the pager
+            'echo "$x" | less +!sh',
+            'echo "$x" | less "+!sh"',
+            'echo "$x" | more +/x',
+            'echo "$x" | less -S +G',
+        ):
+            with self.subTest(command):
+                self.deny(command)
+        for command in (
+            'echo "$x" | less -S',
+            'echo "$x" | more',
+            'echo "$x" | git commit -F -',
+            'tee out.txt <<<"ok"',
+            'cat <<EOF > notes.txt\nplain\nEOF',
+            'python3 script.py < "$f"',
+            'export LC_ALL=C; echo "$x" | sort',
+        ):
+            with self.subTest(command):
+                self.allow(command)
+
 
 if __name__ == "__main__":
     unittest.main()
