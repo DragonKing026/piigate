@@ -1190,6 +1190,48 @@ class TestIssueRegressions(Base):
             with self.subTest(command):
                 self.allow(command)
 
+    def test_a_text_with_an_expansion_given_to_code_is_code_nobody_can_read(self):
+        """#41 and the human-only words: `echo "$(echo piigate) reverse" | sh` is `bash -c "$x"` with another syntax."""
+        for sink in (
+            "sh", "bash", "zsh -s", "/bin/sh", "env sh", "sudo sh", "python3", "perl", "node", "ssh localhost", "at now", "xargs sh",
+            'xargs -I{} sh -c "{}"',
+        ):
+            for feeder in ('echo "$(echo piigate) reverse"', 'printf "%s reverse" "$(echo piigate)"', 'printf "%s project approve" "$(echo piigate)"',
+                           'printf "%s shadow-off" "$(echo piigate)"'):
+                command = f"{feeder} | {sink}"
+                with self.subTest(command):
+                    self.deny(command)
+        for command in (
+            'sh <<< "$(echo piigate) reverse"',
+            "cat <<EOF | sh\n$(echo piigate) reverse\nEOF",
+            "sh <<EOF\n$(echo piigate) reverse\nEOF",
+            'sh <(echo "$(echo piigate) reverse")',
+            'source <(echo "$(echo piigate) reverse")',
+            'x=$(echo piigate); echo "$x reverse" | sh',
+        ):
+            with self.subTest(command):
+                self.deny(command)
+        for command in (  # literal text is read by the tree; an expansion that feeds a program that is no code reader is not it
+            "echo 'ls' | sh",
+            'echo "$(date)" | cat',
+            'echo "$(date) reverse" | xargs echo',
+            'echo "$(date)" | grep x',
+            "printf '%s' x | python3 -c 'print(1)'",
+        ):
+            with self.subTest(command):
+                self.allow(command)
+
+    def test_41_text_built_with_an_expansion_and_run_by_a_shell_reaches_the_sensitive_source(self):
+        for command in (
+            'echo "cat ../Sens$(echo itive)-data/people.csv" | sh',
+            'sh <<< "cat ../Sens$(echo itive)-data/people.csv"',
+            'printf "%s" "cat ../Sens$(echo itive)-data/people.csv" | bash',
+            'x=itive; echo "cat ../Sens${x}-data/people.csv" | sh',
+            'cat <<EOF | sh\ncat ../Sens$(echo itive)-data/people.csv\nEOF',
+        ):
+            with self.subTest(command):
+                self.deny(command)  # the production gate lets the first two through (reported separately as #41)
+
     # -- #22: a path made by a command substitution is an unknown path for a command that reads files
     def test_22_a_substitution_as_the_operand_of_a_reader_is_refused(self):
         s = "../Sens*/people.csv"

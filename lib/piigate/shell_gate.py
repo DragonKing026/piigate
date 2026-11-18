@@ -52,6 +52,8 @@ VALUE_OPTIONS = {
 XARGS_VALUE_OPTIONS = {"-I", "-n", "-P", "-L", "-s", "-d", "-E", "-a", "--max-args", "--max-procs", "--delimiter", "--arg-file"}
 # the only commands a compound list may use to touch a sensitive source without reading it (they create, remove or change modes)
 CREATE_COMMANDS = {"mkdir", "rm", "rmdir", "touch", "chmod", "chown", "chgrp"}
+# programs that run the text they read as shell code from stdin (besides the shells and interpreters the parser knows)
+STDIN_SINKS = {"ssh", "mosh", "sshpass", "at", "batch", "su", "sg", "newgrp", "runuser"}
 NESTED_UNKNOWN = SUBSTITUTION_ORIGINS + ("-c", "eval")  # a call there has arguments the old gate reports as None
 
 
@@ -529,6 +531,14 @@ class AstGate(gate.Gate):
                 return reason
             if reason := self._substituted_operand(self._current):
                 return reason
+            if self.sensitive or self.project_sensitive or self.sensitive_name:
+                c = self._expanded_into_code(self._current)
+                if c is not None:
+                    return (
+                        f"piigate: command denied — `{c.name or 'a command'}` runs text that a stage of the line builds with an "
+                        f"expansion (a substitution or a variable); the gate cannot read that code, and a sensitive source is "
+                        f"configured. {gate.HINT}"
+                    )
             return None
         except Exception as e:  # whatever the adapter did not foresee: deny, and say so
             self.internal_error = f"{type(e).__name__}: {e}"[:200]
@@ -601,6 +611,53 @@ class AstGate(gate.Gate):
                 )
         return None
 
+    @staticmethod
+    def _xargs_command(words: list[shell.Word]) -> list[shell.Word]:
+        """The command `xargs` runs (its words after the options)."""
+        args, k = words[1:], 0
+        while k < len(args) and args[k].static and args[k].text.startswith("-") and len(args[k].text) > 1:
+            k += 1 + (args[k].text in XARGS_VALUE_OPTIONS)
+        return shell._effective(args[k:])
+
+    def _expanded_into_code(self, p: _Parsed | None) -> shell.Call | None:
+        """A shell, an interpreter or a launcher of a shell (`| sh`, `| python3`, `| ssh host`, `| at now`, `| xargs sh -c`,
+        `sh <<< "…"`, a heredoc, `source <(…)`) reads TEXT that a stage with an expansion makes
+        (`echo "$(echo piigate) reverse" | sh`): code nobody can read, like `bash -c "$x"` (#41). Text without an expansion is
+        read by the tree (`echo 'ls' | sh`) and judged as before. Returns the call that reads it, or None."""
+        if p is None:
+            return None
+        live = {"param", "cmd", "proc", "arith"}
+
+        def expands(w: shell.Word | None) -> bool:
+            return w is not None and bool(live & w.kinds)
+
+        for i, c in enumerate(p.calls):
+            words = shell._effective(c.argv)
+            name = os.path.basename(words[0].text) if words and words[0].static else ""
+            if name == "xargs":
+                inner = self._xargs_command(words)
+                iname = os.path.basename(inner[0].text) if inner and inner[0].static else ""
+                sink = not inner or not inner[0].static or iname in SHELLS or iname in shell.INTERPRETERS
+            else:
+                sink = bool(c.stdin_interpreter) or name in STDIN_SINKS
+            into_arg = name in SHELLS | {"source", "."} and any("proc" in w.kinds for w in words[1:])
+            if not (sink or into_arg):
+                continue
+            own = [r for r in c.redirects if r.op in ("<<<", "<", "<<")]
+            fed = any(
+                expands(r.target) or (r.heredoc is not None and (r.heredoc.subst or r.heredoc.names)) for r in own
+            ) or into_arg
+            if not fed and c.piped_in:
+                feeders = [p.calls[j] for j in range(i) if p.calls[j].pipes_out]
+                fed = any(
+                    expands(w) for f in feeders for w in (*f.argv, *(r.target for r in f.redirects if r.target is not None))
+                ) or any(
+                    r.heredoc is not None and (r.heredoc.subst or r.heredoc.names) for f in feeders for r in f.redirects
+                )
+            if fed:
+                return c
+        return None
+
     # ------------------------------------------------------------------------------------------------ front-end
 
     def _strip_file_heredocs(self, command: str) -> str:
@@ -629,6 +686,8 @@ class AstGate(gate.Gate):
         p = self._cache.get(command)
         if p is None or tokens is None:
             return super()._human_only_dynamic(command, tokens, standalone)
+        if self._expanded_into_code(p) is not None:
+            return True  # text with an expansion given to a shell or an interpreter: code nobody can read (#41)
         rebound = any(c.name == "alias" or any(a.name in shell.CODE_ARRAYS for a in c.assigns) for c in p.calls)
         for c in p.calls:
             if c.opaque_code:
