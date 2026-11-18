@@ -724,6 +724,10 @@ class AstGate(gate.Gate):
                 return True
             if not words[0].static:
                 return False
+            if os.path.basename(words[0].text) in FILTER_OPTIONS:
+                # the input of xargs ends up in the arguments of a filter that takes a program or options — appended
+                # (`printf '%s\n' -e "e $x" | xargs sed p f`) or put in by `-I{}` / `-i` / `--replace` (`xargs -I{} awk {}`): code (#43)
+                return False
         name = os.path.basename(words[0].text)
         if name in p.functions or name not in STDIN_DATA:
             return False

@@ -1494,6 +1494,37 @@ class TestIssueRegressions(Base):
         self.assertFalse(g.sensitive or g.project_sensitive or g.sensitive_name)
         self.assertIsNone(g.bash('cat "$(echo x.csv)"'))
 
+    # -- #43 round 4: what an unaware agent could hit (the owner's scope: the gate stops accidental reads; a deliberate obfuscation is
+    # left to the output filter and the password of `piigate reverse` / `project approve`, see README "Limitations")
+    def test_43_xargs_gives_its_input_to_a_filter_that_takes_a_program_or_options_it_is_code(self):
+        for command in (
+            'echo "BEGIN{system(\\"$x reverse\\")}" | xargs -I{} awk {}',
+            'echo "$x" | xargs -I% sed "s/%/b/" f',
+            "printf '%s\\n' -e \"e $x\" | xargs sed p f",
+            'echo "$x" | xargs -i awk {}',
+            'echo "$x" | xargs --replace=@ sort @',
+            'echo "$x" | xargs sort',
+            'echo "$x" | xargs jq .',
+            'echo "$x" | xargs less',
+            'echo "$x" | xargs -n1 awk "{print}"',
+            'echo "$x" | xargs -0 sed p',
+        ):
+            with self.subTest(command):
+                self.deny(command)
+
+    def test_43_xargs_gives_its_input_to_a_program_without_such_options_it_is_data(self):
+        for command in (
+            'echo "$x" | xargs',
+            'echo "$x" | xargs grep y',
+            'echo "$x" | xargs -n1 wc -c',
+            'echo "$x" | xargs head -n 2',
+            'echo "$x" | xargs -I{} cat {}',
+            'echo "$x" | xargs -I{} grep {} f.txt',
+            'echo "$x" | xargs tail',
+        ):
+            with self.subTest(command):
+                self.allow(command)
+
 
 if __name__ == "__main__":
     unittest.main()
