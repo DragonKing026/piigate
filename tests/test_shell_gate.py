@@ -1021,6 +1021,49 @@ class TestIssueRegressions(Base):
             with self.subTest(command):
                 self.deny(command)
 
+    # -- #26: `approve` / `reverse` are refused where piigate RUNS them, not where the words stand beside a `$(…)`
+    def test_26_the_words_in_data_next_to_a_substitution_are_not_a_call(self):
+        for command in (
+            'X=$(echo hi); echo "$X https://example.test/api/orders/1/approve"',
+            'X=$(echo hi); echo "$X"; grep -c -E "a\\|approve" /dev/null',
+            "X=$(echo hi); python3 -c 'print(sorted([1, 2], reverse=True))'",
+            'echo "${HOME} approve"',
+            "git log --reverse $(git rev-parse HEAD)",
+            "echo $(date) reverse",
+        ):
+            with self.subTest(command):
+                self.allow(command)
+        for command in (  # the three lines of the issue: the text rule of the old gate refuses them (the intended difference)
+            'X=$(echo hi); echo "$X https://example.test/api/orders/1/approve"',
+            "X=$(echo hi); python3 -c 'print(sorted([1, 2], reverse=True))'",
+        ):
+            self.assertIsNotNone(self.old().bash(command), command)
+
+    def test_26_a_call_of_piigate_is_refused_wherever_it_stands(self):
+        for command in (
+            "X=$(piigate project approve)",
+            "piigate reverse x",
+            "echo a && piigate project approve",
+            'echo "$(piigate reverse)"',
+            "`piigate reverse`",
+            "echo a | piigate reverse",
+            "command piigate reverse x",
+            "/opt/x/piigate reverse x",
+            "sudo -u x piigate project approve",
+            "piigate rev''erse",
+            "x=rev; piigate ${x}erse",
+            "p=piigate; $p reverse",
+            "$c reverse",  # a command nobody can name: the word counts
+            "X=$(echo piigate); $X reverse",
+            'piigate "$sub" reverse',
+            'eval "$cmd"; echo reverse',
+            'bash -c "$x"; echo reverse',
+            "echo reverse | xargs piigate",
+            "python3 -c 'import subprocess; subprocess.run([\"piigate\",\"reverse\"])'",
+        ):
+            with self.subTest(command):
+                self.deny(command)
+
 
 if __name__ == "__main__":
     unittest.main()

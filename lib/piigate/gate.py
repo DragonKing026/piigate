@@ -2807,9 +2807,7 @@ class Gate:
                 continue
             flat = _flat(command)
             standalone = re.search(r"(?<![\w./-])piigate(?![\w.-])", flat)
-            suspicious = tokens is None or re.search(r"\$\(|`|<\(|\$\{|\beval\b", command) or (
-                standalone and "$" in command
-            )
+            suspicious = self._human_only_dynamic(command, tokens, bool(standalone))
             prefix = r"(?:project['\",\s]+)?" if word == "approve" else ""
             # `piigate reverse`, also in code: subprocess.run(['piigate', 'reverse', …])
             call = re.search(rf"(?<![\w./-])piigate['\",\s]+{prefix}{word}(?![\w-])", command) or any(
@@ -2827,6 +2825,15 @@ class Gate:
                     "Show the human the command to run."
                 )
         return None
+
+    def _human_only_dynamic(self, command: str, tokens: list[str] | None, standalone: bool) -> bool:
+        """The line may run `piigate` with a subcommand that its words do not show (a substitution, eval, a variable): the
+        word of `_human_only` anywhere in such a line counts as the call — by the text alone, conservatively."""
+        return bool(
+            tokens is None
+            or re.search(r"\$\(|`|<\(|\$\{|\beval\b", command)
+            or (standalone and "$" in command)
+        )
 
     @staticmethod
     def _runs_piigate(stage: list[str]) -> int | None:

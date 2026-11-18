@@ -524,6 +524,26 @@ class AstGate(gate.Gate):
             return super()._human_only(p.composed, tokens)
         return None
 
+    def _human_only_dynamic(self, command: str, tokens: list[str] | None, standalone: bool) -> bool:
+        """Is `piigate` possibly run with a subcommand the words do not show? The tree says: a command whose name is not
+        known (`$c reverse`, `$(echo piigate) reverse`), code the parser cannot read (`eval $x`, `bash -c "$x"`), a call
+        of piigate with an argument of unknown value (`piigate $sub`). A `$(…)` or `${…}` elsewhere in the line, or the word
+        `reverse` / `approve` in an argument of another program (a URL, a grep pattern, `sorted(…, reverse=True)`), is not
+        one (#26). A line the tree cannot tell about is judged by its text, as before."""
+        p = self._cache.get(command)
+        if p is None or tokens is None:
+            return super()._human_only_dynamic(command, tokens, standalone)
+        for c in p.calls:
+            if c.opaque_code:
+                return True
+            words = shell._effective(c.argv)
+            if words and not words[0].static:
+                return True
+            k = self._runs_piigate([w.text for w in c.argv])
+            if k is not None and any(not w.static for w in c.argv[k + 1 :]):
+                return True
+        return False
+
     def _tokens(self, command: str) -> list[str] | None:
         p = self._lookup(command)
         return None if p is None else p.tokens
