@@ -66,11 +66,34 @@ CREATE_FLAGS = {
     "chgrp": _OWNER_FLAGS,
 }
 # programs known to treat what they read from stdin (or from `<(…)`) as DATA, never as code — the only receivers of text that a
-# stage builds with an expansion (#41); everything else is a possible interpreter. `sed` / `awk` / `jq` / `rg` / `sort` / `piigate`
-# also need arguments that keep them so (`_reads_stdin_as_data`).
+# stage builds with an expansion (#41); everything else is a possible interpreter. A program that takes a program or a command in
+# an option has an explicit list of the options it may have there (FILTER_OPTIONS): every other option, an abbreviated long
+# option included (getopt_long takes `--co` for `--compress-program`), and every word that is not literal and not the value of
+# an option makes it no filter. A program of the list without an entry here has no option that runs anything (grep, cat, wc…).
 STDIN_DATA = shell.DATA_ONLY | {
-    "sort", "tee", "less", "more", "tac", "shuf", "pr", "fmt", "expand", "unexpand", "diff", "cmp", "comm", "rg", "jq", "gojq",
-    "sed", "awk", "gawk", "mawk", "piigate", "pbcopy", "wl-copy", "xclip", "xsel",
+    "sort", "tee", "less", "more", "tac", "shuf", "pr", "fmt", "expand", "unexpand", "diff", "cmp", "comm", "jq", "gojq", "sed",
+    "awk", "gawk", "mawk", "piigate", "pbcopy", "wl-copy", "xclip", "xsel",
+}
+# name -> (short flags, short options with a value, long flags, long options with the number of words they take)
+_JQ_OPTIONS = ("rcsnCMSaejR", "", frozenset({
+    "--raw-output", "--compact-output", "--slurp", "--null-input", "--color-output", "--monochrome-output", "--sort-keys",
+    "--ascii-output", "--exit-status", "--join-output", "--raw-input", "--tab", "--seq", "--stream", "--raw-output0",
+}), {"--arg": 2, "--argjson": 2, "--indent": 1})
+FILTER_OPTIONS = {
+    "sed": ("nErsuz", "e", frozenset({"--quiet", "--silent", "--regexp-extended", "--separate", "--unbuffered", "--null-data"}),
+            {"--expression": 1}),
+    "sort": ("bdfghiMnrRuVzcCms", "ktS", frozenset({
+        "--ignore-leading-blanks", "--dictionary-order", "--ignore-case", "--general-numeric-sort", "--human-numeric-sort",
+        "--ignore-nonprinting", "--month-sort", "--numeric-sort", "--random-sort", "--reverse", "--stable", "--unique",
+        "--version-sort", "--zero-terminated", "--check", "--merge",
+    }), {"--key": 1, "--field-separator": 1, "--buffer-size": 1}),
+    "jq": _JQ_OPTIONS,
+    "gojq": _JQ_OPTIONS,
+    "awk": ("", "Fv", frozenset(), {}),
+    "gawk": ("", "Fv", frozenset(), {}),
+    "mawk": ("", "Fv", frozenset(), {}),
+    "less": ("NSRrFXiIqQsnwJ", "", frozenset(), {}),
+    "more": ("", "", frozenset(), {}),
 }
 NESTED_UNKNOWN = SUBSTITUTION_ORIGINS + ("-c", "eval")  # a call there has arguments the old gate reports as None
 
@@ -639,7 +662,7 @@ class AstGate(gate.Gate):
 
     def _expanded_into_code(self, p: _Parsed | None) -> shell.Call | None:
         """A stage that RECEIVES text a stage with an expansion makes — through a pipe, `<<<`, a heredoc, `<`, or a file argument
-        `<(…)` — and is not a known data filter (STDIN_DATA) is code nobody can read: `echo "$(echo piigate) reverse" | sh`,
+        `<(…)`, or the `>(…)` that a stage writes to — and is not a known data filter (STDIN_DATA) is code nobody can read: `echo "$(echo piigate) reverse" | sh`,
         `| python3`, `| busybox sh`, `| env -S sh`, `| make -f -`, `| awk '{system($0)}'`, `sh <<< "…"`, `python3 <(printf …)` (#41).
         The rule is fail closed: no list of programs that run their input is complete, so what is not known to be a filter is a
         sink. Feeders are the earlier stages of the SAME pipeline. Text without an expansion is read by the tree
@@ -664,20 +687,28 @@ class AstGate(gate.Gate):
             for pid, stage in c.pipes:
                 stages.setdefault(pid, []).append((stage, c))
         rebound = any(c.name == "alias" or any(a.name in shell.CODE_ARRAYS for a in c.assigns) for c in p.calls)
+        parent = {id(sub): c for c in p.calls for sub in c.substitutions}
+        fed_calls: set[int] = set()
         for c in p.calls:
             own = [r for r in c.redirects if r.op in ("<<<", "<", "<<")]
             fed = (
                 any(expands(r.target) or dynamic_heredoc(r) for r in own)
-                or any("proc" in w.kinds for w in c.argv)
+                or any("proc" in w.kinds and not w.text.startswith(">(") for w in c.argv)
                 or any(feeds(f) for pid, stage in c.pipes if stage for s, f in stages[pid] if s < stage)
             )
-            if fed and not self._reads_stdin_as_data(c, p, rebound):
-                return c
+            if c.origin == ">(" and (up := parent.get(id(c))) is not None:  # `tee >(sh)`, `printf "$x" > >(sh)`: its stdin is the output of `up`
+                fed = fed or id(up) in fed_calls or any(
+                    expands(w) for w in (*up.argv, *(r.target for r in up.redirects if r.target is not None)) if not w.text.startswith(">(")
+                )
+            if fed:
+                fed_calls.add(id(c))
+                if not self._reads_stdin_as_data(c, p, rebound):
+                    return c
         return None
 
     def _reads_stdin_as_data(self, c: shell.Call, p: _Parsed, rebound: bool) -> bool:
-        """Is `c` a program known to treat what it reads as data and never as code — a filter of STDIN_DATA with the arguments
-        that keep it so (`sed` / `awk` with a literal program of no `e` / `system` / pipe, no `-f`; `rg` without `--pre`;
+        """Is `c` a program known to treat what it reads as data and never as code — a program of STDIN_DATA with options that
+        keep it so (FILTER_OPTIONS; for `sed` a script of `_sed_script_ok`, for `awk` a program of `_awk_program_ok`;
         `piigate text` / `table`), possibly behind `xargs` (judged by what it runs; `xargs` alone runs `echo`)? A function, an
         alias, a name nobody can read, a wrapper that is not `command` / `nice` / `time` is not."""
         words = shell._effective(c.argv)
@@ -697,63 +728,159 @@ class AstGate(gate.Gate):
         if name in p.functions or name not in STDIN_DATA:
             return False
         args = words[1:]
-        if name in ("sed", "awk", "gawk", "mawk", "jq", "gojq"):
-            return self._literal_program(name, args)
         if name == "piigate":
             return bool(args) and args[0].static and args[0].text in ("text", "table")
-        if name == "sort":
-            return not any(w.static and w.text.startswith("--compress-program") for w in args)
-        if name == "rg":
-            return not any(w.static and w.text.startswith("--pre") for w in args)
+        spec = FILTER_OPTIONS.get(name)
+        if spec is None:
+            return True
+        scanned = self._scan_options(args, spec)
+        if scanned is None:
+            return False
+        operands, values = scanned
+        if name == "sed":
+            programs = [v for o, v in values if o in ("e", "--expression")] or [operands[0] if operands else None]
+            return all(t is not None and self._sed_script_ok(t) for t in programs)
+        if name in ("awk", "gawk", "mawk"):
+            return bool(operands) and self._awk_program_ok(operands[0])
         return True
 
     @staticmethod
-    def _literal_program(name: str, args: list[shell.Word]) -> bool:
-        """`sed` / `awk` / `jq` whose program is a literal word that cannot run a command: not from a file (`-f`), no `e`
-        command or `s///e` in sed, no `system`, pipe, `@load` / `@include` in awk (`-i`, `-l`, `-E` loaders too). A word that is
-        not literal where the program should be makes it unreadable."""
-        sed, awk = name == "sed", name in ("awk", "gawk", "mawk")
-        value_count = {"--arg": 2, "--argjson": 2, "--slurpfile": 2, "--rawfile": 2, "-L": 1, "--indent": 1}
-        explicit: list[str | None] = []  # programs given with -e / --expression / --source
-        first: list[str | None] = []  # the first operand: the program when none was given with an option
+    def _scan_options(args: list[shell.Word], spec) -> tuple[list[str], list[tuple[str, str | None]]] | None:
+        """The operands (literal texts) and the option values (option, text or None when not literal) of `args`, or None when an
+        option is not on the list of `spec`, or a word that is neither literal nor the value of an option is there (it may be an
+        option: getopt takes them after the operands too)."""
+        shorts, short_values, longs, long_values = spec
+        operands: list[str] = []
+        values: list[tuple[str, str | None]] = []
+        done = False
         k = 0
+
+        def take(option: str, n: int) -> bool:
+            nonlocal k
+            for _ in range(n):
+                if k >= len(args):
+                    return False
+                values.append((option, args[k].text if args[k].static else None))
+                k += 1
+            return True
+
         while k < len(args):
             w = args[k]
             k += 1
-            t = w.text if w.static else None
-            if t is None or t == "-" or not t.startswith("-"):
-                first = first or [t]
-                continue
-            if t == "--":
-                continue
-            if t in ("-f", "--from-file") or t.startswith("--file") or (sed and re.fullmatch(r"-[A-Za-z]*f[A-Za-z]*", t)):
+            if not w.static:
+                return None
+            t = w.text
+            if done or t == "-" or not t.startswith("-"):
+                operands.append(t)
+            elif t == "--":
+                done = True
+            elif t.startswith("--"):
+                name, eq, rest = t.partition("=")
+                if name in long_values:
+                    if eq:
+                        values.append((name, rest))
+                    if not take(name, long_values[name] - bool(eq)):
+                        return None
+                elif t not in longs:
+                    return None
+            else:
+                for j, ch in enumerate(t[1:], 1):
+                    if ch in short_values:
+                        if t[j + 1 :]:
+                            values.append((ch, t[j + 1 :]))
+                        elif not take(ch, 1):
+                            return None
+                        break
+                    if ch not in shorts:
+                        return None
+        return operands, values
+
+    @staticmethod
+    def _awk_program_ok(program: str) -> bool:
+        """An awk program that cannot run a command or write a file: nothing of `system`, `getline`, `|` (a pipe, `|&`), `>`
+        (a redirection), `@` (`@load`, `@include`), `ENVIRON`, `close`, `fflush` anywhere in its text — in a string too, since
+        no scan of strings and regular expressions is sure. What passes is `{print $2}` and `$1 == "x"`; a comparison with `>` does not."""
+        return not re.search(r"system|getline|[|>@]|ENVIRON|close|fflush|\bexec\b|PROCINFO|SYMTAB|FUNCTAB", program)
+
+    @staticmethod
+    def _sed_script_ok(text: str) -> bool:
+        """A sed script of the small grammar: commands `p` `d` `=` `q` `Q` `s` `y`, each with an optional address (a number,
+        `$`, `/re/` with `I` / `M`, or two of them with a comma, then `!`); `s` flags `g` `p` `I` `i` `M` `m` and digits. No
+        `e`, `w`, `W`, `r`, `R`, `x~y`, `+N`, `~N`, `\\cREc`, blocks, labels or comments — whatever the tokenizer does not
+        know is not a data filter."""
+        n = len(text)
+        i = 0
+
+        def part(i: int, d: str) -> int:
+            """The index after the next unescaped `d` (a backslash takes the next character), or -1."""
+            while i < n:
+                if text[i] == "\\":
+                    i += 2
+                elif text[i] == d:
+                    return i + 1
+                else:
+                    i += 1
+            return -1
+
+        def address(i: int) -> int:
+            if i < n and text[i] == "$":
+                return i + 1
+            if i < n and text[i].isdigit():
+                while i < n and text[i].isdigit():
+                    i += 1
+                return i
+            if i < n and text[i] == "/":
+                i = part(i + 1, "/")
+                while 0 < i < n and text[i] in "IM":
+                    i += 1
+                return i
+            return -1
+
+        while True:
+            while i < n and text[i] in " \t\n;":
+                i += 1
+            if i >= n:
+                return True
+            j = address(i)
+            if j >= 0:
+                i = j
+                if i < n and text[i] == ",":
+                    i = address(i + 1)
+                    if i < 0:
+                        return False
+                while i < n and text[i] in " \t":
+                    i += 1
+                if i < n and text[i] == "!":
+                    i += 1
+                    while i < n and text[i] in " \t":
+                        i += 1
+            if i >= n:
                 return False
-            if awk and re.match(r"-[filE]|--(include|load|exec)", t):
-                return False
-            if t.startswith(("--expression=", "--source=")):
-                explicit.append(t.split("=", 1)[1])
-            elif t in ("-e", "--expression", "--source") or ((sed or awk) and re.fullmatch(r"-[A-Za-z]*e", t)):
-                if k >= len(args):
+            c = text[i]
+            i += 1
+            if c in "pd=":
+                pass
+            elif c in "qQ":
+                while i < n and text[i].isdigit():
+                    i += 1
+            elif c in "sy":
+                if i >= n or text[i].isalnum() or text[i] in " \t\n\\;":
                     return False
-                explicit.append(args[k].text if args[k].static else None)
-                k += 1
-            elif awk and t in ("-F", "-v"):
-                k += 1
-            elif t in value_count:
-                k += value_count[t]
-        programs = explicit or first
-        if not programs or None in programs:
-            return False
-        for text in programs:
-            if sed and (
-                re.search(r"(?:^|[;{}\n])\s*(?:[0-9$]+(?:,[0-9$]+)?!?\s*)?e(?:\s|;|}|$)", text)
-                or re.search(r"s(.)(?:\\.|(?!\1).)*\1(?:\\.|(?!\1).)*\1[0-9gpIiMmw]*e", text)
-                or re.search(r"/!?\s*e(?:\s|;|}|$)", text)
-            ):
+                d = text[i]
+                i = part(i + 1, d)
+                if i < 0:
+                    return False
+                i = part(i, d)
+                if i < 0:
+                    return False
+                while c == "s" and i < n and text[i] in "gpIiMm0123456789":
+                    i += 1
+            else:
                 return False
-            if awk and re.search(r"\bsystem\b|\||@", re.sub(r'"(?:\\.|[^"\\])*"', '""', text)):
+            while i < n and text[i] in " \t":
+                i += 1
+            if i < n and text[i] not in ";\n":
                 return False
-        return True
 
     # ------------------------------------------------------------------------------------------------ front-end
 

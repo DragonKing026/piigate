@@ -1331,11 +1331,64 @@ class TestIssueRegressions(Base):
             'echo "$x" | less',
             'echo "$x" | base64',
             'echo "$x" | sha256sum',
-            'echo "$x" | rg y',
             'echo "$x" | while read l; do echo "$l"; done',
         ):
             with self.subTest(command):
                 self.allow(command)
+
+    def test_41_review_a_filter_has_a_list_of_allowed_options_and_a_small_script_grammar(self):
+        """Review of round 3: a list of BAD options is never complete (getopt_long takes `--co` for `--compress-program`, sed has
+        `1~1e` and `\\%re%e`, mawk has `-W exec`): a filter that takes a program or a command has a list of the options it may have;
+        a sed script is of a small grammar; awk is judged by a program that cannot run or write anything."""
+        feeder = 'echo "cat ../Sens$(echo itive)-data/people.csv" | '
+        for receiver in (
+            "mawk -W exec /dev/stdin", "mawk -W interactive '{print}'", "sort -S 1 --co=sh", "sort --compress=sh", "sort --compress-program sh",
+            "sort -o out", "sort --output=out", "sort -T /tmp", "sort --ran=x",
+            "sed --fil=- x", "sed --file=- x", "sed -f - x", "sed -nf - x", "sed -i p x", "sed --in-place p x", "sed --sandbox p",
+            "sed 1~1e", "sed 1,+0e", "sed '\\%re%e'", "sed '1,~2e'", "sed 'e'", "sed '1e echo x'", "sed -n '/x/e'", "sed 's/a/b/e'",
+            "sed 's/a/b/w out'", "sed 'w out'", "sed 'r x'", "sed 'R x'", "sed 'W x'", "sed '{p}'", "sed 'p;e'", "sed '2~2p'", "sed '#n'",
+            "sed ':a;N;$!ba'", "sed 'a text'", "sed 's/a/b/ge'", "sed -e p -e e", "sed -e 'p;e'", "sed --expression=e", "sed -ee",
+            "gawk --fil=x", "gawk --loa=x", "gawk -f x", "gawk -i x '{print}'", "gawk --source '{system(\"sh\")}'", "awk -e '{print}'",
+            "awk '{print > \"x\"}'", "awk '$1 > 5'", "awk '{\"date\" | getline}'", "awk 'BEGIN{getline}'", "awk '{system(\"sh\")}'",
+            "awk '@load \"x\"'", "awk '{print ENVIRON[\"X\"]}'", "awk -F: -f x", "awk -v x=1", "awk", "awk $prog", "jq -f x", "jq --from-file x", "jq -L . .a",
+            "jq --slurpfile a x .a", "jq --rawfile a x .a", "jq --fro=x", "jq --arg a", "jq .a $f", "less --lesskey-file=x", "sort $f", "sed p $f",
+        ):
+            command = feeder + receiver
+            with self.subTest(command):
+                self.deny(command)
+        for command in (
+            'echo "$(date)" | sed s/a/b/g',
+            'echo "$(date)" | sed -n "2p"',
+            'echo "$(date)" | sed -n "/x/p;\\$p"',
+            'echo "$(date)" | sed -E -e "s#a+#b#2" -e 3d',
+            'echo "$(date)" | sed "2,4!d"',
+            'echo "$(date)" | sed "/a/I,/b/ s/x/y/gI"',
+            'echo "$(date)" | sed -e "y/abc/xyz/;q"',
+            'echo "$(date)" | sed --expression="s/a/b/" --quiet',
+            'echo "$(date)" | sort -u',
+            'echo "$(date)" | sort -t, -k2,2nr',
+            'echo "$(date)" | sort -rn --key=2',
+            'echo "$(date)" | jq .a',
+            'echo "$(date)" | jq -r --arg k "$K" ".[\\$k]"',
+            'echo "$(date)" | jq --indent 2 -c .',
+            'echo "$(date)" | grep -c x',
+            'echo "$(date)" | awk "{print \\$2}"',
+            'echo "$(date)" | awk -F, -v n="$N" "{print \\$1, n}"',
+            'echo "$(date)" | tee >(cat > /dev/null)',
+            'echo "$(date)" | less -S',
+        ):
+            with self.subTest(command):
+                self.allow(command)
+
+    def test_41_review_a_process_substitution_that_receives_the_output_of_a_stage_is_a_receiver(self):
+        for command in (
+            'echo "cat ../Sens$(echo itive)-data/people.csv" | tee >(sh)',
+            'printf "%s" "cat ../Sens$(echo itive)-data/people.csv" > >(sh)',
+            'tee >(sh) <<< "cat ../Sens$(echo itive)-data/people.csv"',
+            'echo "cat ../Sens$(echo itive)-data/people.csv" | tee >(busybox sh) > /dev/null',
+        ):
+            with self.subTest(command):
+                self.deny(command)
 
     def test_41_a_function_or_an_alias_named_like_a_filter_is_not_one(self):
         for command in (
