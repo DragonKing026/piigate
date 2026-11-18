@@ -52,6 +52,19 @@ VALUE_OPTIONS = {
 XARGS_VALUE_OPTIONS = {"-I", "-n", "-P", "-L", "-s", "-d", "-E", "-a", "--max-args", "--max-procs", "--delimiter", "--arg-file"}
 # the only commands a compound list may use to touch a sensitive source without reading it (they create, remove or change modes)
 CREATE_COMMANDS = {"mkdir", "rm", "rmdir", "touch", "chmod", "chown", "chgrp"}
+# ... and the options they may have there (#32): (short flags, short options with a value, long flags, long options with a value).
+# Anything else — `-v`, `-c`, `--changes`, `-i`, `-I`, `--reference`, an abbreviated long option — can print the names it touches
+# (names in a sensitive directory can be personal data) or read another file, so it makes the stage a read.
+_OWNER_FLAGS = ("Rfh", "", ("--recursive", "--quiet", "--silent", "--no-dereference"), ())
+CREATE_FLAGS = {
+    "mkdir": ("p", "m", ("--parents",), ("--mode",)),
+    "rm": ("rRfd", "", ("--recursive", "--force", "--dir"), ()),
+    "rmdir": ("p", "", ("--parents", "--ignore-fail-on-non-empty"), ()),
+    "touch": ("amch", "dt", ("--no-create", "--no-dereference"), ("--date",)),
+    "chmod": _OWNER_FLAGS,
+    "chown": _OWNER_FLAGS,
+    "chgrp": _OWNER_FLAGS,
+}
 # programs known to treat what they read from stdin (or from `<(…)`) as DATA, never as code — the only receivers of text that a
 # stage builds with an expansion (#41); everything else is a possible interpreter. `sed` / `awk` / `jq` / `rg` / `sort` / `piigate`
 # also need arguments that keep them so (`_reads_stdin_as_data`).
@@ -890,14 +903,41 @@ class AstGate(gate.Gate):
 
     @staticmethod
     def _prints_or_reads(stage: list[str]) -> bool:
-        """`-v` / `--verbose` prints the names it touches (names in a sensitive directory can be personal data); `touch -r`,
-        `--reference` read the metadata of another file."""
+        """The stage has an option that is not on the list of its command (CREATE_FLAGS): `-v` / `--verbose`, `chmod -c`,
+        `--changes`, `rm -i` / `-I` print the names they touch; `touch -r`, `--reference` read the metadata of another file;
+        an option nobody listed is unknown. A word that starts with `$` (unresolved) may be an option too. `chmod -x f` / `+x` is
+        a mode, not an option."""
         cmd = Path(stage[0]).name if stage else ""
-        for t in map(str, stage[1:]):
-            if re.fullmatch(r"-[A-Za-z]*v[A-Za-z]*", t) or (t.startswith("--v") and "--verbose".startswith(t.split("=")[0])):
+        spec = CREATE_FLAGS.get(cmd)
+        if spec is None:
+            return True
+        shorts, short_values, longs, long_values = spec
+        words = [str(t) for t in stage[1:]]
+        i = 0
+        while i < len(words):
+            t = words[i]
+            i += 1
+            if t == "--":
+                return False  # the rest are operands
+            if t.startswith(("$", "`")):
                 return True
-            if t.startswith("--ref") or (cmd == "touch" and re.fullmatch(r"-[A-Za-z]*r[A-Za-z]*", t)):
-                return True
+            if not t.startswith("-") or t == "-":
+                continue
+            if cmd == "chmod" and re.fullmatch(r"[-+][rwxXstugo]+(?:,.*)?", t):
+                continue  # a mode (`-w`, `-x`), not an option
+            if t.startswith("--"):
+                name, eq, _ = t.partition("=")
+                if name in long_values:
+                    i += 0 if eq else 1  # `--mode 755`
+                elif t not in longs:
+                    return True
+                continue
+            for j, ch in enumerate(t[1:], 1):
+                if ch in short_values:
+                    i += 0 if t[j + 1 :] else 1  # `-m755` carries its value, `-m 755` takes the next word
+                    break
+                if ch not in shorts:
+                    return True
         return False
 
     def _creates_only(self, tokens: list[str]) -> bool:

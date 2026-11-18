@@ -1190,6 +1190,55 @@ class TestIssueRegressions(Base):
             with self.subTest(command):
                 self.allow(command)
 
+    def test_32_a_creating_stage_may_have_only_the_options_of_its_list(self):
+        """Round 3: the options are a list of the allowed ones (CREATE_FLAGS), not a list of the forbidden: `chmod -c` /
+        `--changes`, `rm -i` / `-I` print names, an abbreviated or unknown option is unknown."""
+        s = "../Sensitive-data"
+        for command in (
+            f"cd sub && chmod -Rc 600 {s}",
+            f"chmod --changes 600 {s}/people.csv && cd sub",
+            f"mkdir x && rm -i {s}/people.csv",
+            f"mkdir x && rm -I {s}/people.csv",
+            f"mkdir x && rm -ri {s}/n",
+            f"mkdir x && rm --interactive {s}/people.csv",
+            f"mkdir x && rm --rec {s}/n",  # an abbreviated long option is not on the list
+            f"mkdir x && chown -c me {s}/people.csv",
+            f"mkdir x && chgrp --changes users {s}/people.csv",
+            f"mkdir x && chmod --silent -c 600 {s}/people.csv",
+            f"mkdir x && rmdir -v {s}/n",
+            f"mkdir x && rmdir --verbose {s}/n",
+            f"mkdir x && touch --reference={s}/people.csv {s}/n",
+            f"mkdir x && touch -r {s}/people.csv l",
+            f"mkdir x && mkdir -pv {s}/n",
+            f"mkdir x && mkdir -Z {s}/n",
+            f'mkdir x && rm $flags {s}/n',  # an unresolved word may be an option
+            f"mkdir x && rm -f -i {s}/people.csv",
+        ):
+            with self.subTest(command):
+                self.deny(command)
+        for command in (
+            f"mkdir -p {s}/n && touch {s}/n/f",
+            f"mkdir x && rm -r {s}/n",
+            f"mkdir x && rm -rf {s}/n",
+            f"mkdir x && rm -R --force {s}/n",
+            f"mkdir x && rm -- {s}/n",
+            f"cd sub && mkdir {s}2",
+            f"mkdir -p {s}/n && echo a > {s}/n/n.txt",
+            f"mkdir x && mkdir -m 755 {s}/n",
+            f"mkdir x && mkdir -m755 {s}/n",
+            f"mkdir x && mkdir --mode=755 --parents {s}/n",
+            f"mkdir x && touch -a -m -c {s}/n",
+            f"mkdir x && touch -d 2020-01-01 {s}/n",
+            f"mkdir x && touch -t 202001010000 {s}/n",
+            f"mkdir x && touch --date=2020-01-01 {s}/n",
+            f"mkdir x && chmod -R 600 {s}",
+            f"mkdir x && chmod -R -f u+rw {s}",
+            f"mkdir x && chmod -w {s}/n",  # a mode, not an option
+            f"mkdir x && rmdir -p {s}/n",
+        ):
+            with self.subTest(command):
+                self.allow(command)
+
     def test_a_text_with_an_expansion_given_to_code_is_code_nobody_can_read(self):
         """#41 and the human-only words: `echo "$(echo piigate) reverse" | sh` is `bash -c "$x"` with another syntax."""
         for sink in (
