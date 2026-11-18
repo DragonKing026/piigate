@@ -1726,21 +1726,24 @@ class TestIssueRegressions(Base):
             'git tag -F - v1 <<EOF\n$x\nEOF',
             'echo "$x" | git commit -F -',
             'echo "$x" | git commit -a -F -',
-            'echo "$x" | git -C d commit -F-',
+            'echo "$x" | git commit -m "$m" -F -',
             'echo "$x" | git commit --file=-',
+            'echo "$x" | git commit -F-',
             'cat <<EOF | kubectl apply -f -\napiVersion: v1\nname: $N\nEOF',
             'echo "$x" | kubectl apply -f -',
+            'echo "$x" | kubectl apply -n "$ns" -f - -o yaml',
+            'echo "$x" | kubectl apply --dry-run=client --filename=-',
             'echo "$x" | gh pr comment 1 -F -',
             'echo "$x" | gh issue create --body-file - -t t',
+            'echo "$x" | gh issue create --body-file - -t "$t"',
             'echo "$x" | gh release create v1 --notes-file -',
-            'echo "$x" | docker login -u u --password-stdin',
-            'curl -s "$u" | python3 -m json.tool',
-            'curl -s "$u" | python3 -m json.tool --indent 2',
             'echo "$x" | openssl base64',
             'echo "$x" | openssl dgst -sha256',
             'echo "$x" | base64 -d | openssl dgst -sha256',
             'echo "$x" | base64 -d',
             'echo "$x" | base64',
+            'echo "$x" | LC_ALL=C sort',
+            'echo "$x" | LANG=C TZ=UTC git commit -F -',
         ):
             with self.subTest(command):
                 self.allow(command)
@@ -1751,22 +1754,93 @@ class TestIssueRegressions(Base):
             'echo "$x" | git log',
             'echo "$x" | git commit -m x',  # no `-F -`: nothing says it reads the text as a message
             'echo "$x" | git -c alias.ci="!sh" ci -F -',
+            'echo "$x" | git -c core.editor=sh commit -e -F -',
+            'echo "$x" | git -C d commit -F -',
+            'echo "$x" | git --git-dir=d commit -F -',
+            'echo "$x" | git --exec-path=. commit -F -',
+            'echo "$x" | git --work-tree=d commit -F -',
+            'echo "$x" | git commit -e -F -',  # review: the editor runs the text
+            'echo "$x" | git commit -eF -',
+            'echo "$x" | git commit --edit -F -',
+            'echo "$x" | git commit --ed -F -',
+            'echo "$x" | git commit --template=t -F -',
+            'echo "$x" | git commit --te t -F -',
+            'echo "$x" | git commit -t t -F -',
+            'echo "$x" | git commit -c HEAD -F -',
+            'echo "$x" | git commit -aF -',  # a cluster: may hold `-e`
+            'echo "$x" | git commit $opts -F -',
+            'GIT_EDITOR=sh git commit -eF - <<EOF\n$(date)\nEOF',  # review
+            'GIT_EDITOR=sh; echo "$x" | git commit -F -',
+            'export GIT_EDITOR=sh; echo "$x" | git commit -F -',
+            'export EDITOR=sh && echo "$x" | git commit -F -',
+            'export PATH=.:$PATH; echo "$x" | git commit -F -',
+            'echo "$x" | PATH=. git commit -F -',
+            'echo "$x" | GIT_EXEC_PATH=. git commit -F -',
+            'echo "$x" | GIT_PAGER=sh git tag -F - v1',
             'echo "$x" | gh alias set x -',
             'echo "$x" | gh extension exec x -F -',
+            'echo "$x" | gh pr create -e -F -',
+            'echo "$x" | gh pr create --editor --body-file -',
+            'echo "$x" | gh pr create --web --body-file -',
+            'echo "$x" | gh pr create --body-file - $opts',
+            'echo "$x" | gh api -F -',
+            'echo "$x" | GH_EDITOR=sh gh pr create --body-file -',
+            'export GH_PAGER=sh; echo "$x" | gh pr comment 1 -F -',
             'echo "$x" | kubectl exec -i p -- sh',
             'echo "$x" | kubectl apply -f x.yaml',
+            'echo "$x" | kubectl create -f -',  # only `apply` stays
+            'echo "$x" | kubectl delete -f -',
+            'echo "$x" | kubectl --kubeconfig=k apply -f -',
+            'echo "$x" | kubectl apply --kubeconfig=k -f -',
+            'echo "$x" | kubectl apply -f - --as-group=x',
+            'echo "$x" | kubectl apply -f - $opts',
+            'echo "$x" | KUBECONFIG=k kubectl apply -f -',
+            'echo "$x" | kubectl plugin-x -f -',
             'echo "$x" | docker exec -i c sh',
+            'echo "$x" | docker login -u u --password-stdin',  # review: the credential helper is chosen by PATH / DOCKER_CONFIG
+            'echo "$x" | podman login --password-stdin',
             'echo "$x" | docker login',
+            'curl -s "$u" | python3 -m json.tool',  # review: `-m` imports ./json or a package of PYTHONPATH
+            'curl -s "$u" | python3 -m json.tool --indent 2',
             'echo "$x" | python3 -m http.server',
             'echo "$x" | python3 -c "import sys"',
             'echo "$x" | xargs git commit -F -',  # through xargs the input is appended to the arguments
             'echo "$x" | openssl enc -d',
+            'echo "$x" | openssl dgst -engine e -sha256',
+            'echo "$x" | openssl dgst -provider-path . -sha256',
+            'echo "$x" | OPENSSL_CONF=c openssl base64',
             'echo "$x" | base64 -d | sh',  # the result of base64 goes to a shell
             'echo "$x" | ./git commit -F -',
             'echo "$x" | $c commit -F -',
         ):
             with self.subTest(command):
                 self.deny(command)
+
+    def test_43_a_prefix_assignment_takes_the_data_exceptions_of_the_call_away(self):
+        """Any assignment before the call (except LC_ALL, LANG, TZ) lets the environment decide what runs: `LESSOPEN=… less`,
+        `PATH=. sort`, `LD_PRELOAD=… cat` are no data filters; the same for the `<` exception (#43)."""
+        (self.work / "script.py").write_text("x\n", encoding="utf-8")
+        for command in (
+            'echo "$x" | LESSOPEN="||-sh %s" less -',
+            'echo "$x" | LESS="+!sh" less',
+            'echo "$x" | PATH=. sort',
+            'echo "$x" | LD_PRELOAD=./x.so cat',
+            'echo "$x" | AWKPATH=. awk "{print}"',
+            'echo "$x" | BASH_ENV=x grep y',
+            'echo "$x" | FOO=1 wc -c',
+            'echo "$x" | xargs_x=1 xargs grep y',
+            'PYTHONPATH=. python3 script.py < "$f"',
+            'PGOPTIONS=x psql < "$f"',
+        ):
+            with self.subTest(command):
+                self.deny(command)
+        for command in (
+            'echo "$x" | LC_ALL=C sort',
+            'echo "$x" | LANG=C LC_ALL=C TZ=UTC grep y',
+            'LC_ALL=C python3 script.py < "$f"',
+        ):
+            with self.subTest(command):
+                self.allow(command)
 
     def test_41_a_shell_reading_a_pipe_after_a_transforming_stage_is_code_nobody_can_read(self):
         """Literal text transformed into code (#41, #43): a shell or an interpreter that reads stdin from a pipe is code the line does

@@ -115,6 +115,12 @@ DB_OPTIONS = {
 }
 DB_OPTIONS["mariadb"] = DB_OPTIONS["mysql"]
 PYTHON_PLAIN_FLAGS = {"-u", "-B", "-O", "-OO", "-q", "-I", "-s", "-S", "-E"}  # python options that do not run or load code
+# a prefix assignment that is harmless to a program that reads its input as data (`LC_ALL=C sort`); any other (`LESSOPEN=… less`,
+# `PATH=. sort`, `GIT_EDITOR=sh git commit -e`, `LD_PRELOAD=… cat`) lets the environment decide what the program runs: no exception
+# of the data receivers and the data filters holds for such a call (#43)
+HARMLESS_ASSIGNMENTS = {"LC_ALL", "LANG", "TZ"}
+# names that, assigned or exported ANYWHERE in the line, change what a data receiver (git, gh, kubectl, openssl) starts
+RECEIVER_ENVIRONMENT = re.compile(r"(?:GIT|GH|KUBE|OPENSSL|LD)_\w*|EDITOR|VISUAL|PAGER|BROWSER|PATH|BASH_ENV|ENV|KUBECONFIG")
 NESTED_UNKNOWN = SUBSTITUTION_ORIGINS + ("-c", "eval")  # a call there has arguments the old gate reports as None
 
 
@@ -753,7 +759,7 @@ class AstGate(gate.Gate):
         option but a plain flag of python), or a local database client with the options of DB_OPTIONS only? A function, an alias, a
         name nobody can read, a name by a path outside the system directories, a wrapper that is not `command` / `nice` / `time` is not."""
         words = shell._effective(c.argv)
-        if rebound or not words or not words[0].static or not self._known_location(words[0].text):
+        if rebound or not words or not words[0].static or self._prefix_assignment(c) or not self._known_location(words[0].text):
             return False
         if len(words) != len(c.argv) and not {
             os.path.basename(w.text) for w in c.argv[: len(c.argv) - len(words)] if w.static
@@ -823,7 +829,7 @@ class AstGate(gate.Gate):
         `piigate text` / `table`), possibly behind `xargs` (judged by what it runs; `xargs` alone runs `echo`)? A function, an
         alias, a name nobody can read, a wrapper that is not `command` / `nice` / `time` is not."""
         words = shell._effective(c.argv)
-        if rebound or not words or not words[0].static:
+        if rebound or not words or not words[0].static or self._prefix_assignment(c):
             return False
         if len(words) != len(c.argv) and not {
             os.path.basename(w.text) for w in c.argv[: len(c.argv) - len(words)] if w.static
@@ -846,7 +852,7 @@ class AstGate(gate.Gate):
         name = os.path.basename(words[0].text)
         if name in p.functions:
             return False
-        if not via_xargs and self._data_receiver(name, words[1:]):  # (through xargs its input is APPENDED to the arguments: options)
+        if not via_xargs and self._data_receiver(name, words[1:], p):  # (through xargs its input is APPENDED to the arguments: options)
             return True
         if name not in STDIN_DATA:
             return False
@@ -880,34 +886,108 @@ class AstGate(gate.Gate):
                 return True
         return False
 
-    def _data_receiver(self, name: str, args: list[shell.Word]) -> bool:
+    @staticmethod
+    def _prefix_assignment(c: shell.Call) -> bool:
+        """The call has an assignment in front of it that is not a harmless one: `NAME=value cmd`."""
+        return any(a.name not in HARMLESS_ASSIGNMENTS for a in c.assigns)
+
+    @staticmethod
+    def _receiver_environment_changed(p: _Parsed) -> bool:
+        """Does the line assign or export a variable that decides what git, gh, kubectl or openssl start (GIT_EDITOR, EDITOR, PATH…)?"""
+        for c in p.calls:
+            if any(RECEIVER_ENVIRONMENT.fullmatch(a.name) for a in c.assigns):
+                return True
+            if c.name in ("export", "declare", "typeset", "readonly", "local", "env", "set", "setenv"):
+                for w in c.argv[1:]:
+                    m = re.match(r"([A-Za-z_]\w*)=", w.text)
+                    if m and RECEIVER_ENVIRONMENT.fullmatch(m.group(1)):
+                        return True
+        return False
+
+    @staticmethod
+    def _stdin_flag(texts: list[str | None], short: str, longs: tuple[str, ...]) -> bool:
+        """Is `-` given as the file of one of the options (`-F -`, `-F-`, `--file -`, `--file=-`)? A cluster (`-aF -`) is no match: it is
+        a cluster that may hold `-e` (review)."""
+        for i, t in enumerate(texts):
+            if t is None:
+                continue
+            nxt = texts[i + 1] if i + 1 < len(texts) else None
+            if t == short + "-" or any(t == o + "=-" for o in longs):
+                return True
+            if nxt == "-" and (t == short or t in longs):
+                return True
+        return False
+
+    @staticmethod
+    def _plain_words(args: list[shell.Word]) -> bool:
+        """Every word is literal or one quoted word (an unquoted expansion may be several words, options among them)."""
+        return all(w.static or w.quoting in ("double", "single") for w in args)
+
+    @staticmethod
+    def _has_option(texts: list[str | None], shorts: str, longs: tuple[str, ...]) -> bool:
+        """An option of the list, by its short letters (also inside a cluster: `-eF`) or its long name or any abbreviation of it
+        (getopt_long takes `--ed` for `--edit`)."""
+        for t in texts:
+            if t is None or not t.startswith("-") or t == "-":
+                continue
+            if t.startswith("--"):
+                name = t.partition("=")[0]
+                if len(name) > 2 and any(o.startswith(name) for o in longs):
+                    return True
+            elif any(ch in shorts for ch in t[1:]):
+                return True
+        return False
+
+    def _data_receiver(self, name: str, args: list[shell.Word], p: _Parsed) -> bool:
         """The programs that read stdin as DATA only when it is given the way they are told to (#43): the options are what makes
-        them so, a bare name is not enough — `git commit -F -` and `git tag -F -` (the message), `kubectl apply -f -` (a manifest),
-        `gh <issue|pr|release|gist|discussion> … -F -` / `--body-file -` / `--notes-file -`, `docker login --password-stdin`,
-        `python3 -m json.tool`, `openssl base64` / `openssl dgst`. The subcommand and the option are literal words: a word nobody
-        can read there may be another subcommand (`git $c -F -`)."""
+        them so, a bare name is not enough. What stays, and why each is data:
+          * `git commit -F -` / `git tag -F -`: the message. No `-e` / `--edit` (an editor runs the text: `GIT_EDITOR=sh`, also in
+            a cluster `-eF`), no `--template`, `-c` / `-C`, nothing before the subcommand (`-c`, `-C`, `--exec-path`, `--git-dir`, `--work-tree`).
+            The hooks of the repository are code written earlier and run later: the known limit of the README, not judged here.
+          * `kubectl apply -f -`: a manifest; only `-n`, `-o`, `--dry-run`, `--server-side` besides (no `--kubeconfig`: its exec plugin).
+          * `gh <issue|pr|release|gist|discussion> … -F -` / `--body-file -` / `--notes-file -`: the body. No `-e` / `--editor`, `-w` / `--web`.
+          * `openssl base64` / `openssl dgst`: no `-engine`, `-provider`, `-provider-path`, `-propquery`, `-config`.
+        And for all of them: no assignment in front of the call, none of RECEIVER_ENVIRONMENT assigned or exported in the line, the
+        subcommand and the option literal, no unquoted expansion among the words. Removed in review: `python3 -m json.tool` (`-m`
+        imports `./json`), `docker` / `podman login --password-stdin` (the credential helper is chosen by `PATH` / `DOCKER_CONFIG`)."""
+        if name not in ("git", "kubectl", "gh", "openssl") or not self._plain_words(args) or self._receiver_environment_changed(p):
+            return False
         texts = [w.text if w.static else None for w in args]
         if name == "git":
-            i = 0
-            while texts[i : i + 1] == ["-C"] and i + 1 < len(texts):
-                i += 2
-            return texts[i : i + 1] in (["commit"], ["tag"]) and self._stdin_flag(texts[i + 1 :], "-F", ("--file",))
-        if name == "kubectl":
-            return texts[:1] in (["apply"], ["create"], ["replace"], ["delete"]) and self._stdin_flag(texts[1:], "-f", ("--filename",))
-        if name == "gh":
-            return texts[:1] in (["issue"], ["pr"], ["release"], ["gist"], ["discussion"]) and (
-                self._stdin_flag(texts[1:], "-F", ("--body-file", "--notes-file", "--file"))
+            return (
+                texts[:1] in (["commit"], ["tag"])
+                and self._stdin_flag(texts[1:], "-F", ("--file",))
+                and not self._has_option(texts[1:], "etcC", ("--edit", "--reedit-message", "--reuse-message", "--template", "--exec-path", "--git-dir", "--work-tree"))
             )
-        if name in ("docker", "podman"):
-            return texts[:1] == ["login"] and "--password-stdin" in texts
-        if name == "openssl":
-            return texts[:1] in (["base64"], ["dgst"])
-        if re.sub(r"[\d.]+$", "", name) == "python":
-            k = 0
-            while k < len(texts) and texts[k] in PYTHON_PLAIN_FLAGS:
+        if name == "kubectl":
+            if texts[:1] != ["apply"] or not self._stdin_flag(texts[1:], "-f", ("--filename",)):
+                return False
+            k, rest = 0, texts[1:]
+            while k < len(rest):
+                t = rest[k]
                 k += 1
-            return texts[k : k + 2] == ["-m", "json.tool"]
-        return False
+                if t is None:
+                    continue  # a quoted word: the value of the option before it, or an operand nothing reads
+                if t in ("-f", "--filename"):
+                    k += 1  # its `-`
+                elif t in ("-n", "--namespace", "-o", "--output"):
+                    k += 1
+                elif not (
+                    t in ("-f-", "--filename=-", "--server-side")
+                    or re.fullmatch(r"--(?:namespace|output|dry-run)=[\w.-]+", t)
+                    or re.fullmatch(r"-[no][\w.-]+", t)
+                ):
+                    return False
+            return True
+        if name == "gh":
+            return (
+                texts[:1] in (["issue"], ["pr"], ["release"], ["gist"], ["discussion"])
+                and self._stdin_flag(texts[1:], "-F", ("--body-file", "--notes-file"))
+                and not self._has_option(texts[1:], "ew", ("--editor", "--web"))
+            )
+        return texts[:1] in (["base64"], ["dgst"]) and not any(
+            t in ("-engine", "-provider", "-provider-path", "-propquery", "-config", "-conf") for t in texts
+        )
 
     @staticmethod
     def _known_location(text: str) -> bool:
