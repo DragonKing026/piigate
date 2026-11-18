@@ -52,8 +52,13 @@ VALUE_OPTIONS = {
 XARGS_VALUE_OPTIONS = {"-I", "-n", "-P", "-L", "-s", "-d", "-E", "-a", "--max-args", "--max-procs", "--delimiter", "--arg-file"}
 # the only commands a compound list may use to touch a sensitive source without reading it (they create, remove or change modes)
 CREATE_COMMANDS = {"mkdir", "rm", "rmdir", "touch", "chmod", "chown", "chgrp"}
-# programs that run the text they read as shell code from stdin (besides the shells and interpreters the parser knows)
-STDIN_SINKS = {"ssh", "mosh", "sshpass", "at", "batch", "su", "sg", "newgrp", "runuser"}
+# programs known to treat what they read from stdin (or from `<(…)`) as DATA, never as code — the only receivers of text that a
+# stage builds with an expansion (#41); everything else is a possible interpreter. `sed` / `awk` / `jq` / `rg` / `sort` / `piigate`
+# also need arguments that keep them so (`_reads_stdin_as_data`).
+STDIN_DATA = shell.DATA_ONLY | {
+    "sort", "tee", "less", "more", "tac", "shuf", "pr", "fmt", "expand", "unexpand", "diff", "cmp", "comm", "rg", "jq", "gojq",
+    "sed", "awk", "gawk", "mawk", "piigate", "pbcopy", "wl-copy", "xclip", "xsel",
+}
 NESTED_UNKNOWN = SUBSTITUTION_ORIGINS + ("-c", "eval")  # a call there has arguments the old gate reports as None
 
 
@@ -535,9 +540,9 @@ class AstGate(gate.Gate):
                 c = self._expanded_into_code(self._current)
                 if c is not None:
                     return (
-                        f"piigate: command denied — `{c.name or 'a command'}` runs text that a stage of the line builds with an "
-                        f"expansion (a substitution or a variable); the gate cannot read that code, and a sensitive source is "
-                        f"configured. {gate.HINT}"
+                        f"piigate: command denied — `{c.name or 'a command'}` reads text that a stage of the line builds with an "
+                        f"expansion (a substitution or a variable) and is not a known data filter, so it may run it as code; the "
+                        f"gate cannot read that code, and a sensitive source is configured. {gate.HINT}"
                     )
             return None
         except Exception as e:  # whatever the adapter did not foresee: deny, and say so
@@ -620,10 +625,12 @@ class AstGate(gate.Gate):
         return shell._effective(args[k:])
 
     def _expanded_into_code(self, p: _Parsed | None) -> shell.Call | None:
-        """A shell, an interpreter or a launcher of a shell (`| sh`, `| python3`, `| ssh host`, `| at now`, `| xargs sh -c`,
-        `sh <<< "…"`, a heredoc, `source <(…)`) reads TEXT that a stage with an expansion makes
-        (`echo "$(echo piigate) reverse" | sh`): code nobody can read, like `bash -c "$x"` (#41). Text without an expansion is
-        read by the tree (`echo 'ls' | sh`) and judged as before. Returns the call that reads it, or None."""
+        """A stage that RECEIVES text a stage with an expansion makes — through a pipe, `<<<`, a heredoc, `<`, or a file argument
+        `<(…)` — and is not a known data filter (STDIN_DATA) is code nobody can read: `echo "$(echo piigate) reverse" | sh`,
+        `| python3`, `| busybox sh`, `| env -S sh`, `| make -f -`, `| awk '{system($0)}'`, `sh <<< "…"`, `python3 <(printf …)` (#41).
+        The rule is fail closed: no list of programs that run their input is complete, so what is not known to be a filter is a
+        sink. Feeders are the earlier stages of the SAME pipeline. Text without an expansion is read by the tree
+        (`echo 'ls' | sh`) and judged as before. Returns the call that reads it, or None."""
         if p is None:
             return None
         live = {"param", "cmd", "proc", "arith"}
@@ -631,32 +638,109 @@ class AstGate(gate.Gate):
         def expands(w: shell.Word | None) -> bool:
             return w is not None and bool(live & w.kinds)
 
-        for i, c in enumerate(p.calls):
-            words = shell._effective(c.argv)
-            name = os.path.basename(words[0].text) if words and words[0].static else ""
-            if name == "xargs":
-                inner = self._xargs_command(words)
-                iname = os.path.basename(inner[0].text) if inner and inner[0].static else ""
-                sink = not inner or not inner[0].static or iname in SHELLS or iname in shell.INTERPRETERS
-            else:
-                sink = bool(c.stdin_interpreter) or name in STDIN_SINKS
-            into_arg = name in SHELLS | {"source", "."} and any("proc" in w.kinds for w in words[1:])
-            if not (sink or into_arg):
-                continue
+        def dynamic_heredoc(r) -> bool:
+            return r.heredoc is not None and bool(r.heredoc.subst or r.heredoc.names)
+
+        def feeds(f: shell.Call) -> bool:
+            return any(expands(w) for w in (*f.argv, *(r.target for r in f.redirects if r.target is not None))) or any(
+                dynamic_heredoc(r) for r in f.redirects
+            )
+
+        stages: dict[int, list[tuple[int, shell.Call]]] = {}
+        for c in p.calls:
+            for pid, stage in c.pipes:
+                stages.setdefault(pid, []).append((stage, c))
+        rebound = any(c.name == "alias" or any(a.name in shell.CODE_ARRAYS for a in c.assigns) for c in p.calls)
+        for c in p.calls:
             own = [r for r in c.redirects if r.op in ("<<<", "<", "<<")]
-            fed = any(
-                expands(r.target) or (r.heredoc is not None and (r.heredoc.subst or r.heredoc.names)) for r in own
-            ) or into_arg
-            if not fed and c.piped_in:
-                feeders = [p.calls[j] for j in range(i) if p.calls[j].pipes_out]
-                fed = any(
-                    expands(w) for f in feeders for w in (*f.argv, *(r.target for r in f.redirects if r.target is not None))
-                ) or any(
-                    r.heredoc is not None and (r.heredoc.subst or r.heredoc.names) for f in feeders for r in f.redirects
-                )
-            if fed:
+            fed = (
+                any(expands(r.target) or dynamic_heredoc(r) for r in own)
+                or any("proc" in w.kinds for w in c.argv)
+                or any(feeds(f) for pid, stage in c.pipes if stage for s, f in stages[pid] if s < stage)
+            )
+            if fed and not self._reads_stdin_as_data(c, p, rebound):
                 return c
         return None
+
+    def _reads_stdin_as_data(self, c: shell.Call, p: _Parsed, rebound: bool) -> bool:
+        """Is `c` a program known to treat what it reads as data and never as code — a filter of STDIN_DATA with the arguments
+        that keep it so (`sed` / `awk` with a literal program of no `e` / `system` / pipe, no `-f`; `rg` without `--pre`;
+        `piigate text` / `table`), possibly behind `xargs` (judged by what it runs; `xargs` alone runs `echo`)? A function, an
+        alias, a name nobody can read, a wrapper that is not `command` / `nice` / `time` is not."""
+        words = shell._effective(c.argv)
+        if rebound or not words or not words[0].static:
+            return False
+        if len(words) != len(c.argv) and not {
+            os.path.basename(w.text) for w in c.argv[: len(c.argv) - len(words)] if w.static
+        } <= {"command", "builtin", "noglob", "nocorrect", "time", "nice"}:
+            return False
+        if os.path.basename(words[0].text) == "xargs":
+            words = self._xargs_command(words)
+            if not words:
+                return True
+            if not words[0].static:
+                return False
+        name = os.path.basename(words[0].text)
+        if name in p.functions or name not in STDIN_DATA:
+            return False
+        args = words[1:]
+        if name in ("sed", "awk", "gawk", "mawk", "jq", "gojq"):
+            return self._literal_program(name, args)
+        if name == "piigate":
+            return bool(args) and args[0].static and args[0].text in ("text", "table")
+        if name == "sort":
+            return not any(w.static and w.text.startswith("--compress-program") for w in args)
+        if name == "rg":
+            return not any(w.static and w.text.startswith("--pre") for w in args)
+        return True
+
+    @staticmethod
+    def _literal_program(name: str, args: list[shell.Word]) -> bool:
+        """`sed` / `awk` / `jq` whose program is a literal word that cannot run a command: not from a file (`-f`), no `e`
+        command or `s///e` in sed, no `system`, pipe, `@load` / `@include` in awk (`-i`, `-l`, `-E` loaders too). A word that is
+        not literal where the program should be makes it unreadable."""
+        sed, awk = name == "sed", name in ("awk", "gawk", "mawk")
+        value_count = {"--arg": 2, "--argjson": 2, "--slurpfile": 2, "--rawfile": 2, "-L": 1, "--indent": 1}
+        explicit: list[str | None] = []  # programs given with -e / --expression / --source
+        first: list[str | None] = []  # the first operand: the program when none was given with an option
+        k = 0
+        while k < len(args):
+            w = args[k]
+            k += 1
+            t = w.text if w.static else None
+            if t is None or t == "-" or not t.startswith("-"):
+                first = first or [t]
+                continue
+            if t == "--":
+                continue
+            if t in ("-f", "--from-file") or t.startswith("--file") or (sed and re.fullmatch(r"-[A-Za-z]*f[A-Za-z]*", t)):
+                return False
+            if awk and re.match(r"-[filE]|--(include|load|exec)", t):
+                return False
+            if t.startswith(("--expression=", "--source=")):
+                explicit.append(t.split("=", 1)[1])
+            elif t in ("-e", "--expression", "--source") or ((sed or awk) and re.fullmatch(r"-[A-Za-z]*e", t)):
+                if k >= len(args):
+                    return False
+                explicit.append(args[k].text if args[k].static else None)
+                k += 1
+            elif awk and t in ("-F", "-v"):
+                k += 1
+            elif t in value_count:
+                k += value_count[t]
+        programs = explicit or first
+        if not programs or None in programs:
+            return False
+        for text in programs:
+            if sed and (
+                re.search(r"(?:^|[;{}\n])\s*(?:[0-9$]+(?:,[0-9$]+)?!?\s*)?e(?:\s|;|}|$)", text)
+                or re.search(r"s(.)(?:\\.|(?!\1).)*\1(?:\\.|(?!\1).)*\1[0-9gpIiMmw]*e", text)
+                or re.search(r"/!?\s*e(?:\s|;|}|$)", text)
+            ):
+                return False
+            if awk and re.search(r"\bsystem\b|\||@", re.sub(r'"(?:\\.|[^"\\])*"', '""', text)):
+                return False
+        return True
 
     # ------------------------------------------------------------------------------------------------ front-end
 

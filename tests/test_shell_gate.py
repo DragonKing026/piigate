@@ -1232,6 +1232,118 @@ class TestIssueRegressions(Base):
             with self.subTest(command):
                 self.deny(command)  # the production gate lets the first two through (reported separately as #41)
 
+    # -- round 3: a receiver of text with an expansion is code unless it is a known data filter (fail closed, #41); a feeder is of the same pipeline
+    def test_41_a_receiver_that_is_not_a_known_filter_is_code_nobody_can_read(self):
+        feeder = 'echo "cat ../Sens$(echo itive)-data/people.csv" | '
+        for receiver in (
+            "bash /dev/stdin", "python3 /dev/stdin", "busybox sh", "parallel", "env -S sh", "flock f sh", "ionice sh", "unbuffer sh",
+            "script -qc sh /dev/null", "pkexec sh", "nsenter sh", "chroot / sh", "tclsh", "csh", "deno run -", "docker exec -i c sh",
+            "awk '{system($0)}'", "gawk -f -", "sed -f -", "make -f -", 'while read l; do eval "$l"; done', "some-unknown-tool",
+            "$prog", "python3 -c 'import sys; exec(sys.stdin.read())'", "sed 's/x/y/e'", "sed -n '1e'", "sed -e p -f -",
+            "awk '{print | \"sh\"}'", "awk -f /dev/stdin", "gawk -i x '{print}'", "awk \"$prog\"", "sed \"$prog\"", "sort --compress-program=sh",
+            "rg --pre sh x", "piigate reverse", "piigate $sub", "xargs sh -c 'echo {}'", "xargs -I{} bash -c {}",
+        ):
+            command = feeder + receiver
+            with self.subTest(command):
+                self.deny(command)
+        for command in (
+            'x=$(echo "cat ../Sens$(echo itive)-data/people.csv"); sh -c "$x"',
+            "python3 <(printf 'print(open(\"../Sens%s/people.csv\").read())' itive-data)",
+            'python3 /dev/stdin <<< "$(echo "print(open(\"../Sens"; echo "itive-data/people.csv\").read())")"',
+            'bash <(echo "cat ../Sens$(echo itive)-data/people.csv")',
+            'tclsh <<< "$(echo puts)"',
+        ):
+            with self.subTest(command):
+                self.deny(command)
+
+    def test_41_a_known_data_filter_may_receive_an_expansion(self):
+        for command in (
+            'echo "$(date)" | grep x',
+            'git log | grep "$X"',
+            "echo 'ls' | sh",
+            'curl -s "$U" | jq .a',
+            'echo "$x" | wc -c',
+            'ls "$HOME" | sort',
+            'echo "$x" | sed "s/a/b/"',
+            "echo \"$x\" | sed -n '1p;3p'",
+            "echo \"$x\" | awk '{print $1}'",
+            "echo \"$x\" | awk -F: '{print $2}'",
+            "echo \"$x\" | awk -F'|' '{print $2}'",
+            'echo "$x" | jq -r --arg a 1 ".a"',
+            'echo "$x" | tee out.txt | head -n 3',
+            'echo "$x" | cut -d, -f1 | tr a-z A-Z | sort | uniq -c',
+            'wc -l <<< "$x"',
+            'grep -c y <<EOF\n$x\nEOF',
+            'echo "$x" | xargs',
+            'echo "$x" | xargs grep y',
+            'echo "$x" | xargs ls',
+            'echo "$x" | piigate text',
+            'echo "$x" | command grep y',
+            'echo "$x" | less',
+            'echo "$x" | base64',
+            'echo "$x" | sha256sum',
+            'echo "$x" | rg y',
+            'echo "$x" | while read l; do echo "$l"; done',
+        ):
+            with self.subTest(command):
+                self.allow(command)
+
+    def test_41_a_function_or_an_alias_named_like_a_filter_is_not_one(self):
+        for command in (
+            'grep() { sh; }; echo "cat ../Sens$(echo itive)-data/people.csv" | grep',
+            'alias grep=sh; echo "cat ../Sens$(echo itive)-data/people.csv" | grep',
+            'echo "cat ../Sens$(echo itive)-data/people.csv" | sudo sh',
+            'echo "cat ../Sens$(echo itive)-data/people.csv" | env sh',
+        ):
+            with self.subTest(command):
+                self.deny(command)
+
+    def test_41_the_receiver_decides_for_the_human_only_words_too(self):
+        """Without a sensitive source nothing is refused for the paths, but a line with `reverse` / `approve` whose receiver may
+        run `piigate` is (the words of the human-only commands, #26)."""
+        cfg = {**self.cfg, "sources": {**self.cfg["sources"], "directories": []}}
+        cfg["in_project"] = {"sensitive": [], "anonymized": []}
+        cfg["project_directories"] = {}
+        g = shell_gate.AstGate(cfg, str(self.work), "bash")
+        for command in (
+            'echo "$(echo piigate) reverse" | busybox sh',
+            'echo "$(echo piigate) reverse" | env -S sh',
+            'echo "$(echo piigate) reverse" | some-unknown-tool',
+            'echo "$(echo piigate) project approve" | tclsh',
+            'python3 <(echo "$(echo piigate) reverse")',
+        ):
+            with self.subTest(command):
+                self.assertIsNotNone(g.bash(command))
+        for command in (
+            'echo "$(date) reverse" | grep x',
+            'echo "$(date) approve" | sed s/a/b/',
+            'echo "$(date) reverse" | jq .a',
+            "echo 'ls' | sh",
+        ):
+            with self.subTest(command):
+                self.assertIsNone(g.bash(command))
+
+    def test_41_feeders_come_from_the_same_pipeline_only(self):
+        for command in (
+            'echo "$HOME" | wc -c; echo ls | sh',
+            'ls "$HOME" | sort > o.txt; echo ls | sh',
+            'X=$(date); echo "$X" | wc -c; echo ls | sh',
+            'echo "$HOME" | wc -c\necho ls | sh',
+            'echo "$HOME" | wc -c && echo ls | sh',
+            'echo "$HOME" | wc -c; echo ls | python3 -c "import sys"',
+        ):
+            with self.subTest(command):
+                self.allow(command)
+        for command in (  # the expansion is in the pipeline that feeds the sink, whatever its depth or its stage
+            'echo "$HOME" | wc -c; echo "cat ../Sens$(echo itive)-data/people.csv" | sh',
+            '{ echo "cat ../Sens$(echo itive)-data/people.csv" | cat; } | sh',
+            'echo "cat ../Sens$(echo itive)-data/people.csv" | cat | tr a b | sh',
+            'echo "$HOME" | wc -c; echo ls | sh; echo "cat ../Sens$(echo itive)-data/people.csv" | sh',
+            '(echo "cat ../Sens$(echo itive)-data/people.csv") | sh',
+        ):
+            with self.subTest(command):
+                self.deny(command)
+
     # -- #22: a path made by a command substitution is an unknown path for a command that reads files
     def test_22_a_substitution_as_the_operand_of_a_reader_is_refused(self):
         s = "../Sens*/people.csv"

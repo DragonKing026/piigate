@@ -19,6 +19,7 @@ import json
 import os
 import re
 import hashlib
+import itertools
 import platform
 import subprocess
 import sys
@@ -168,6 +169,7 @@ class Call:
     pipes_out: bool = False  # its stage feeds a later stage of the pipeline (every command of a `{ a; b; } | c` stage does)
     opaque_code: bool = False  # `bash -c "$x"` / `eval $x`: code the parser cannot see
     background: bool = False
+    pipes: tuple = ()  # (pipeline id, stage) of every pipeline whose stage this call is in, inner first: who feeds whom
     eval_as_argument: int = 0  # words `eval` that are arguments of a plain program (`playwright-cli eval "js"`): data, not code
 
     @property
@@ -1023,6 +1025,9 @@ def _stdin_interpreter(argv: list[Word]) -> str:
     return ""
 
 
+_PIPELINE_IDS = itertools.count(1)  # one number per pipeline walked, across nested scripts: `Call.pipes`
+
+
 class _Walker:
     def __init__(self, session_cwd: str, depth: int = 0, dialect: str = DEFAULT_DIALECT, model: VarModel | None = None):
         self.dialect = dialect
@@ -1231,6 +1236,10 @@ class _Walker:
                     call.piped_in = True
                     call.piped_stderr = ops[i - 1] == "|&"
         if not self.dry:
+            pipe_id = next(_PIPELINE_IDS)
+            for i, (a, b) in enumerate(spans):
+                for call in _toplevel(self.calls[a:b]):
+                    call.pipes += ((pipe_id, i),)
             for a, b in spans[:-1]:  # every command of a stage feeds the next stage, not only the last one
                 for call in _toplevel(self.calls[a:b]):
                     call.pipes_out = True
