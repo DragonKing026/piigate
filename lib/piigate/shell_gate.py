@@ -31,6 +31,9 @@ TEXT_ONLY = {
     "unset", "set", "shift", "wait", "sleep", "pwd", "for", "select", "case", "exit", "return", "read", "cd", "pushd", "popd",
 }
 SUBSTITUTION_ORIGINS = ("$(", "`", "<(", ">(")
+# programs whose `-o` / `--output` names the file they WRITE; for any other program the word after `-o` is a file it may READ
+# (`grep -o`, `od -o`, `cut -c1- -o`, `head --output` take no output file, or something else): fail closed
+OUTPUT_OPTION_COMMANDS = {"sort", "gcc", "cc", "g++", "c++", "clang", "clang++", "ld", "curl", "wget", "pandoc", "tree", "openssl"}
 # programs that read the files they are given as operands (a path built by a command substitution is an unknown path, #22) and
 # the options whose NEXT word is a value, not a file
 READERS = {
@@ -694,6 +697,20 @@ class AstGate(gate.Gate):
         for c in p.stage_calls:
             result.append(sorted(c.cwds) if c is not None else everywhere)
         return result
+
+    @staticmethod
+    def _write_targets(stage: list[str]) -> set[int]:
+        """The old rule frees the word after `-o` / `--output` in EVERY command (`grep -e . -o ../S/people.csv` read the file
+        and passed). Here it is a write target only for the programs of OUTPUT_OPTION_COMMANDS; redirections, `tee` and the
+        `cp` / `mv` target are the old rule's."""
+        dests = gate.Gate._write_targets(stage)
+        cmd = Path(stage[0]).name if stage else ""
+        if cmd in OUTPUT_OPTION_COMMANDS or cmd in ("tee", "cp", "mv"):
+            return dests
+        by_option = {i + 1 for i, t in enumerate(stage[:-1]) if i and t in ("-o", "--output")}
+        by_option |= {i for i, t in enumerate(stage) if i and re.match(r"^--(?:output|out)=", t)}
+        by_redirect = {i + 1 for i, t in enumerate(stage[:-1]) if t in (">", ">>", ">|", "&>", "&>>")}
+        return dests - (by_option - by_redirect)
 
     def _touches(self, command: str, tokens: list[str]) -> tuple[str | None, str]:
         self._stage_log = []

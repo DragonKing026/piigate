@@ -1134,6 +1134,29 @@ class TestIssueRegressions(Base):
             with self.subTest(command):
                 self.deny(command)
 
+    # -- review of #32: `-o` / `--output` frees a word only for the programs that write there (the old gate frees it in every command)
+    def test_32_an_option_o_is_not_a_write_target_of_a_reader(self):
+        s = "../Sensitive-data/people.csv"
+        forms = (
+            f"grep -e '.*' -o {s}",
+            f"grep -o x {s}",
+            f"od -o {s}",
+            f"od -c -o {s}",
+            f"cut -c1- -o {s}",
+            f"head -n5 --output {s}",
+            f"head -n5 --output={s}",
+        )
+        for form in forms:
+            for command in (form, f"mkdir x && {form}", f"true; {form}", f"mkdir -p ../Sensitive-data/n && {form}"):
+                with self.subTest(command):
+                    self.deny(command)
+        for command in ("sort x.csv -o ../Sensitive-data/out.txt", "curl -o ../Sensitive-data/out.txt http://example.test"):
+            with self.subTest(command):
+                self.allow(command)
+        # the old gate (production) lets these through — a hole reported separately; the tree gate is stricter there on purpose
+        for form in (f"grep -e '.*' -o {s}", f"od -o {s}", f"od -c -o {s}", f"cut -c1- -o {s}", f"head -n5 --output {s}"):
+            self.assertIsNone(self.old().bash(form), form)
+
     # -- #22: a path made by a command substitution is an unknown path for a command that reads files
     def test_22_a_substitution_as_the_operand_of_a_reader_is_refused(self):
         s = "../Sens*/people.csv"
