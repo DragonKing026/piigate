@@ -962,6 +962,9 @@ ARGUMENT_RUNNERS = {
     "source", ".", "foreach", "while", "until", "if", "then", "else", "elif", "do", "!", "{", "(", "fc", "bind", "complete",
     "compgen", "compopt", "mapfile", "readarray", "emulate", "enable", "zle", "vared", "bindkey", "zcompile", "autoload",
     "functions", "compctl", "function", *SHELLS_NAMED,
+    # sessions and remote shells: they hand their arguments to a shell (`ssh host eval '…'`, `tmux new-session eval '…'`)
+    "ssh", "mosh", "sshpass", "tmux", "screen", "sg", "newgrp", "systemd-run", "at", "batch", "docker", "podman", "kubectl", "lxc",
+    "schroot",
 }
 DATA_ONLY = {
     "echo", "printf", "true", "false", ":", "test", "[", "[[", "((", "let", "export", "declare", "typeset", "local", "readonly",

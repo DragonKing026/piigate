@@ -525,7 +525,9 @@ class AstGate(gate.Gate):
                 return gate.MCP_PIIGATE  # `piigate ana''lyze x`: the words say it, the raw text does not
             if reason := super().bash(command, files):
                 return reason
-            return self._substituted_operand(self._current)
+            if reason := self._substituted_operand(self._current):
+                return reason
+            return None
         except Exception as e:  # whatever the adapter did not foresee: deny, and say so
             self.internal_error = f"{type(e).__name__}: {e}"[:200]
             return f"piigate: command denied — the shadow gate failed ({type(e).__name__}). {gate.HINT}"

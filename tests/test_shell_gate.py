@@ -1157,6 +1157,17 @@ class TestIssueRegressions(Base):
         for form in forms:
             self.assertIsNotNone(self.old().bash(form), form)
 
+    # -- round 2 of the review: B (launchers of a shell), C (what a "creating" stage may be), A / #41 (text with an expansion given to code)
+    def test_b_programs_that_hand_their_arguments_to_a_shell_keep_eval_code(self):
+        for launcher in (
+            "ssh localhost", "tmux new-session", "screen", "sg users", "newgrp", "mosh host --", "sshpass -p x ssh h", "systemd-run --user",
+            "at now", "batch", "docker exec c", "podman exec c", "kubectl exec p --", "lxc exec c --", "schroot -c x --",
+        ):
+            for code in ("ls *(+cat)", "ls ^x(e:cat:)", "echo ${(e)x}"):
+                command = f"{launcher} eval '{code}'"
+                with self.subTest(command):
+                    self.deny(command, ("zsh",))
+
     # -- #22: a path made by a command substitution is an unknown path for a command that reads files
     def test_22_a_substitution_as_the_operand_of_a_reader_is_refused(self):
         s = "../Sens*/people.csv"
