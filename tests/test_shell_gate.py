@@ -1690,6 +1690,8 @@ class TestIssueRegressions(Base):
             'psql "-c$q" < "$f"',
             'psql "$opt" < "$f"',
             'psql -d "$db" "-c$q" < "$f"',
+            'psql -d -d "$q" < "$f"',  # the second -d is the VALUE of the first: "$q" is a free word
+            'psql -h -h "$(printf -- -c)" < "$f"',
             'mysql "--init-command=$q" db < "$f"',
             'mysql --host="$h" db < "$f"',  # not a separate token: not told apart from `--init-command=`
             'mysql -u r -p "$db" < "$dump"',
@@ -1733,8 +1735,6 @@ class TestIssueRegressions(Base):
             'git tag -F - v1 <<EOF\n$x\nEOF',
             'echo "$x" | git commit -F -',
             'echo "$x" | git commit -a -F -',
-            'echo "$x" | git commit -m "$m" -F -',
-            'echo "$x" | git commit --message "$m" -F -',
             'echo "$x" | git commit --file=-',
             'echo "$x" | git commit -F-',
             'echo "$x" | base64 -d',
@@ -1775,6 +1775,10 @@ class TestIssueRegressions(Base):
             'echo "$x" | GIT_EXEC_PATH=. git commit -F -',
             'echo "$x" | GIT_PAGER=sh git tag -F - v1',
             'echo "$x" | git commit -m x $opts -F -',
+            'echo "$x" | git commit -m "$m" -F -',  # review: no word nobody can read, the value of -m included
+            'echo "$x" | git commit --message "$m" -F -',
+            'echo "$x" | git commit -m -m "$(printf -- -et)" -m "$(printf -- --no-message)" -F -',
+            'echo "$x" | git commit -m -m "$(printf -- --edit)" -F -',
             'echo "$x" | git commit "$o" -F -',
             'echo "$x" | git commit "-e$x" -F -',
             'echo "$x" | git commit -F - "$(printf -- --edit)"',

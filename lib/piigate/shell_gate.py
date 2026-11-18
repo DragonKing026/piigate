@@ -804,10 +804,10 @@ class AstGate(gate.Gate):
         them may be an option that runs code: they end the exception. A word is never skipped because its text is unknown."""
         takes_value = False
         for w in args:
-            if w.static:
-                takes_value = w.text in value_options
-            elif takes_value:
+            if takes_value:  # this token IS the value, whatever it looks like (`-d -d "$x"`: the second `-d` is a value, `"$x"` is not)
                 takes_value = False
+            elif w.static:
+                takes_value = w.text in value_options
             else:
                 return False
         return True
@@ -954,11 +954,11 @@ class AstGate(gate.Gate):
         makes code) that reads stdin as DATA only when it is told to (#43): `git commit -F -` / `git tag -F -`, the message. No `-e` /
         `--edit` (an editor runs the text: `GIT_EDITOR=sh`, also in a cluster `-eF`), no `--template`, `-c` / `-C`, nothing before the
         subcommand (`-c`, `-C`, `--exec-path`, `--git-dir`, `--work-tree`), no assignment in front of the call or of RECEIVER_ENVIRONMENT
-        in the line, every word literal but the value of `-m` / `--message` (`_literal_or_value`). The hooks of the repository are code
+        in the line, EVERY word literal, the value of `-m` included (a literal `-m` can be the value of the one before it, and the next built word is then a free option: `-m -m "$(printf -- --edit)"`; git refuses `-m` with `-F` anyway). The hooks of the repository are code
         written earlier and run later: the known limit of the README, not judged here. Removed in review: `kubectl`, `gh`, `openssl`
         (a word that is quoted but built, `"$(printf -- --kubeconfig=k)"`, can be an option that runs code), `python3 -m json.tool`
         (`-m` imports `./json`), `docker` / `podman login` (the credential helper is chosen by `PATH` / `DOCKER_CONFIG`)."""
-        if name != "git" or self._receiver_environment_changed(p) or not self._literal_or_value(args, {"-m", "--message"}):
+        if name != "git" or self._receiver_environment_changed(p) or not self._literal_or_value(args, frozenset()):
             return False
         texts = [w.text if w.static else None for w in args]
         return (
