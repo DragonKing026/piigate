@@ -1670,6 +1670,54 @@ class TestIssueRegressions(Base):
             with self.subTest(command):
                 self.deny(command)
 
+    def test_43_known_receivers_of_data_pass_with_text_built_by_an_expansion(self):
+        for command in (
+            'git commit -F - <<EOF\n$(git log -1 --format=%s)\nEOF',
+            'git tag -F - v1 <<EOF\n$x\nEOF',
+            'echo "$x" | git commit -F -',
+            'echo "$x" | git commit -a -F -',
+            'echo "$x" | git -C d commit -F-',
+            'echo "$x" | git commit --file=-',
+            'cat <<EOF | kubectl apply -f -\napiVersion: v1\nname: $N\nEOF',
+            'echo "$x" | kubectl apply -f -',
+            'echo "$x" | gh pr comment 1 -F -',
+            'echo "$x" | gh issue create --body-file - -t t',
+            'echo "$x" | gh release create v1 --notes-file -',
+            'echo "$x" | docker login -u u --password-stdin',
+            'curl -s "$u" | python3 -m json.tool',
+            'curl -s "$u" | python3 -m json.tool --indent 2',
+            'echo "$x" | openssl base64',
+            'echo "$x" | openssl dgst -sha256',
+            'echo "$x" | base64 -d | openssl dgst -sha256',
+            'echo "$x" | base64 -d',
+            'echo "$x" | base64',
+        ):
+            with self.subTest(command):
+                self.allow(command)
+
+    def test_43_a_known_receiver_is_one_only_with_the_option_that_makes_it_data(self):
+        for command in (
+            'echo "$x" | git $c -F -',
+            'echo "$x" | git log',
+            'echo "$x" | git commit -m x',  # no `-F -`: nothing says it reads the text as a message
+            'echo "$x" | git -c alias.ci="!sh" ci -F -',
+            'echo "$x" | gh alias set x -',
+            'echo "$x" | gh extension exec x -F -',
+            'echo "$x" | kubectl exec -i p -- sh',
+            'echo "$x" | kubectl apply -f x.yaml',
+            'echo "$x" | docker exec -i c sh',
+            'echo "$x" | docker login',
+            'echo "$x" | python3 -m http.server',
+            'echo "$x" | python3 -c "import sys"',
+            'echo "$x" | xargs git commit -F -',  # through xargs the input is appended to the arguments
+            'echo "$x" | openssl enc -d',
+            'echo "$x" | base64 -d | sh',  # the result of base64 goes to a shell
+            'echo "$x" | ./git commit -F -',
+            'echo "$x" | $c commit -F -',
+        ):
+            with self.subTest(command):
+                self.deny(command)
+
 
 if __name__ == "__main__":
     unittest.main()

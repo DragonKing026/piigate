@@ -761,7 +761,9 @@ class AstGate(gate.Gate):
             return False
         if not self._known_location(words[0].text):
             return False
+        via_xargs = False
         if os.path.basename(words[0].text) == "xargs":
+            via_xargs = True
             words = self._xargs_command(words)
             if not words:
                 return True
@@ -772,7 +774,11 @@ class AstGate(gate.Gate):
                 # (`printf '%s\n' -e "e $x" | xargs sed p f`) or put in by `-I{}` / `-i` / `--replace` (`xargs -I{} awk {}`): code (#43)
                 return False
         name = os.path.basename(words[0].text)
-        if name in p.functions or name not in STDIN_DATA:
+        if name in p.functions:
+            return False
+        if not via_xargs and self._data_receiver(name, words[1:]):  # (through xargs its input is APPENDED to the arguments: options)
+            return True
+        if name not in STDIN_DATA:
             return False
         args = words[1:]
         if name == "piigate":
@@ -790,6 +796,48 @@ class AstGate(gate.Gate):
         if name in ("awk", "gawk", "mawk"):
             return bool(operands) and self._awk_program_ok(operands[0])
         return True
+
+    @staticmethod
+    def _stdin_flag(texts: list[str | None], short: str, longs: tuple[str, ...]) -> bool:
+        """Is `-` given as the file of one of the options (`-F -`, `-F-`, `-aF -`, `--file -`, `--file=-`)?"""
+        for i, t in enumerate(texts):
+            if t is None:
+                continue
+            nxt = texts[i + 1] if i + 1 < len(texts) else None
+            if t == short + "-" or any(t == o + "=-" for o in longs):
+                return True
+            if nxt == "-" and (t in longs or re.fullmatch(r"-[A-Za-z]*" + short[1:], t)):
+                return True
+        return False
+
+    def _data_receiver(self, name: str, args: list[shell.Word]) -> bool:
+        """The programs that read stdin as DATA only when it is given the way they are told to (#43): the options are what makes
+        them so, a bare name is not enough — `git commit -F -` and `git tag -F -` (the message), `kubectl apply -f -` (a manifest),
+        `gh <issue|pr|release|gist|discussion> … -F -` / `--body-file -` / `--notes-file -`, `docker login --password-stdin`,
+        `python3 -m json.tool`, `openssl base64` / `openssl dgst`. The subcommand and the option are literal words: a word nobody
+        can read there may be another subcommand (`git $c -F -`)."""
+        texts = [w.text if w.static else None for w in args]
+        if name == "git":
+            i = 0
+            while texts[i : i + 1] == ["-C"] and i + 1 < len(texts):
+                i += 2
+            return texts[i : i + 1] in (["commit"], ["tag"]) and self._stdin_flag(texts[i + 1 :], "-F", ("--file",))
+        if name == "kubectl":
+            return texts[:1] in (["apply"], ["create"], ["replace"], ["delete"]) and self._stdin_flag(texts[1:], "-f", ("--filename",))
+        if name == "gh":
+            return texts[:1] in (["issue"], ["pr"], ["release"], ["gist"], ["discussion"]) and (
+                self._stdin_flag(texts[1:], "-F", ("--body-file", "--notes-file", "--file"))
+            )
+        if name in ("docker", "podman"):
+            return texts[:1] == ["login"] and "--password-stdin" in texts
+        if name == "openssl":
+            return texts[:1] in (["base64"], ["dgst"])
+        if re.sub(r"[\d.]+$", "", name) == "python":
+            k = 0
+            while k < len(texts) and texts[k] in PYTHON_PLAIN_FLAGS:
+                k += 1
+            return texts[k : k + 2] == ["-m", "json.tool"]
+        return False
 
     @staticmethod
     def _known_location(text: str) -> bool:
