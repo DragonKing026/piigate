@@ -98,6 +98,12 @@ FILTER_OPTIONS = {
 # where a program of STDIN_DATA may live when it is named by a path (`/usr/bin/sort`); any other path (`./cat`, `/tmp/x/sort`) is
 # a file the model may have written, not the filter (#43)
 SYSTEM_BINDIRS = ("/usr/bin", "/bin", "/usr/local/bin")
+# `< file` read by one of these is not text the line builds, even when the NAME of the file is built (#43): an interpreter run on a
+# script FILE of its own (`python3 script.py < "$f"`) and the clients of a database. A client that gets the same text from a
+# heredoc or a here-string with an expansion stays refused: `psql` and `mysql` run what they read (`\\!` is a shell command, `system`
+# in sqlite3 `.shell`), so only the text of a file that nobody built is data. The file name is still judged as the path it is (#22).
+DB_CLIENTS = {"psql", "mysql", "mariadb", "sqlite3"}
+PYTHON_PLAIN_FLAGS = {"-u", "-B", "-O", "-OO", "-q", "-I", "-s", "-S", "-E"}  # python options that do not run or load code
 NESTED_UNKNOWN = SUBSTITUTION_ORIGINS + ("-c", "eval")  # a call there has arguments the old gate reports as None
 
 
@@ -645,7 +651,7 @@ class AstGate(gate.Gate):
             if hit is None and via_xargs and name in READERS:
                 feeders = [w for j in range(i) if p.calls[j].pipes_out for w in (*p.calls[j].argv, *(r.target for r in p.calls[j].redirects if r.target))]
                 hit = next((w for w in (*feeders, *stdin_words) if self._expands_command(w)), None)
-            if hit is None and (name in READERS or not name) and not via_xargs:
+            if hit is None and (name in READERS or not name or self._stdin_file_receiver(c, p, False)) and not via_xargs:
                 hit = next((w for w in stdin_words if self._expands_command(w) and w.text and not w.text.startswith("<<<")), None)
             if hit is not None:
                 return (
@@ -694,8 +700,9 @@ class AstGate(gate.Gate):
         fed_calls: set[int] = set()
         for c in p.calls:
             own = [r for r in c.redirects if r.op in ("<<<", "<", "<<")]
+            from_file = self._stdin_file_receiver(c, p, rebound)  # `< "$f"`: the name is built, the text is not (#43)
             fed = (
-                any(expands(r.target) or dynamic_heredoc(r) for r in own)
+                any((expands(r.target) and not (from_file and r.op == "<")) or dynamic_heredoc(r) for r in own)
                 or any("proc" in w.kinds and not w.text.startswith(">(") for w in c.argv)
                 or any(feeds(f) for pid, stage in c.pipes if stage for s, f in stages[pid] if s < stage)
             )
@@ -708,6 +715,37 @@ class AstGate(gate.Gate):
                 if not self._reads_stdin_as_data(c, p, rebound):
                     return c
         return None
+
+    def _stdin_file_receiver(self, c: shell.Call, p: _Parsed, rebound: bool) -> bool:
+        """Does `c` read `< file` as data it did not build: an interpreter or shell that runs a script FILE of its own (`python3 script.py`,
+        `node app.js`, `bash run.sh`: the first operand, no option that gives a program), a database client (DB_CLIENTS), `docker exec … psql`?
+        A function, an alias, a name nobody can read or a wrapper that is not `command` / `nice` / `time` is not."""
+        words = shell._effective(c.argv)
+        if rebound or not words or not words[0].static or not self._known_location(words[0].text):
+            return False
+        if len(words) != len(c.argv) and not {
+            os.path.basename(w.text) for w in c.argv[: len(c.argv) - len(words)] if w.static
+        } <= {"command", "builtin", "noglob", "nocorrect", "time", "nice"}:
+            return False
+        name = os.path.basename(words[0].text)
+        if name in p.functions:
+            return False
+        args = words[1:]
+        if name in DB_CLIENTS:
+            return True
+        if name in ("docker", "podman"):
+            texts = [os.path.basename(w.text) for w in args if w.static]
+            return "exec" in texts and bool(DB_CLIENTS & set(texts)) and not (set(texts) & (SHELLS | shell.INTERPRETERS | {"env", "xargs", "sudo"}))
+        base = re.sub(r"[\d.]+$", "", name)
+        if base in shell.INTERPRETERS or name in shell.INTERPRETERS or name in SHELLS:
+            k = 0
+            while base == "python" and k < len(args) and args[k].static and args[k].text in PYTHON_PLAIN_FLAGS:
+                k += 1
+            script = args[k] if k < len(args) else None
+            return (
+                script is not None and script.static and not script.text.startswith(("-", "+", "/dev/", "/proc/")) and script.text != ""
+            )
+        return False
 
     def _reads_stdin_as_data(self, c: shell.Call, p: _Parsed, rebound: bool) -> bool:
         """Is `c` a program known to treat what it reads as data and never as code — a program of STDIN_DATA with options that

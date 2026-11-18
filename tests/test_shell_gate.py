@@ -1611,6 +1611,65 @@ class TestIssueRegressions(Base):
             with self.subTest(command):
                 self.deny(command)
 
+    def test_43_stdin_from_a_file_with_a_built_name_is_not_built_text_for_a_script_or_a_database_client(self):
+        for command in (
+            'python3 script.py < "$f"',
+            'node app.js < "$f"',
+            'python3 -u script.py < "$f"',
+            'bash run.sh < "$f"',
+            'perl script.pl < "$f"',
+            'psql < "$f"',
+            'psql "$url" < "$f"',
+            'mysql -u r db < "$dump"',
+            'mariadb db < "$dump"',
+            'sqlite3 x.db < "$f"',
+            'docker compose exec -T db psql -U u < "$f"',
+            'docker exec -i db mysql < "$f"',
+        ):
+            with self.subTest(command):
+                self.allow(command)
+
+    def test_43_stdin_from_a_file_still_runs_as_code_when_the_receiver_takes_its_program_from_it(self):
+        for command in (
+            'python3 < "$f"',
+            'python3 - < "$f"',
+            'python3 /dev/stdin < "$f"',
+            "python3 -c 'import os' < \"$f\"",
+            "perl -e 'x' < \"$f\"",
+            'sh < "$f"',
+            'bash -s < "$f"',
+            'docker exec -i db sh < "$f"',
+            'docker exec -i db bash -c psql < "$f"',
+            'sed -f - < "$f"',
+        ):
+            with self.subTest(command):
+                self.deny(command)
+
+    def test_43_a_database_client_fed_by_a_heredoc_or_a_here_string_with_an_expansion_stays_refused(self):
+        """`psql` and `mysql` run what they read (`\\!` is a shell command); only a file whose text nobody built is data."""
+        for command in (
+            'psql <<< "select $x"',
+            'cat <<EOF | psql\nselect $N;\nEOF',
+            'psql <<EOF\nselect $N;\nEOF',
+            'echo "$q" | mysql db',
+            'echo "$q" | psql',
+        ):
+            with self.subTest(command):
+                self.deny(command)
+
+    def test_43_the_name_of_the_file_is_still_a_path_the_gate_judges_by_the_rule_of_22(self):
+        for command in (
+            'python3 script.py < "$(echo ../Sensitive-data/people.csv)"',
+            'python3 script.py < "$(echo ../Sens)itive-data/people.csv"',
+            "psql < $(echo ../Sensitive-data/people.csv)",
+            'psql < "$(echo ../Sens)itive-data/people.csv"',
+            "node app.js < ../Sensitive-data/people.csv",
+            "python3 script.py < ../Sens*/people.csv",
+            'docker exec -i db mysql < "$(echo ../Sens)itive-data/people.csv"',
+        ):
+            with self.subTest(command):
+                self.deny(command)
+
 
 if __name__ == "__main__":
     unittest.main()
