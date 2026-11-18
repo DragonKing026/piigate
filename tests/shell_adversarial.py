@@ -437,6 +437,8 @@ NOREAD = {
 # sensitive source is configured (`AstGate._substituted_operand`) — operand-subst, operand-bare-subst, operand-default,
 # operand-from-substitution, quoted-operand-from-substitution are no longer listed here. Still open: a variable assigned from a substitution
 # (`f=$(echo P); cat "$f"`), the items of a `for`, the options of gh/curl.
+# CLOSED (issue #41 / #43): a shell or interpreter that reads a PIPE whose earlier stage is not a plain `echo` / `printf` / `cat` of a literal
+# (`… | base64 -d | sh`, `rev | sh`, `sed … | sh`) is code nobody can read — base64-to-sh is no longer listed here.
 KNOWN: dict[str, str] = {
     "python-script-concatenated-name": "`S=x.py; cat > $S <<'EOF' … 'Sens'+'itive' … EOF; python3 $S`: the old gate denied it only through "
     "the accident `_unvettable_script` (a `$` in the target name of a written script that is run in the line). The AST gate resolves `$S` and judges the "
@@ -463,7 +465,6 @@ KNOWN: dict[str, str] = {
     "text may be written by `printf`, `tee`, `cp`, `ln -s` (see the `script-*` cases). README: covered (\"a script written earlier\", "
     "\"code that assembles a path at run time\") — the pattern and the copy cases are NOT spelled out",
     "script-prepared-by-an-earlier-call": "D5: the script was written by an earlier tool call, the line only names it. README: covered (\"a script run by a later call\")",
-    "base64-to-sh": "D6: the code is encoded; nothing in the line names the path. README: covered (\"base64\")",
     "base64-to-bash-c": "D6: the same through `bash -c \"$(… | base64 -d)\"`: the output of a substitution is not a value the line holds. README: covered (base64)",
     "eval-subst": "the script of `eval` is the OUTPUT of a command substitution; its text is `$(echo 'cat ../S*/p*')`, a glob the gate cannot match "
     "to a path from the text (the old gate has the same gap). README: covered (\"the output of a command substitution used as an operand is not followed yet, issue #22\")",

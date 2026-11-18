@@ -678,7 +678,7 @@ class AstGate(gate.Gate):
         (`echo 'ls' | sh`) and judged as before. Returns the call that reads it, or None."""
         if p is None:
             return None
-        live = {"param", "cmd", "proc", "arith"}
+        live = {"param", "cmd", "proc", "arith", "brace"}  # `echo p{ii,}gate`: the words are made by the shell, not read from the line
 
         def expands(w: shell.Word | None) -> bool:
             return w is not None and bool(live & w.kinds)
@@ -696,6 +696,25 @@ class AstGate(gate.Gate):
             for pid, stage in c.pipes:
                 stages.setdefault(pid, []).append((stage, c))
         rebound = any(c.name == "alias" or any(a.name in shell.CODE_ARRAYS for a in c.assigns) for c in p.calls)
+
+        def literal(f: shell.Call) -> bool:
+            """A stage that is the plain `echo` / `printf` / `cat` of a LITERAL text: every word static (no variable, no glob, no
+            brace, no substitution), a `cat` without a file, a heredoc or a here-string without an expansion, nothing read from a file."""
+            if rebound or f.name not in ("echo", "printf", "cat") or f.name in p.functions or not all(w.static for w in f.argv):
+                return False
+            if f.name == "cat" and any(w.text == "-" or not w.text.startswith("-") for w in f.argv[1:]):
+                return False
+            return all(
+                r.op not in ("<", "<>") and not dynamic_heredoc(r) and (r.target is None or r.target.static) for r in f.redirects
+            )
+
+        def transformed(c: shell.Call) -> bool:
+            """A shell or an interpreter that reads its program from a pipe whose earlier stage is anything but a plain `echo` /
+            `printf` / `cat` of a literal (`base64 -d | sh`, `rev | sh`, `sed … | sh`, `awk … | sh`, `curl … | sh`): the text it gets is
+            not the text of the line, so nobody can read the code (#41, #43). `echo 'ls' | sh` is read by the tree."""
+            return bool(c.stdin_interpreter) and any(
+                not literal(f) for pid, stage in c.pipes if stage for s, f in stages[pid] if s < stage
+            )
         parent = {id(sub): c for c in p.calls for sub in c.substitutions}
         fed_calls: set[int] = set()
         for c in p.calls:
@@ -705,6 +724,7 @@ class AstGate(gate.Gate):
                 any((expands(r.target) and not (from_file and r.op == "<")) or dynamic_heredoc(r) for r in own)
                 or any("proc" in w.kinds and not w.text.startswith(">(") for w in c.argv)
                 or any(feeds(f) for pid, stage in c.pipes if stage for s, f in stages[pid] if s < stage)
+                or transformed(c)
             )
             if c.origin == ">(" and (up := parent.get(id(c))) is not None:  # `tee >(sh)`, `printf "$x" > >(sh)`: its stdin is the output of `up`
                 fed = fed or id(up) in fed_calls or any(
