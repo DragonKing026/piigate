@@ -1064,6 +1064,41 @@ class TestIssueRegressions(Base):
             with self.subTest(command):
                 self.deny(command)
 
+    def test_26_a_word_nobody_knows_is_data_only_for_a_command_that_never_runs_it(self):
+        """The rule of shell.py (WHAT CAN RUN A WORD): `$c` / `$(…)` in the argv of anything but `shell.DATA_ONLY` may be the
+        program that runs — a launcher the gate has never heard of included — so with `reverse` / `approve` in the line it is a call."""
+        for command in (
+            'printf reverse | xargs "$(printf pii)gate"',
+            "c=$(printf pii)gate; taskset 1 $c reverse",
+            'find . -maxdepth 0 -exec "$(printf pii)gate" reverse \\;',
+            "c=$(printf pii)gate; flock /tmp/l $c reverse",
+            "c=$(printf pii)gate; strace -f $c reverse",
+            "c=$(printf pii)gate; watch $c reverse",
+            "c=$(printf pii)gate; ionice $c reverse",
+            "c=$(printf pii)gate; chrt 1 $c reverse",
+            "c=$(printf pii)gate; unshare -m $c reverse",
+            "c=$(printf pii)gate; setsid $c reverse",
+            "c=$(printf pii)gate; nohup $c reverse",
+            "c=$(printf pii)gate; parallel $c ::: reverse",
+            "c=$(printf pii)gate; somelauncher-nobody-knows $c reverse",
+            'python3 -c "$code"; echo reverse',  # an interpreter with a program of unknown value is not data-only
+            'python3 "$script" x; echo approve',
+            'sh -c "$x"; echo reverse',
+            'f() { "$@"; }; f $c reverse',  # a function runs its arguments
+            'echo() { piigate "$@"; }; echo $x reverse',  # a function of the line may be named like a plain command
+            "alias echo=piigate; echo $x reverse",  # so may an alias
+        ):
+            with self.subTest(command):
+                self.deny(command)
+        for command in (  # the same unknown words, but in the argv of commands that never run them
+            'echo "$(date)" reverse',
+            'cat "$f" > /dev/null; echo reverse',
+            'grep -c "$(echo a)" x.csv; echo approve',
+            'python3 -c "print(sorted([1], reverse=True))"',  # literal code: nothing dynamic reaches python
+        ):
+            with self.subTest(command):
+                self.allow(command)
+
 
 if __name__ == "__main__":
     unittest.main()

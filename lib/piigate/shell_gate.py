@@ -53,6 +53,7 @@ class _Parsed:
     composed: str = ""  # the line as its WORDS compose it (quotes and variables resolved): `piigate rev''erse` -> `piigate reverse`
     dynamic_body: str = ""  # why an unquoted heredoc given to an interpreter holds a value nobody can read
     rest: frozenset = frozenset()  # the words of the command itself (without the text bodies of its heredocs)
+    functions: frozenset = frozenset()  # the names of the functions the line declares
 
 
 class _TooMany(str):
@@ -411,7 +412,7 @@ class AstGate(gate.Gate):
         if any("\x00" in str(t) for t in tokens):
             raise shell.ParseError("a NUL byte in a word", "nul-byte")
         composed = all_text + "".join("\n" + b.text for b in bodies if not b.stripped)
-        return _Parsed(command, calls, tokens, stage_calls, bodies, view, composed, dynamic_body, rest)
+        return _Parsed(command, calls, tokens, stage_calls, bodies, view, composed, dynamic_body, rest, getattr(calls, "functions", frozenset()))
 
     def _store(self, command: str) -> _Parsed:
         p = self._build(command)
@@ -525,22 +526,26 @@ class AstGate(gate.Gate):
         return None
 
     def _human_only_dynamic(self, command: str, tokens: list[str] | None, standalone: bool) -> bool:
-        """Is `piigate` possibly run with a subcommand the words do not show? The tree says: a command whose name is not
-        known (`$c reverse`, `$(echo piigate) reverse`), code the parser cannot read (`eval $x`, `bash -c "$x"`), a call
-        of piigate with an argument of unknown value (`piigate $sub`). A `$(…)` or `${…}` elsewhere in the line, or the word
-        `reverse` / `approve` in an argument of another program (a URL, a grep pattern, `sorted(…, reverse=True)`), is not
-        one (#26). A line the tree cannot tell about is judged by its text, as before."""
+        """Can `piigate` be run with a subcommand the words do not show? By the rule of shell.py (WHAT CAN RUN A WORD): a word
+        whose value nobody knows (`$c`, `$(…)`, a glob) is data only for a command of `shell.DATA_ONLY` (`echo`, `cat`…); in the
+        argv of any other command — a launcher (`xargs $c`, `taskset 1 $c`, `find -exec $c`), an interpreter (`python3 -c "$code"`),
+        a function, an alias, an unknown name — it may be the program that runs. So is a command whose name is unknown
+        (`$c reverse`) and code the parser cannot read (`eval $x`, `bash -c "$x"`). A `$(…)` elsewhere in the line, or the word
+        `reverse` / `approve` in an argument of another program (a URL, a grep pattern, `sorted(…, reverse=True)`), is not one
+        (#26). A line the tree cannot tell about is judged by its text, as before."""
         p = self._cache.get(command)
         if p is None or tokens is None:
             return super()._human_only_dynamic(command, tokens, standalone)
+        rebound = any(c.name == "alias" or any(a.name in shell.CODE_ARRAYS for a in c.assigns) for c in p.calls)
         for c in p.calls:
             if c.opaque_code:
                 return True
             words = shell._effective(c.argv)
             if words and not words[0].static:
                 return True
-            k = self._runs_piigate([w.text for w in c.argv])
-            if k is not None and any(not w.static for w in c.argv[k + 1 :]):
+            name = os.path.basename(words[0].text) if words else ""
+            known = name in shell.DATA_ONLY and not rebound and name not in p.functions
+            if not known and any(w.expands for w in c.argv):
                 return True
         return False
 

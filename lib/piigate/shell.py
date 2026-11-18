@@ -947,11 +947,29 @@ def _effective(argv: list[Word]) -> list[Word]:
     return words
 
 
-# commands that run (or may run) the words they are given as a command, a script or shell text — `eval` after one of them is code
+# WHAT CAN RUN A WORD OF THE ARGV (one rule, two questions — the gate asks both, fail closed):
+#  * a LITERAL builtin name (`eval`) given to a program is code only where a shell evaluates it: the shells, the builtins and
+#    keywords that take a command, the zsh precommand modifiers (WRAPPERS) and the programs that hand their arguments to a
+#    shell (`watch`, `parallel`, `su -c`…) — ARGUMENT_RUNNERS, a list that is finite because the grammar is. A program
+#    that starts its argument with execvp cannot run a builtin: `playwright-cli eval "js"` hands `eval` to its own parser.
+#    A command nobody can name, a function or an alias of the line is not known to be a program: `eval` stays code.
+#  * a DYNAMIC word (`$c`, `$(…)`) may be a program name, and ANY program that execs its arguments runs it (`taskset 1 $c`,
+#    `strace $c`, `xargs $c`, `find -exec $c`): no list of launchers is complete, so such a word is data only for the
+#    commands of DATA_ONLY — those that never run what they are given — and for nothing else.
 ARGUMENT_RUNNERS = {
     "xargs", "parallel", "find", "fd", "watch", "flock", "script", "chrt", "taskset", "ionice", "trap", "alias", "repeat",
     "coproc", "sched", "su", "runuser", "pkexec", "unshare", "nsenter", "chroot", "strace", "ltrace", "entr", "zargs", "eval",
-    "source", ".", "foreach", "while", "until", "if", "then", "else", "elif", "do", "!", "{", "(", "case", *SHELLS_NAMED,
+    "source", ".", "foreach", "while", "until", "if", "then", "else", "elif", "do", "!", "{", "(", "fc", "bind", "complete",
+    "compgen", "compopt", "mapfile", "readarray", "emulate", "enable", "zle", "vared", "bindkey", "zcompile", "autoload",
+    "functions", "compctl", "function", *SHELLS_NAMED,
+}
+DATA_ONLY = {
+    "echo", "printf", "true", "false", ":", "test", "[", "[[", "((", "let", "export", "declare", "typeset", "local", "readonly",
+    "unset", "shift", "sleep", "pwd", "for", "select", "case", "exit", "return", "read", "cd", "pushd", "popd", "dirs",
+    "cat", "tac", "head", "tail", "nl", "wc", "uniq", "cut", "paste", "join", "comm", "diff", "cmp", "grep", "egrep", "fgrep",
+    "zgrep", "ls", "stat", "file", "du", "date", "basename", "dirname", "realpath", "readlink", "mkdir", "rmdir", "rm", "touch",
+    "cp", "mv", "ln", "chmod", "chown", "seq", "expr", "uname", "id", "whoami", "hostname", "tr", "column", "fold", "rev", "od",
+    "xxd", "hexdump", "strings", "base64", "md5sum", "sha1sum", "sha256sum", "sha512sum", "b2sum", "cksum",
 }
 
 
@@ -1346,16 +1364,14 @@ class _Walker:
         return out
 
     def plain_program(self, argv: list[Word], at: int) -> bool:
-        """The command word (at `at`) names a program that only gets its arguments as data — never a builtin, a keyword, a
-        launcher, a function or an alias of the line, or a word whose value nobody knows (fail closed)."""
+        """The command word (at `at`) is KNOWN to be a program that only gets its arguments as data (see ARGUMENT_RUNNERS):
+        static, no builtin / keyword / launcher, no function and no alias of the line."""
         if at >= len(argv) or not argv[at].static:
             return False
         name = os.path.basename(argv[at].text)
         if name in ARGUMENT_RUNNERS or argv[at].text in self.functions or name in self.functions:
             return False
-        return not any(
-            c.name == "alias" or any(a.name in CODE_ARRAYS for a in c.assigns) for c in self.calls
-        )  # an alias or `aliases[x]=…` earlier in the line: any word may be one
+        return not any(c.name == "alias" or any(a.name in CODE_ARRAYS for a in c.assigns) for c in self.calls)
 
     def nested_script(self, call: Call, st: _State) -> _State | None:
         """The scripts the command runs: `bash -c S`, `eval S` — and the same behind a launcher in its arguments
@@ -1594,6 +1610,7 @@ class CallList(list):
 
     assigned_in_expansions: frozenset[str] = frozenset()
     model: VarModel | None = None
+    functions: frozenset[str] = frozenset()  # the names of the functions the line declares
 
 
 def _expansion_assignments(node) -> set[str]:
@@ -1639,5 +1656,6 @@ def parse(command: str, *, cwd: str, dialect: str = DEFAULT_DIALECT) -> list[Cal
         raise ParseError(f"cannot walk the syntax tree ({type(e).__name__})", "walk-error") from e
     finally:
         _SRC = saved_src
+    result.functions = frozenset(walker.functions)
     result.extend(walker.calls)
     return result
