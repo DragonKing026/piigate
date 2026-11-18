@@ -194,6 +194,9 @@ def ssh_valid(arguments: list[str]) -> bool:
 
 
 PDFTOTEXT_WITH_VALUE = {"-f", "-l", "-r", "-x", "-y", "-W", "-H", "-enc", "-eol", "-opw", "-upw", "-fixed", "-margin"}
+# programs whose `-o` / `--output` names the file they WRITE; for any other program the word after it is a file it may READ
+# (`grep -e . -o F`, `od -o F`, `cut -c1- -o F`, `head --output F` — #40): not a write target there
+OUTPUT_OPTION_COMMANDS = {"sort", "gcc", "cc", "g++", "c++", "clang", "clang++", "ld", "curl", "wget", "pandoc", "tree", "openssl"}
 OUTPUT_OPTIONS = re.compile(r"^(?:-o|-O|--output(?:=.*)?|--out(?:=.*)?|-o.+|--output-file(?:=.*)?)$")
 SEARCHERS = {
     "grep",
@@ -918,7 +921,7 @@ class Gate:
                 unsafe_pipe = True
             if core:
                 stages.append(core)
-                writes += [(len(stages) - 1, i, os.path.normpath(core[i])) for i in self._write_targets(core) if i < len(core)]
+                writes += [(len(stages) - 1, i, os.path.normpath(core[i])) for i in self._write_targets(core, True) if i < len(core)]
             piped = t in ("|", "|&")
             previous, stage = t, []
         return stages, writes, unsafe_pipe
@@ -2163,13 +2166,14 @@ class Gate:
         return any(len(name) >= len(e) and compatible(e, name) and len(name) > len(e) for e in extensions)
 
     @staticmethod
-    def _write_targets(stage: list[str]) -> set[int]:
+    def _write_targets(stage: list[str], any_output_option: bool = False) -> set[int]:
         """Indices of tokens the stage only writes to (no content to check): after > >> >| &> &>>, tee arguments,
         -o/--output, the cp/mv target (without -t and redirections)."""
         dests = {i + 1 for i, t in enumerate(stage[:-1]) if t in (">", ">>", ">|", "&>", "&>>")}
-        dests |= {i + 1 for i, t in enumerate(stage[:-1]) if i and t in ("-o", "--output")}
-        dests |= {i for i, t in enumerate(stage) if i and re.match(r"^--(?:output|out)=", t)}
         cmd = Path(stage[0]).name if stage else ""
+        if any_output_option or cmd in OUTPUT_OPTION_COMMANDS:  # any_output_option: a file WRITTEN by any program (script tracking)
+            dests |= {i + 1 for i, t in enumerate(stage[:-1]) if i and t in ("-o", "--output")}
+            dests |= {i for i, t in enumerate(stage) if i and re.match(r"^--(?:output|out)=", t)}
         if cmd == "tee":
             dests |= {
                 i

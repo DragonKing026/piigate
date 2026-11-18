@@ -1153,9 +1153,9 @@ class TestIssueRegressions(Base):
         for command in ("sort x.csv -o ../Sensitive-data/out.txt", "curl -o ../Sensitive-data/out.txt http://example.test"):
             with self.subTest(command):
                 self.allow(command)
-        # the old gate (production) lets these through — a hole reported separately; the tree gate is stricter there on purpose
-        for form in (f"grep -e '.*' -o {s}", f"od -o {s}", f"od -c -o {s}", f"cut -c1- -o {s}", f"head -n5 --output {s}"):
-            self.assertIsNone(self.old().bash(form), form)
+        # #40: the production gate no longer frees the word after `-o` either (OUTPUT_OPTION_COMMANDS is shared)
+        for form in forms:
+            self.assertIsNotNone(self.old().bash(form), form)
 
     # -- #22: a path made by a command substitution is an unknown path for a command that reads files
     def test_22_a_substitution_as_the_operand_of_a_reader_is_refused(self):

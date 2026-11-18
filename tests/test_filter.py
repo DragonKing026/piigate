@@ -3626,6 +3626,24 @@ class TestContentNotNames(unittest.TestCase):
             with self.subTest(command):
                 self.assertIsNotNone(b.bash(command))
 
+    def test_o_is_a_write_target_only_for_programs_that_write_there(self):
+        """Issue #40: the word after `-o` / `--output` was freed in EVERY command, so `grep -e . -o F`, `od -o F`,
+        `cut -c1- -o F`, `head --output F` read a sensitive file and passed. Only OUTPUT_OPTION_COMMANDS write there."""
+        b = self.gate()
+        F = "Sensitive-data/people.csv"
+        forms = (
+            f"grep -e '.*' -o {F}", f"grep -o x {F}", f"od -o {F}", f"od -c -o {F}", f"cut -c1- -o {F}",
+            f"head -n5 --output {F}", f"head -n5 --output={F}",
+        )
+        for form in forms:
+            for command in (form, f"mkdir x && {form}", f"true; {form}"):
+                with self.subTest(command):
+                    self.assertIsNotNone(b.bash(command))
+        for command in ("sort x -o out", "curl -o out http://example.test/", "gcc -o a a.c", "grep -o x notes.txt", "sort x --output=out"):
+            with self.subTest(command):
+                self.assertIsNone(b.bash(command))
+        self.assertIsNone(b.bash("sort x -o Sensitive-data/out.txt"))  # a program that writes there: creating a file brings nothing back
+
     def test_grep_directories_option(self):
         b = self.gate()
         for command in ("grep -d recurse x", "grep --directories=recurse x", "grep --directories recurse x", "grep -drecurse x", "grep -rd recurse x"):
