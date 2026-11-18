@@ -278,7 +278,8 @@ NIP_RE = re.compile(
 # a bare number that is a JSON number value (`"key": 1234567890`, also in a list of numbers) is a NIP only under a key
 # that names an identity or tax number; the key is looked up here (the quoted form `"nip": "1234567890"` is not affected)
 _JSON_KEY_VALUE_RE = re.compile(r'\\?"([^"\\]{1,80})\\?"\s*:\s*$')
-_JSON_KEY_LIST_RE = re.compile(r'\\?"([^"\\]{1,80})\\?"\s*:\s*\[\s*(?:-?[\d.eE+-]+\s*,\s*)*$')
+# one token class per list item (no optional `-` in front of a class that has `-` too): no exponential backtracking
+_JSON_KEY_LIST_RE = re.compile(r'\\?"([^"\\]{1,80})\\?"\s*:\s*\[\s*(?:[\d.eE+-]+\s*,\s*)*$')
 # a substring of the lower-cased key without separators (fail-safe: `private` also matches `vat`, and is kept as a NIP)
 _IDENTITY_KEY_RE = re.compile(r"nip|tax|vat|regon|krs|pesel|ssn|podat|ident|nrid|idnum")
 NIP_CONTEXT_RE = re.compile(r"(?i)\bNIP\s*[:.]?\s*((?:PL)?\s?[\d -]{10,13}\d)")

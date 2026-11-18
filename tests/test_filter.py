@@ -4989,6 +4989,20 @@ class TestChecksumNumbers(unittest.TestCase):
     """Issue #30: PESEL and card numbers are contiguous digits (or a printed card layout) that pass the checksum;
     digit groups that merely stand next to each other or are joined in a file name are not one number."""
 
+    def test_json_list_key_has_no_exponential_backtracking(self):
+        """CodeQL py/redos: `"k": [` followed by many `-+,` must not hang the detector (it did with `-?` in front of a
+        class that has `-` too)."""
+        import time
+
+        from piigate import rules
+
+        text = '"!":[' + "-+," * 40 + "x 1234567819"
+        start = time.monotonic()
+        rules.detect(text, dates="none", drugs=False)
+        self.assertLess(time.monotonic() - start, 2.0)
+        self.assertEqual({f.type_ for f in rules.detect('{"a": [1, -2, 1234567819]}', dates="none", drugs=False)}, set())
+        self.assertIn("NIP", {f.type_ for f in rules.detect('{"nip": [-2, 1234567819]}', dates="none", drugs=False)})
+
     CARDS = ("4111111111111111", "4111 1111 1111 1111", "4111-1111-1111-1111", "5500 0000 0000 0004", "3782 822463 10005",
              "378282246310005")
 
