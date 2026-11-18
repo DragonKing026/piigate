@@ -36,9 +36,14 @@ MAX_LOOP_NESTING = 6  # loops inside loops: each level walks its body twice, so 
 
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "mksh", "ash", "fish"}
 # interpreters that read a program from stdin when called without a script (or with `-`)
+SHELLS_NAMED = ("bash", "sh", "zsh", "dash", "ksh", "fish")
 INTERPRETERS = {"python", "python3", "node", "nodejs", "perl", "ruby", "php", "lua", "deno", "bun"}
 CODE_FLAGS = {"-c", "-m", "-e", "-E", "-p", "-r", "--eval", "--command", "--print", "--exec"}
-WRAPPERS = {"env", "sudo", "doas", "nice", "nohup", "exec", "command", "builtin", "time", "setsid", "stdbuf", "timeout"}
+# `noglob`, `nocorrect` and `-` are the zsh precommand modifiers: they run the next word as the command (`noglob eval '…'` evals)
+WRAPPERS = {
+    "env", "sudo", "doas", "nice", "nohup", "exec", "command", "builtin", "time", "setsid", "stdbuf", "timeout",
+    "noglob", "nocorrect", "-",
+}
 WRAPPER_VALUE_OPTIONS = {
     "sudo": {"-u", "-g", "-h", "-p", "-C", "-D", "-R", "-T", "-U"},
     "doas": {"-u", "-C"},
@@ -163,6 +168,7 @@ class Call:
     pipes_out: bool = False  # its stage feeds a later stage of the pipeline (every command of a `{ a; b; } | c` stage does)
     opaque_code: bool = False  # `bash -c "$x"` / `eval $x`: code the parser cannot see
     background: bool = False
+    eval_as_argument: int = 0  # words `eval` that are arguments of a plain program (`playwright-cli eval "js"`): data, not code
 
     @property
     def name(self) -> str:
@@ -941,12 +947,12 @@ def _effective(argv: list[Word]) -> list[Word]:
     return words
 
 
-ARGUMENT_RUNNERS = {"xargs", "parallel", "find", "fd", "watch", "flock", "script", "chrt", "taskset", "ionice", "trap", "alias"}
-
-
-def _runs_arguments(argv: list[Word], at: int) -> bool:
-    """The command word (at `at`) is not a plain program: it runs what it is given, or it is not known."""
-    return at >= len(argv) or not argv[at].static or os.path.basename(argv[at].text) in ARGUMENT_RUNNERS
+# commands that run (or may run) the words they are given as a command, a script or shell text — `eval` after one of them is code
+ARGUMENT_RUNNERS = {
+    "xargs", "parallel", "find", "fd", "watch", "flock", "script", "chrt", "taskset", "ionice", "trap", "alias", "repeat",
+    "coproc", "sched", "su", "runuser", "pkexec", "unshare", "nsenter", "chroot", "strace", "ltrace", "entr", "zargs", "eval",
+    "source", ".", "foreach", "while", "until", "if", "then", "else", "elif", "do", "!", "{", "(", "case", *SHELLS_NAMED,
+}
 
 
 def _script_words(argv: list[Word]) -> tuple[str, list[Word]] | None:
@@ -1339,6 +1345,18 @@ class _Walker:
             out.append(w)
         return out
 
+    def plain_program(self, argv: list[Word], at: int) -> bool:
+        """The command word (at `at`) names a program that only gets its arguments as data — never a builtin, a keyword, a
+        launcher, a function or an alias of the line, or a word whose value nobody knows (fail closed)."""
+        if at >= len(argv) or not argv[at].static:
+            return False
+        name = os.path.basename(argv[at].text)
+        if name in ARGUMENT_RUNNERS or argv[at].text in self.functions or name in self.functions:
+            return False
+        return not any(
+            c.name == "alias" or any(a.name in CODE_ARRAYS for a in c.assigns) for c in self.calls
+        )  # an alias or `aliases[x]=…` earlier in the line: any word may be one
+
     def nested_script(self, call: Call, st: _State) -> _State | None:
         """The scripts the command runs: `bash -c S`, `eval S` — and the same behind a launcher in its arguments
         (`find -exec sh -c S ';'`, `xargs sh -c S`, `env -i bash -c S`): every shell word of the argv followed by -c."""
@@ -1349,9 +1367,11 @@ class _Walker:
         command_at = len(argv) - len(_effective(argv))  # where the command itself starts, after `sudo -u x`, `env A=1`, `time`…
         while i < len(argv):
             found = _script_words(argv[i:])
-            if found and found[0] == "eval" and i != command_at and not _runs_arguments(argv, command_at):
+            if found and found[0] == "eval" and i != command_at and self.plain_program(argv, command_at):
                 # `eval` is a builtin: it is the command word, not an argument that a program may be given (`playwright-cli eval
-                # "document.querySelectorAll('.x')"`, `node eval x`); behind a program that runs its arguments (`xargs`) it stays code
+                # "document.querySelectorAll('.x')"`, `node eval x`). Only where the command is KNOWN to be a plain program: not a
+                # command that runs its arguments (`xargs`, `noglob`), not unknown, not a function or an alias of the line
+                call.eval_as_argument += 1
                 i += 1
                 continue
             if found and not (found[1] and id(found[1][0]) in done):

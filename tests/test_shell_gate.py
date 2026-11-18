@@ -983,6 +983,32 @@ class TestIssueRegressions(Base):
         self.deny("eval 'ls'; cat ../Sensitive-data/people.csv")
         self.deny("playwright-cli eval 'x'; cat ../Sensitive-data/people.csv")
 
+    def test_34_eval_behind_a_modifier_a_builtin_a_function_or_an_alias_is_still_code(self):
+        """Fail closed: `eval` is skipped only after a command KNOWN to be a plain program. The zsh precommand modifiers
+        (`noglob`, `nocorrect`, `-`), `builtin` / `command` / `exec` / `time`, a function or an alias of the line, a command
+        nobody can name and the programs that run their arguments leave it the builtin — in the old gate's reading too."""
+        glued = '"cat ../Sens""itive-data/people.csv"'
+        qualifier = "\"ls *(e:'echo hi':)\""
+        for prefix in ("noglob", "nocorrect", "-", "builtin", "command", "exec", "time", "noglob command", "env", "sudo", "repeat 1"):
+            for code in (glued, qualifier):
+                command = f"{prefix} eval {code}"
+                with self.subTest(command):
+                    self.deny(command)
+                    self.assertIsNotNone(self.old().bash(command), command)  # the old gate refuses it: never looser
+        for command in (
+            f"pw() {{ eval \"$@\"; }}; pw eval {glued}",
+            f"pw() {{ \"$@\"; }}; pw eval {qualifier}",
+            f"alias pw=eval; pw eval {glued}",
+            f"alias pw=''; pw eval {qualifier}",
+            f"$x eval {glued}",
+            f"xargs eval {glued}",
+        ):
+            with self.subTest(command):
+                self.deny(command)
+        calls = shell.parse("noglob eval 'ls'", cwd=str(self.work))
+        self.assertEqual([c.name for c in calls], ["noglob", "ls"])  # the text after a real `eval` is parsed
+        self.assertEqual(sum(c.eval_as_argument for c in calls), 0)
+
     # -- #27: a script written from a heredoc and run is judged by what it says; one built from run-time text is refused
     def test_27_a_script_written_from_a_literal_heredoc_may_run(self):
         for last in ('bash "$f"', 'wc -l "$f"', "true"):
