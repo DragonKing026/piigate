@@ -1250,10 +1250,11 @@ class TestAnonymization(unittest.TestCase):
         with self.assertRaisesRegex(FilterError, "no message found.*server skipped: .*no response"):
             analysis.fetch_mail("Recepty", None, self.cfg, PseudonymMap())
         # a hung server is skipped after the time limit, and no server process is left behind
-        self.cfg["anonymization"]["mail_mcp"] = [["sleep", "30"], fake]
+        hung = f"30.{os.getpid()}"  # unique, so another process sleeping 30 s on this machine does not fail the test
+        self.cfg["anonymization"]["mail_mcp"] = [["sleep", hung], fake]
         with unittest.mock.patch.object(analysis.MailClient, "TIMEOUT_S", 1):
             self.assertIsInstance(analysis.fetch_mail("Recepty", None, self.cfg, PseudonymMap()), tuple)
-        left = subprocess.run(["pgrep", "-f", "-x", "sleep 30"], capture_output=True, text=True, check=False).stdout
+        left = subprocess.run(["pgrep", "-f", "-x", f"sleep {hung}"], capture_output=True, text=True, check=False).stdout
         self.assertEqual(left, "")
         self.cfg["anonymization"]["mail_mcp"] = [fake, "python3"]
         with self.assertRaisesRegex(FilterError, "list of argvs"):
