@@ -1525,6 +1525,30 @@ class TestIssueRegressions(Base):
             with self.subTest(command):
                 self.allow(command)
 
+    def test_43_a_filter_named_by_a_path_is_one_only_in_a_system_directory(self):
+        for command in (
+            'echo "$x" | ./cat',
+            'echo "$x" | ./sort',
+            'echo "$x" | /tmp/x/sort',
+            'echo "$x" | /tmp/cat',
+            'echo "$x" | ../bin/grep y',
+            'echo "$x" | xargs ./cat',
+            'echo "$x" | xargs /tmp/x/grep y',
+            'echo "$x" | $HOME/bin/cat',
+            'echo "$x" | ~/cat',
+        ):
+            with self.subTest(command):
+                self.deny(command)
+        for command in (
+            'echo "$x" | cat',
+            'echo "$x" | /usr/bin/sort',
+            'echo "$x" | /bin/cat',
+            'echo "$x" | /usr/local/bin/jq .a',
+            'echo "$x" | /usr/bin/xargs grep y',
+        ):
+            with self.subTest(command):
+                self.allow(command)
+
 
 if __name__ == "__main__":
     unittest.main()

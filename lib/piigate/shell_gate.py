@@ -95,6 +95,9 @@ FILTER_OPTIONS = {
     "less": ("NSRrFXiIqQsnwJ", "", frozenset(), {}),
     "more": ("", "", frozenset(), {}),
 }
+# where a program of STDIN_DATA may live when it is named by a path (`/usr/bin/sort`); any other path (`./cat`, `/tmp/x/sort`) is
+# a file the model may have written, not the filter (#43)
+SYSTEM_BINDIRS = ("/usr/bin", "/bin", "/usr/local/bin")
 NESTED_UNKNOWN = SUBSTITUTION_ORIGINS + ("-c", "eval")  # a call there has arguments the old gate reports as None
 
 
@@ -718,11 +721,13 @@ class AstGate(gate.Gate):
             os.path.basename(w.text) for w in c.argv[: len(c.argv) - len(words)] if w.static
         } <= {"command", "builtin", "noglob", "nocorrect", "time", "nice"}:
             return False
+        if not self._known_location(words[0].text):
+            return False
         if os.path.basename(words[0].text) == "xargs":
             words = self._xargs_command(words)
             if not words:
                 return True
-            if not words[0].static:
+            if not words[0].static or not self._known_location(words[0].text):
                 return False
             if os.path.basename(words[0].text) in FILTER_OPTIONS:
                 # the input of xargs ends up in the arguments of a filter that takes a program or options — appended
@@ -747,6 +752,11 @@ class AstGate(gate.Gate):
         if name in ("awk", "gawk", "mawk"):
             return bool(operands) and self._awk_program_ok(operands[0])
         return True
+
+    @staticmethod
+    def _known_location(text: str) -> bool:
+        """A bare name (the shell finds it on PATH) or a path in a system directory; `./cat` or `/tmp/x/sort` is a file of the model's (#43)."""
+        return "/" not in text or os.path.dirname(text) in SYSTEM_BINDIRS
 
     @staticmethod
     def _scan_options(args: list[shell.Word], spec) -> tuple[list[str], list[tuple[str, str | None]]] | None:
