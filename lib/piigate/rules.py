@@ -58,7 +58,7 @@ def nip_valid(digits: str) -> bool:
 
 
 def luhn_valid(digits: str) -> bool:
-    if not 12 <= len(digits) <= 19:
+    if not 13 <= len(digits) <= 19:
         return False
     total = 0
     for i, c in enumerate(reversed(digits)):
@@ -307,26 +307,15 @@ _CARD_LAYOUTS = (  # longest first: a longer layout is tried before the one that
     rf"\d{{4}}(?:{_CARD_SEP}\d{{4}}){{2}}{_CARD_SEP}\d{{1,3}}",
 )
 # contiguous digits
-CARD_RE = re.compile(r"(?<!\d)(?<!\d\.)\d{12,19}(?!\d)")
+CARD_RE = re.compile(r"(?<!\d)(?<!\d\.)\d{13,19}(?!\d)")
 CARD_LAYOUT_RES = tuple(re.compile(rf"{_CARD_EDGE}{layout}(?!\d|-\d)") for layout in _CARD_LAYOUTS)
 
 
-# issuer ranges (prefix low, prefix high, prefix length, allowed lengths): a number that fits none is not a card
-# (timestamps in ms, random IDs), a number that fits one and passes Luhn is masked even if it is a counter
-_CARD_ISSUERS = (
-    (4, 4, 1, (13, 16, 19)),  # Visa
-    (51, 55, 2, (16,)), (2221, 2720, 4, (16,)),  # Mastercard
-    (34, 34, 2, (15,)), (37, 37, 2, (15,)),  # Amex
-    (300, 305, 3, range(14, 20)), (36, 36, 2, range(14, 20)), (38, 39, 2, range(14, 20)),  # Diners
-    (6011, 6011, 4, range(16, 20)), (644, 649, 3, range(16, 20)), (65, 65, 2, range(16, 20)),  # Discover
-    (3528, 3589, 4, range(16, 20)),  # JCB
-    (62, 62, 2, range(16, 20)),  # UnionPay
-    (50, 50, 2, range(12, 20)), (56, 69, 2, range(12, 20)),  # Maestro
-)
-
-
-def card_issuer_valid(digits: str) -> bool:
-    return any(lo <= int(digits[:n]) <= hi and len(digits) in lengths for lo, hi, n, lengths in _CARD_ISSUERS)
+# fail-safe by length and first digit (an issuer table loses real cards: Mir 2200, Diners 3095, Visa of 14-18 digits):
+# 14-19 digits starting with 2-6, or 13 digits starting with 4 (Visa, the only 13-digit issuer). Timestamps in ms and
+# random IDs start with 0, 1, 7, 8 or 9 (13 digits starting with 2, 3, 5 or 6 are not a card either)
+def card_shape_valid(digits: str) -> bool:
+    return (len(digits) >= 14 and digits[0] in "23456") or (len(digits) == 13 and digits[0] == "4")
 
 
 def card_spans(text: str, accept=lambda digits, matched: True) -> list[tuple[int, int]]:
@@ -337,7 +326,7 @@ def card_spans(text: str, accept=lambda digits, matched: True) -> list[tuple[int
     for regex in (CARD_RE, *CARD_LAYOUT_RES):
         for m in regex.finditer(text):
             digits = re.sub(r"\D", "", m.group())
-            if card_issuer_valid(digits) and luhn_valid(digits) and accept(digits, m.group()):
+            if card_shape_valid(digits) and luhn_valid(digits) and accept(digits, m.group()):
                 spans.append(m.span())
     spans.sort(key=lambda span: (span[0], -span[1]))
     result: list[tuple[int, int]] = []

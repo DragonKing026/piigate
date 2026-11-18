@@ -5003,22 +5003,20 @@ class TestChecksumNumbers(unittest.TestCase):
         self.assertNotIn("PESEL", self.kinds("1.44051401359"))
         self.assertIn("PESEL", self.kinds("v1.440514-01458"))
 
-    def test_card_issuer_lengths(self):
+    def test_card_shapes(self):
+        """Fail-safe: 14-19 digits starting with 2-6 or 13 digits starting with 4 (and Luhn) are a card; no issuer table."""
+        from piigate import rules
+
         def luhn(prefix: str, length: int) -> str:
             body = prefix + "0" * (length - len(prefix) - 1)
             return body + next(str(c) for c in range(10) if rules.luhn_valid(body + str(c)))
 
-        from piigate import rules
-
-        good = {"4": (13, 16, 19), "51": (16,), "55": (16,), "2221": (16,), "2720": (16,), "34": (15,), "37": (15,),
-                "300": (14, 19), "305": (14,), "36": (14,), "38": (14,), "6011": (16, 19), "644": (16,), "65": (16,),
-                "3528": (16,), "3589": (19,), "62": (16, 19), "50": (12, 19), "56": (12,), "69": (19,)}
-        for prefix, lengths in good.items():
-            for n in lengths:
-                self.assertIn("CARD", self.kinds(f"karta {luhn(prefix, n)}"), (prefix, n))
-        bad = (("4", 14), ("4", 15), ("51", 15), ("51", 17), ("2221", 13), ("2721", 16), ("34", 16), ("37", 16),
-               ("300", 13), ("3528", 15), ("3590", 16), ("1", 13), ("1", 16),
-               ("0", 16), ("7", 16), ("2", 13), ("9", 19))
+        good = [("4", n) for n in range(13, 20)] + [("2200", 16), ("3095", 14), ("51", 16), ("2221", 16), ("34", 15),
+                ("37", 15), ("300", 14), ("6011", 16), ("3528", 19), ("62", 19), ("50", 14), ("56", 14), ("69", 19),
+                ("2", 14), ("3", 15), ("5", 17), ("6", 18)]
+        for prefix, n in good:
+            self.assertIn("CARD", self.kinds(f"karta {luhn(prefix, n)}"), (prefix, n))
+        bad = [(p, 13) for p in "2356"] + [(p, n) for p in "01789" for n in (13, 14, 16, 19)]
         for prefix, n in bad:
             self.assertNotIn("CARD", self.kinds(f"karta {luhn(prefix, n)}"), (prefix, n))
 
@@ -5031,6 +5029,12 @@ class TestChecksumNumbers(unittest.TestCase):
                      '{"nips": [1234567819]}', '{"nip": "1234567819"}', '{"x": "1234567819"}', "NIP: 1234567819",
                      "faktura 123-456-78-19", "faktura 1234567819", "nip 123-45-67-819"):
             self.assertIn("NIP", self.kinds(sample), sample)
+
+    def test_nested_nip_object_is_a_known_limitation(self):
+        """Known limitation (#34, review): in `{"nip": {"value": 5260250274}}` the nearest key is `value`, which is
+        neutral, so the bare number is not a NIP (main masked it). Quoted or labelled NIPs are still found."""
+        self.assertNotIn("NIP", self.kinds('{"nip": {"value": 5260250274}}'))
+        self.assertIn("NIP", self.kinds('{"nip": {"value": "5260250274"}}'))
 
     def test_pesel_still_found(self):
         self.assertIn("PESEL", self.kinds("pesel 44051401359"))
