@@ -1099,6 +1099,54 @@ class TestIssueRegressions(Base):
             with self.subTest(command):
                 self.allow(command)
 
+    # -- #22: a path made by a command substitution is an unknown path for a command that reads files
+    def test_22_a_substitution_as_the_operand_of_a_reader_is_refused(self):
+        s = "../Sens*/people.csv"
+        for command in (
+            f"cat $(echo {s})",
+            f'cat "$(echo {s})"',
+            f"cat `echo {s}`",
+            f'cat -n "$(echo {s})"',
+            f"head -n 3 $(echo {s})",
+            f"grep foo $(echo {s})",
+            f'grep -e foo "$(echo {s})"',
+            f'sed -n 1p "$(echo {s})"',
+            f'cat < "$(echo {s})"',
+            f'cp "$(echo {s})" .',
+            f'echo a | xargs -I{{}} cat "$(echo {s})"',
+            f'echo "$(echo {s})" | xargs cat',
+            f'xargs cat <<< "$(echo {s})"',
+            f'find "$(echo {s})" -type f -exec cat {{}} +',
+            f"echo {s} | xargs cat",
+            f"printf '%s\\n' {s} | xargs -n1 cat",
+        ):
+            with self.subTest(command):
+                self.deny(command)
+
+    def test_22_a_substitution_that_is_not_the_operand_of_a_reader_passes(self):
+        for command in (
+            'X=$(date); echo "$X"',
+            'echo "$(git rev-parse HEAD)"',
+            'git commit -m "msg $(date)"',
+            'grep "$(date)" x.csv',  # the pattern, not a file
+            'head -n "$(echo 3)" x.csv',  # the value of an option
+            'sort -k "$(echo 1)" x.csv',
+            'find . -name "$(echo a)"',  # a name pattern, not the directory searched
+            "echo $(date) | xargs echo",
+            "cat x.csv | xargs echo",
+            "git ls-files | xargs wc -l",
+        ):
+            with self.subTest(command):
+                self.allow(command)
+
+    def test_22_without_a_sensitive_source_nothing_is_refused(self):
+        cfg = {**self.cfg, "sources": {**self.cfg["sources"], "directories": []}}
+        cfg["in_project"] = {"sensitive": [], "anonymized": []}
+        cfg["project_directories"] = {}
+        g = shell_gate.AstGate(cfg, str(self.work), "bash")
+        self.assertFalse(g.sensitive or g.project_sensitive or g.sensitive_name)
+        self.assertIsNone(g.bash('cat "$(echo x.csv)"'))
+
 
 if __name__ == "__main__":
     unittest.main()

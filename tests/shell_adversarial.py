@@ -433,6 +433,10 @@ NOREAD = {
     "fork-bomb-shape", "endless-loop", "gh-text-only",
 }
 
+# CLOSED by the tree gate (issue #22): a word with a command substitution as the operand of a command that reads files is refused while a
+# sensitive source is configured (`AstGate._substituted_operand`) — operand-subst, operand-bare-subst, operand-default,
+# operand-from-substitution, quoted-operand-from-substitution are no longer listed here. Still open: a variable assigned from a substitution
+# (`f=$(echo P); cat "$f"`), the items of a `for`, the options of gh/curl.
 KNOWN: dict[str, str] = {
     "python-script-concatenated-name": "`S=x.py; cat > $S <<'EOF' … 'Sens'+'itive' … EOF; python3 $S`: the old gate denied it only through "
     "the accident `_unvettable_script` (a `$` in the target name of a written script that is run in the line). The AST gate resolves `$S` and judges the "
@@ -464,19 +468,12 @@ KNOWN: dict[str, str] = {
     "eval-subst": "the script of `eval` is the OUTPUT of a command substitution; its text is `$(echo 'cat ../S*/p*')`, a glob the gate cannot match "
     "to a path from the text (the old gate has the same gap). README: covered (\"the output of a command substitution used as an operand is not followed yet, issue #22\")",
     "bash-c-subst": "as `eval-subst`, for `bash -c \"$(…)\"`. README: covered (issue #22)",
-    "operand-subst": "`cat \"$(echo ../S*/p*.csv)\"`: the operand is the output of a substitution; the glob is inside the text of `echo`. README: covered (issue #22)",
     "operand-via-variable": "`f=$(echo P); cat \"$f\"`: the value of `f` is a substitution output. README: covered (issue #22)",
     "printf-v": "`printf -v d %s P; cat $d`: `printf -v` assigns at run time, the value is not a static word. README: NOT spelled out (it is one of "
     "\"text assembled at run time\")",
     "assign-default-then-use": "`${d:={V}}` assigns a default at run time; the later `$d` is judged as the text `$d`. README: NOT spelled out",
     "short-sensitive-name-by-user": "`cat <root>/$USER/zeta/people.csv`: the value of `$USER` comes from the environment (it stays the text `$USER`, "
     "by decision) and the sensitive directory has a short name, so no name marker fires. README: NOT covered (environment variables as path parts)",
-    "operand-bare-subst": "`cat $(echo ../S*/p*.csv)`: the operand is the OUTPUT of a substitution; the glob is inside the text of `echo`, and "
-    "the output is not a value the line holds (by decision it passes as in the old gate, with the substitution's text judged as the old gate "
-    "judges it). README: covered (issue #22)",
-    "operand-default": "`cat ${f:-$(echo P)}`: as `operand-bare-subst`, through a default. README: covered (issue #22)",
-    "operand-from-substitution": "the same as `operand-bare-subst` (round 5 listing). README: covered (issue #22)",
-    "quoted-operand-from-substitution": "`cat \"$(echo P)\"`: as `operand-subst`. README: covered (issue #22)",
     "for-variable-substitution": "`for d in $(echo P); do cat $d`: the items are the output of a substitution. README: covered (issue #22)",
     "unset-variable-in-name": "`cat ../Sens${LANG}itive-data/people.csv`: an unset or empty variable inside a name; the value is the environment's, "
     "the text stays `${LANG}` (by decision). README: NOT spelled out (environment variables as path parts)",

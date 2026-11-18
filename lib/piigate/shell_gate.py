@@ -31,6 +31,25 @@ TEXT_ONLY = {
     "unset", "set", "shift", "wait", "sleep", "pwd", "for", "select", "case", "exit", "return", "read", "cd", "pushd", "popd",
 }
 SUBSTITUTION_ORIGINS = ("$(", "`", "<(", ">(")
+# programs that read the files they are given as operands (a path built by a command substitution is an unknown path, #22) and
+# the options whose NEXT word is a value, not a file
+READERS = {
+    "cat", "tac", "head", "tail", "less", "more", "most", "nl", "wc", "sort", "uniq", "cut", "paste", "join", "comm", "diff",
+    "cmp", "grep", "egrep", "fgrep", "zgrep", "rg", "rga", "ag", "ack", "sed", "awk", "gawk", "mawk", "jq", "yq", "gojq", "xxd",
+    "od", "hexdump", "strings", "base64", "md5sum", "sha1sum", "sha256sum", "sha512sum", "b2sum", "cksum", "bat", "batcat",
+    "column", "fold", "rev", "expand", "unexpand", "shuf", "pr", "fmt", "split", "csplit", "cp", "mv", "rsync", "scp", "install",
+    "tar", "zip", "unzip", "7z", "find", "fd", "fdfind", "source", ".",
+}
+PROGRAM_FIRST = {"grep", "egrep", "fgrep", "zgrep", "rg", "rga", "ag", "ack", "sed", "awk", "gawk", "mawk", "jq", "yq", "gojq"}
+VALUE_OPTIONS = {
+    "head": {"-n", "-c"}, "tail": {"-n", "-c", "-s"}, "cut": {"-d", "-f", "-c", "-b"}, "sort": {"-k", "-t", "-S", "-T", "-o"},
+    "join": {"-t", "-j", "-1", "-2", "-o"}, "paste": {"-d"}, "fold": {"-w"}, "nl": {"-b", "-n", "-w", "-s", "-v", "-i"},
+    "awk": {"-F", "-v"}, "gawk": {"-F", "-v"}, "mawk": {"-F", "-v"}, "split": {"-l", "-b", "-n", "-a"}, "wc": set(),
+    "grep": {"-e", "-m", "-A", "-B", "-C"}, "egrep": {"-e", "-m", "-A", "-B", "-C"}, "fgrep": {"-e", "-m", "-A", "-B", "-C"},
+    "rg": {"-e", "-m", "-A", "-B", "-C", "-g", "-t", "-T", "-j", "--glob", "--type", "--type-not", "--max-count"},
+    "sed": {"-e"}, "jq": {"--arg", "--argjson", "--slurpfile", "--rawfile"},
+}
+XARGS_VALUE_OPTIONS = {"-I", "-n", "-P", "-L", "-s", "-d", "-E", "-a", "--max-args", "--max-procs", "--delimiter", "--arg-file"}
 NESTED_UNKNOWN = SUBSTITUTION_ORIGINS + ("-c", "eval")  # a call there has arguments the old gate reports as None
 
 
@@ -503,10 +522,79 @@ class AstGate(gate.Gate):
                 c is None or c[1:2] in (["analyze"], ["anonymize"]) for c in self._invocations(command, {"piigate"})
             ):
                 return gate.MCP_PIIGATE  # `piigate ana''lyze x`: the words say it, the raw text does not
-            return super().bash(command, files)
+            if reason := super().bash(command, files):
+                return reason
+            return self._substituted_operand(self._current)
         except Exception as e:  # whatever the adapter did not foresee: deny, and say so
             self.internal_error = f"{type(e).__name__}: {e}"[:200]
             return f"piigate: command denied — the shadow gate failed ({type(e).__name__}). {gate.HINT}"
+
+    # ------------------------------------------------------------------------------------------------ operands from a command
+
+    @staticmethod
+    def _expands_command(w: shell.Word | None) -> bool:
+        return w is not None and bool({"cmd", "proc"} & w.kinds)
+
+    @staticmethod
+    def _reader_operands(name: str, args: list[shell.Word]) -> list[shell.Word]:
+        """The words after the command that may be files: no options, no value of an option, no pattern / program word."""
+        found: list[shell.Word] = []
+        values = VALUE_OPTIONS.get(name, set())
+        program_given = any(w.static and w.text in ("-e", "-f", "--regexp", "--file", "--expression") for w in args)
+        need_program = name in PROGRAM_FIRST and not program_given
+        paths_only = name in ("find",)  # `find P… -name "$(…)"`: only the words before the expression are paths
+        skip = False
+        for w in args:
+            if skip:
+                skip = False
+                continue
+            if w.static and w.text.startswith("-") and len(w.text) > 1:
+                if paths_only:
+                    break
+                skip = w.text in values
+                continue
+            if paths_only and w.static and w.text.startswith(("(", "!")):
+                break
+            if need_program:
+                need_program = False
+                continue
+            found.append(w)
+        return found
+
+    def _substituted_operand(self, p: _Parsed | None) -> str | None:
+        """A word with `$(…)` / backticks / `<(…)` that is a file operand of a command that reads files, or the list of names
+        given to `xargs <reader>` from a pipe fed by such a word, names a path nobody can see: with a sensitive source it is
+        refused, like any path the gate cannot resolve (#22). A substitution anywhere else (`X=$(date); echo "$X"`, a commit
+        message, `echo "$(git rev-parse HEAD)"`) is not an operand of a reader."""
+        if p is None or not (self.sensitive or self.project_sensitive or self.sensitive_name):
+            return None
+        for i, c in enumerate(p.calls):
+            words = shell._effective(c.argv)
+            name = os.path.basename(words[0].text) if words and words[0].static else ""
+            via_xargs = False
+            if name == "xargs":
+                args, k = words[1:], 0
+                while k < len(args) and args[k].static and args[k].text.startswith("-") and len(args[k].text) > 1:
+                    k += 1 + (args[k].text in XARGS_VALUE_OPTIONS)
+                inner = shell._effective(args[k:])
+                name = os.path.basename(inner[0].text) if inner and inner[0].static else ""
+                words, via_xargs = inner, True
+            stdin_words = [r.target for r in c.redirects if r.op in ("<", "<<<") and r.target is not None]
+            hit = None
+            if name in READERS:
+                hit = next((w for w in self._reader_operands(name, words[1:]) if self._expands_command(w)), None)
+            if hit is None and via_xargs and name in READERS:
+                feeders = [w for j in range(i) if p.calls[j].pipes_out for w in (*p.calls[j].argv, *(r.target for r in p.calls[j].redirects if r.target))]
+                hit = next((w for w in (*feeders, *stdin_words) if self._expands_command(w)), None)
+            if hit is None and (name in READERS or not name) and not via_xargs:
+                hit = next((w for w in stdin_words if self._expands_command(w) and w.text and not w.text.startswith("<<<")), None)
+            if hit is not None:
+                return (
+                    f"piigate: command denied — `{name or 'a command'}` reads files and one of them is named by a command "
+                    f"substitution ({hit.text}): the gate cannot see the path it will get, and a sensitive source is configured. "
+                    f"{gate.HINT}"
+                )
+        return None
 
     # ------------------------------------------------------------------------------------------------ front-end
 
