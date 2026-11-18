@@ -1632,11 +1632,11 @@ class TestIssueRegressions(Base):
             f'python3 {self.work}/script.py < "$f"',
             'cd . && python3 script.py < "$f"',
             'psql < "$f"',
-            'psql "$url" < "$f"',
-            'psql -h db -U u -d "$d" < "$f"',
+            'psql -d "$db" < "$f"',
+            'psql -h db -U "$u" -d "$d" < "$f"',
             'psql --host=db --dbname=x < "$f"',
             'mysql -u r db < "$dump"',
-            'mysql -u r -p "$db" < "$dump"',
+            'mysql -u "$u" -D "$db" < "$dump"',
             'mariadb db < "$dump"',
             '/usr/bin/psql < "$f"',
         ):
@@ -1686,6 +1686,13 @@ class TestIssueRegressions(Base):
             'psql -c "$q" < "$f"',
             'psql -qc "select 1" < "$f"',
             'psql $url < "$f"',  # an unquoted word may be several, options among them
+            'psql "$url" < "$f"',  # a word with an expansion that is no value of an option: it may be an option (review)
+            'psql "-c$q" < "$f"',
+            'psql "$opt" < "$f"',
+            'psql -d "$db" "-c$q" < "$f"',
+            'mysql "--init-command=$q" db < "$f"',
+            'mysql --host="$h" db < "$f"',  # not a separate token: not told apart from `--init-command=`
+            'mysql -u r -p "$db" < "$dump"',
             'mysql -e "$q" < "$f"',
             'mysql --init-command="$q" db < "$f"',
             'mysql --defaults-file=x < "$f"',
@@ -1727,19 +1734,9 @@ class TestIssueRegressions(Base):
             'echo "$x" | git commit -F -',
             'echo "$x" | git commit -a -F -',
             'echo "$x" | git commit -m "$m" -F -',
+            'echo "$x" | git commit --message "$m" -F -',
             'echo "$x" | git commit --file=-',
             'echo "$x" | git commit -F-',
-            'cat <<EOF | kubectl apply -f -\napiVersion: v1\nname: $N\nEOF',
-            'echo "$x" | kubectl apply -f -',
-            'echo "$x" | kubectl apply -n "$ns" -f - -o yaml',
-            'echo "$x" | kubectl apply --dry-run=client --filename=-',
-            'echo "$x" | gh pr comment 1 -F -',
-            'echo "$x" | gh issue create --body-file - -t t',
-            'echo "$x" | gh issue create --body-file - -t "$t"',
-            'echo "$x" | gh release create v1 --notes-file -',
-            'echo "$x" | openssl base64',
-            'echo "$x" | openssl dgst -sha256',
-            'echo "$x" | base64 -d | openssl dgst -sha256',
             'echo "$x" | base64 -d',
             'echo "$x" | base64',
             'echo "$x" | LC_ALL=C sort',
@@ -1777,6 +1774,18 @@ class TestIssueRegressions(Base):
             'echo "$x" | PATH=. git commit -F -',
             'echo "$x" | GIT_EXEC_PATH=. git commit -F -',
             'echo "$x" | GIT_PAGER=sh git tag -F - v1',
+            'echo "$x" | git commit -m x $opts -F -',
+            'echo "$x" | git commit "$o" -F -',
+            'echo "$x" | git commit "-e$x" -F -',
+            'echo "$x" | git commit -F - "$(printf -- --edit)"',
+            'echo "$x" | git tag -F - "$v"',
+            'echo "$x" | kubectl apply -f -',  # review: kubectl, gh and openssl are no data receivers any more
+            'echo "$x" | kubectl apply -f - "$(printf %s --kubeconfig=./k)"',
+            'echo "$x" | gh pr comment 1 -F -',
+            'echo "$x" | gh pr create --body-file - "$(printf -- --editor)"',
+            'echo "$x" | openssl dgst -sha256',
+            'echo "$x" | openssl base64',
+            'echo "$x" | openssl dgst "$(printf -- -engine)" ./x.so',
             'echo "$x" | gh alias set x -',
             'echo "$x" | gh extension exec x -F -',
             'echo "$x" | gh pr create -e -F -',
@@ -1910,6 +1919,16 @@ class TestIssueRegressions(Base):
         ):
             with self.subTest(command):
                 self.assertIsNone(g.bash(command))
+
+    def test_43_review_a_creating_command_with_a_word_nobody_can_read_is_a_read(self):
+        for command in (
+            'cd .. && rm "$(printf -- -v)" Sensitive-data/x',
+            'cd .. && rm "-v$x" Sensitive-data/x',
+            'cd .. && chmod "$m" Sensitive-data/x',
+        ):
+            with self.subTest(command):
+                self.deny(command)
+        self.allow("cd .. && mkdir -p Sensitive-data/n && echo a > Sensitive-data/n/n.txt")
 
 
 if __name__ == "__main__":

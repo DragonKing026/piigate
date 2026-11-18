@@ -796,18 +796,34 @@ class AstGate(gate.Gate):
             return False
 
     @staticmethod
+    def _literal_or_value(args: list[shell.Word], value_options: frozenset[str] | set[str]) -> bool:
+        """ONE rule for the exceptions that take options (the database clients, `git commit -F -`; #43, review): every word is a
+        literal. The only word that is not may be the VALUE of an option of `value_options` — an option that takes a value and
+        runs nothing — given as a separate token right after it (`-d "$db"`, `-m "$msg"`). `"-c$q"`, `"--init-command=$q"`,
+        `"$opt"`, `"$(printf -- -engine)"` and an operand with an expansion, quoted or not, are words nobody can read, and one of
+        them may be an option that runs code: they end the exception. A word is never skipped because its text is unknown."""
+        takes_value = False
+        for w in args:
+            if w.static:
+                takes_value = w.text in value_options
+            elif takes_value:
+                takes_value = False
+            else:
+                return False
+        return True
+
+    @staticmethod
     def _plain_db_client(spec, args: list[shell.Word]) -> bool:
-        """Only the options of `spec`, the values of those that take one, and operands: a word nobody can read is allowed as an operand
-        or as an option value only in quotes (it is one word then; unquoted it may be several, options among them)."""
+        """A local database client with the options of `spec` only, every word literal but the value of an option that takes one."""
         flags, short_values, long_values = spec
+        if not AstGate._literal_or_value(args, short_values | long_values):
+            return False
         k = 0
         while k < len(args):
             w = args[k]
             k += 1
             if not w.static:
-                if w.quoting not in ("double", "single"):
-                    return False
-                continue
+                return False  # (a value is skipped below, with its option: nothing else may be here)
             t = w.text
             if t == "--" or t == "-" or not t.startswith("-"):
                 continue
@@ -919,11 +935,6 @@ class AstGate(gate.Gate):
         return False
 
     @staticmethod
-    def _plain_words(args: list[shell.Word]) -> bool:
-        """Every word is literal or one quoted word (an unquoted expansion may be several words, options among them)."""
-        return all(w.static or w.quoting in ("double", "single") for w in args)
-
-    @staticmethod
     def _has_option(texts: list[str | None], shorts: str, longs: tuple[str, ...]) -> bool:
         """An option of the list, by its short letters (also inside a cluster: `-eF`) or its long name or any abbreviation of it
         (getopt_long takes `--ed` for `--edit`)."""
@@ -939,54 +950,21 @@ class AstGate(gate.Gate):
         return False
 
     def _data_receiver(self, name: str, args: list[shell.Word], p: _Parsed) -> bool:
-        """The programs that read stdin as DATA only when it is given the way they are told to (#43): the options are what makes
-        them so, a bare name is not enough. What stays, and why each is data:
-          * `git commit -F -` / `git tag -F -`: the message. No `-e` / `--edit` (an editor runs the text: `GIT_EDITOR=sh`, also in
-            a cluster `-eF`), no `--template`, `-c` / `-C`, nothing before the subcommand (`-c`, `-C`, `--exec-path`, `--git-dir`, `--work-tree`).
-            The hooks of the repository are code written earlier and run later: the known limit of the README, not judged here.
-          * `kubectl apply -f -`: a manifest; only `-n`, `-o`, `--dry-run`, `--server-side` besides (no `--kubeconfig`: its exec plugin).
-          * `gh <issue|pr|release|gist|discussion> … -F -` / `--body-file -` / `--notes-file -`: the body. No `-e` / `--editor`, `-w` / `--web`.
-          * `openssl base64` / `openssl dgst`: no `-engine`, `-provider`, `-provider-path`, `-propquery`, `-config`.
-        And for all of them: no assignment in front of the call, none of RECEIVER_ENVIRONMENT assigned or exported in the line, the
-        subcommand and the option literal, no unquoted expansion among the words. Removed in review: `python3 -m json.tool` (`-m`
-        imports `./json`), `docker` / `podman login --password-stdin` (the credential helper is chosen by `PATH` / `DOCKER_CONFIG`)."""
-        if name not in ("git", "kubectl", "gh", "openssl") or not self._plain_words(args) or self._receiver_environment_changed(p):
+        """The ONE program (besides the filters of STDIN_DATA, `base64` among them, whose result a shell later in the pipe still
+        makes code) that reads stdin as DATA only when it is told to (#43): `git commit -F -` / `git tag -F -`, the message. No `-e` /
+        `--edit` (an editor runs the text: `GIT_EDITOR=sh`, also in a cluster `-eF`), no `--template`, `-c` / `-C`, nothing before the
+        subcommand (`-c`, `-C`, `--exec-path`, `--git-dir`, `--work-tree`), no assignment in front of the call or of RECEIVER_ENVIRONMENT
+        in the line, every word literal but the value of `-m` / `--message` (`_literal_or_value`). The hooks of the repository are code
+        written earlier and run later: the known limit of the README, not judged here. Removed in review: `kubectl`, `gh`, `openssl`
+        (a word that is quoted but built, `"$(printf -- --kubeconfig=k)"`, can be an option that runs code), `python3 -m json.tool`
+        (`-m` imports `./json`), `docker` / `podman login` (the credential helper is chosen by `PATH` / `DOCKER_CONFIG`)."""
+        if name != "git" or self._receiver_environment_changed(p) or not self._literal_or_value(args, {"-m", "--message"}):
             return False
         texts = [w.text if w.static else None for w in args]
-        if name == "git":
-            return (
-                texts[:1] in (["commit"], ["tag"])
-                and self._stdin_flag(texts[1:], "-F", ("--file",))
-                and not self._has_option(texts[1:], "etcC", ("--edit", "--reedit-message", "--reuse-message", "--template", "--exec-path", "--git-dir", "--work-tree"))
-            )
-        if name == "kubectl":
-            if texts[:1] != ["apply"] or not self._stdin_flag(texts[1:], "-f", ("--filename",)):
-                return False
-            k, rest = 0, texts[1:]
-            while k < len(rest):
-                t = rest[k]
-                k += 1
-                if t is None:
-                    continue  # a quoted word: the value of the option before it, or an operand nothing reads
-                if t in ("-f", "--filename"):
-                    k += 1  # its `-`
-                elif t in ("-n", "--namespace", "-o", "--output"):
-                    k += 1
-                elif not (
-                    t in ("-f-", "--filename=-", "--server-side")
-                    or re.fullmatch(r"--(?:namespace|output|dry-run)=[\w.-]+", t)
-                    or re.fullmatch(r"-[no][\w.-]+", t)
-                ):
-                    return False
-            return True
-        if name == "gh":
-            return (
-                texts[:1] in (["issue"], ["pr"], ["release"], ["gist"], ["discussion"])
-                and self._stdin_flag(texts[1:], "-F", ("--body-file", "--notes-file"))
-                and not self._has_option(texts[1:], "ew", ("--editor", "--web"))
-            )
-        return texts[:1] in (["base64"], ["dgst"]) and not any(
-            t in ("-engine", "-provider", "-provider-path", "-propquery", "-config", "-conf") for t in texts
+        return (
+            texts[:1] in (["commit"], ["tag"])
+            and self._stdin_flag(texts[1:], "-F", ("--file",))
+            and not self._has_option(texts[1:], "etcC", ("--edit", "--reedit-message", "--reuse-message", "--template", "--exec-path", "--git-dir", "--work-tree"))
         )
 
     @staticmethod
