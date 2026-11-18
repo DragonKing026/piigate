@@ -4954,6 +4954,54 @@ class TestChecksumNumbers(unittest.TestCase):
             self.assertEqual(sensors_mask(line), (line, 0), line)
         self.assertEqual(sensors_mask("200 302 200 200 200"), ("200 302 200 200 200", 0))
 
+    def test_config_json_is_not_a_card_or_a_nip(self):
+        """Issue #34: a process configuration (block ids, canvas coordinates, ms timestamps, decimal options) in a
+        SQL INSERT has no card and no NIP, whatever the random digits sum to."""
+        import json
+        import random
+
+        rng = random.Random(7)
+        blocks = [
+            {
+                "id": f"block_{rng.randint(10**12, 10**13)}",
+                "position": {"x": round(rng.uniform(-2000, 4000), 4), "y": round(rng.uniform(-2000, 4000), 6)},
+                "options": {
+                    "timeout_ms": rng.randint(1000, 9999999999),
+                    "weight": rng.random(),
+                    "template": f'<div class="step" data-step="{i}"><p>Krok {i}</p></div>',
+                    "created": 1731000000000 + rng.randint(0, 10**9),
+                    "seq": rng.randint(10**15, 10**16 - 1),
+                },
+            }
+            for i in range(200)
+        ]
+        sql = "INSERT INTO workflow_graph (id, graph) VALUES (1, '" + json.dumps({"blocks": blocks}) + "');\n"
+        self.assertEqual(verdict.check_text(sql, CONFIG), {})
+
+    def test_fraction_digits_and_issuer_prefix(self):
+        for sample in ("x = 0.4111111111111111", "x 3.5555555555554444", "0.9400000019", "7.1234563218"):
+            self.assertFalse(self.kinds(sample) & {"CARD", "NIP", "NUMBER", "PESEL"}, sample)
+        for number in ("0000000000000000", "1111111111111117", "7992739871300", "8888 8888 8888 8888 8", "9111-1111-1111-1111"):
+            self.assertNotIn("CARD", self.kinds(f"karta {number}"), number)
+
+    def test_real_test_cards_are_found(self):
+        for number in ("4111111111111111", "5555555555554444", "378282246310005", "6011111111111117", "3530111333300000",
+                       "2221000000000009", "2221 0000 0000 0009", "5555 5555 5555 4444"):
+            self.assertIn("CARD", self.kinds(f"karta {number}"), number)
+        self.assertIn("CARD", self.kinds('{"card_number": 4111111111111111}'))
+
+    def test_bare_json_number_nip(self):
+        for sample in ('{"timeout": 1234567819}', '{"values": [5, 1234567819, 7]}', '{\\"timeout\\": 1234567819}'):
+            self.assertNotIn("NIP", self.kinds(sample), sample)
+        for sample in ('{"nip": 1234567819}', '{"tax_id": 1234567819}', '{"podatnikNip": 1234567819}',
+                     '{"nips": [1234567819]}', '{"nip": "1234567819"}', '{"x": "1234567819"}', "NIP: 1234567819",
+                     "faktura 123-456-78-19", "faktura 1234567819", "nip 123-45-67-819"):
+            self.assertIn("NIP", self.kinds(sample), sample)
+
+    def test_pesel_still_found(self):
+        self.assertIn("PESEL", self.kinds("pesel 44051401359"))
+        self.assertIn("PESEL", self.kinds('{"pesel": 44051401359}'))
+
     def test_cards_are_still_found(self):
         for number in self.CARDS:
             with self.subTest(number):

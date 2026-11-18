@@ -271,7 +271,18 @@ DRUG_RE = re.compile(
     rf"\b([{UPPER}][{LOWER}A-Z]+(?:[ -][{LOWER}A-Z]+)?)\s+\d+(?:[.,]\d+)?\s?(?:mg|g|mcg|µg|μg|ml|j\.m\.|jm|IU|%)(?![\w])"
 )
 DRUG_CONTEXT_RE = re.compile(rf"(?i:\b(?:lek|leku|preparat|preparatu|Rp\.)\s*[:.]?\s*)({NAME})")
-NIP_RE = re.compile(r"\b\d{3}-?\d{3}-?\d{2}-?\d{2}\b|\b\d{3}-?\d{2}-?\d{2}-?\d{3}\b")
+# `(?<!\d\.)`: digits right after "digit + dot" are the fractional part of a decimal number, not an identifier
+NIP_RE = re.compile(
+    r"(?<!\d\.)\b\d{3}-?\d{3}-?\d{2}-?\d{2}\b|(?<!\d\.)\b\d{3}-?\d{2}-?\d{2}-?\d{3}\b"
+)
+# a bare number that is a JSON number value (`"key": 1234567890`, also in a list of numbers) is a NIP only under a key
+# that names an identity or tax number; the key is looked up here (the quoted form `"nip": "1234567890"` is not affected)
+_JSON_KEY_VALUE_RE = re.compile(r'\\?"([^"\\]{1,80})\\?"\s*:\s*$')
+_JSON_KEY_LIST_RE = re.compile(r'\\?"([^"\\]{1,80})\\?"\s*:\s*\[\s*(?:-?[\d.eE+-]+\s*,\s*)*$')
+_CARD_KEY_RE = re.compile(r"(?<![^\W\d_])(?:cards?|kart\w*|pan|cc|credit\w*|payment\w*|platnos\w*|płatnoś\w*)(?![^\W\d_])")
+_IDENTITY_KEY_RE = re.compile(
+    r"(?<![a-z])(?:nips?|tax(?:es)?|vat|regon|krs|pesel|ssn|id_?number|podatk\w*|identyfikator\w*)(?![a-z])"
+)
 NIP_CONTEXT_RE = re.compile(r"(?i)\bNIP\s*[:.]?\s*((?:PL)?\s?[\d -]{10,13}\d)")
 REGON_RE = re.compile(r"(?i)\bREGON\s*[:.]?\s*(\d{9}(?:\d{5})?)\b")
 KRS_RE = re.compile(r"(?i)\bKRS\s*[:.]?\s*(?:nr\.?\s*)?(\d{10})\b")
@@ -280,7 +291,7 @@ IPV6_RE = re.compile(r"(?<![\w:.])(?=[0-9A-Fa-f:]*\d)(?:[0-9A-Fa-f]{0,4}:){2,7}[
 # PESEL: eleven contiguous digits, or the printed layouts 6+5 and 2-2-2-5 (a space or a hyphen) with a valid
 # checksum; other digit groups are not one number (`bak-20261023-046` holds eleven digits split by a hyphen). With a
 # "PESEL" label the usual separators are tolerated anywhere.
-PESEL_RE = re.compile(r"(?<!\d)\d{11}(?!\d)")
+PESEL_RE = re.compile(r"(?<!\d)(?<!\d\.)\d{11}(?!\d)")
 PESEL_LAYOUT_RE = re.compile(r"(?<!\d)(?<!\d-)(?:\d{6}[ -]\d{5}|\d{2}[ -]\d{2}[ -]\d{2}[ -]\d{5})(?!\d|-\d)")
 PESEL_LABELLED_RE = re.compile(r"(?i)\bpesel\b[^\d\n]{0,15}(\d(?:[ \t-]{0,3}\d){10})(?!\d)")
 # payment card: 13-19 contiguous digits, or the printed layouts 4-4-4-4, 4-6-5 / 4-6-4 (Amex, Diners), 4-8-4, 4-4-4-1..3,
@@ -288,7 +299,7 @@ PESEL_LABELLED_RE = re.compile(r"(?i)\bpesel\b[^\d\n]{0,15}(\d(?:[ \t-]{0,3}\d){
 # sit next to each other (HTTP codes `200 302 200 200 200`) are not one card. Only a neighbouring digit (or digit and
 # hyphen) ends the match on either side — a letter, a mark or an extension glued to it does not hide a card.
 _CARD_SEP = r"(?: {1,2}|-)"
-_CARD_EDGE = r"(?<!\d)(?<!\d-)"
+_CARD_EDGE = r"(?<!\d)(?<!\d-)(?<!\d\.)"  # not after "digit + dot": the fractional part of a decimal number
 _CARD_LAYOUTS = (  # longest first: a longer layout is tried before the one that is its prefix
     rf"\d{{4}}(?:{_CARD_SEP}\d{{4}}){{3}}{_CARD_SEP}\d{{3}}",
     rf"\d{{4}}(?:{_CARD_SEP}\d{{4}}){{3}}",
@@ -297,8 +308,14 @@ _CARD_LAYOUTS = (  # longest first: a longer layout is tried before the one that
     rf"\d{{4}}{_CARD_SEP}\d{{8}}{_CARD_SEP}\d{{4}}",
     rf"\d{{4}}(?:{_CARD_SEP}\d{{4}}){{2}}{_CARD_SEP}\d{{1,3}}",
 )
-CARD_RE = re.compile(r"(?<!\d)\d{13,19}(?!\d)")  # contiguous digits
+# contiguous digits; not the tail of an identifier such as `block_1731309170818`
+CARD_RE = re.compile(r"(?<!\d)(?<!\d\.)(?<![A-Za-z]_)\d{13,19}(?!\d)")
 CARD_LAYOUT_RES = tuple(re.compile(rf"{_CARD_EDGE}{layout}(?!\d|-\d)") for layout in _CARD_LAYOUTS)
+
+
+# issuers start with 2-6 (Mastercard 2221-2720 and 51-55, Amex 34/37, Diners 36/38, JCB 35, Visa 4, Discover/UnionPay/
+# Maestro 5 and 6); numbers starting with 0, 1, 7, 8 or 9 (timestamps in ms, random IDs) are not a card
+CARD_FIRST_DIGITS = "23456"
 
 
 def card_spans(text: str, accept=lambda digits, matched: True) -> list[tuple[int, int]]:
@@ -309,7 +326,7 @@ def card_spans(text: str, accept=lambda digits, matched: True) -> list[tuple[int
     for regex in (CARD_RE, *CARD_LAYOUT_RES):
         for m in regex.finditer(text):
             digits = re.sub(r"\D", "", m.group())
-            if luhn_valid(digits) and accept(digits, m.group()):
+            if digits[0] in CARD_FIRST_DIGITS and luhn_valid(digits) and accept(digits, m.group()):
                 spans.append(m.span())
     spans.sort(key=lambda span: (span[0], -span[1]))
     result: list[tuple[int, int]] = []
@@ -424,6 +441,19 @@ def _inside(spans: list[tuple[int, int]], starts: list[int], s: int, k: int) -> 
     return i >= 0 and k <= spans[i][1]
 
 
+def _json_number_key(text: str, start: int, end: int) -> str | None:
+    """The key of a bare number that is a JSON number value (`"k": 123`, `"k": [1, 123]`), else None."""
+    if text[end : end + 1].isalnum() or not re.match(r"\s*(?:[,}\]]|$)", text[end : end + 3]):
+        return None
+    before = text[max(0, start - 3000) : start]
+    m = _JSON_KEY_VALUE_RE.search(before[-200:]) or _JSON_KEY_LIST_RE.search(before)
+    return m.group(1) if m else None
+
+
+def _key_matches(regex: re.Pattern, key: str) -> bool:
+    return bool(regex.search(re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", key).lower()))
+
+
 def detect(text: str, *, dates: str = "all", drugs: bool = True) -> list[Fragment]:
     result: list[Fragment] = []
     lists = [m.span() for m in NUMBER_LIST_RE.finditer(text) if not PHONE_LABEL_RE.search(text, max(0, m.start() - 24), m.start())]
@@ -455,10 +485,19 @@ def detect(text: str, *, dates: str = "all", drugs: bool = True) -> list[Fragmen
         if not PESEL_RE.fullmatch(m.group(1)) and pesel_valid(re.sub(r"\D", "", m.group(1))):
             result.append(Fragment(m.start(1), m.end(1), "PESEL", 3))
     for start, end in card_spans(text):
+        if text[start:end].isdigit():  # a JSON number value (a counter, a random ID) is a card only under a card key
+            key = _json_number_key(text, start, end)
+            if key is not None and not _key_matches(_CARD_KEY_RE, key):
+                continue
         result.append(Fragment(start, end, "CARD", 3))
     for m in NIP_RE.finditer(text):
-        if nip_valid(re.sub(r"\D", "", m.group())):
-            result.append(Fragment(m.start(), m.end(), "NIP", 3))
+        if not nip_valid(re.sub(r"\D", "", m.group())):
+            continue
+        if m.group().isdigit():  # a JSON number value under a key that is not an identity or tax number
+            key = _json_number_key(text, m.start(), m.end())
+            if key is not None and not _key_matches(_IDENTITY_KEY_RE, key):
+                continue
+        result.append(Fragment(m.start(), m.end(), "NIP", 3))
     for regex in (NIP_CONTEXT_RE, REGON_RE, KRS_RE):
         for m in regex.finditer(text):
             result.append(Fragment(m.start(1), m.end(1), "NIP", 3))
