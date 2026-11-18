@@ -809,12 +809,95 @@ class AstGate(gate.Gate):
                         return None
         return operands, values
 
+    _AWK_FORBIDDEN_WORDS = re.compile(r"system|getline|ENVIRON|close|fflush|\bexec\b|PROCINFO|SYMTAB|FUNCTAB")
+    _AWK_KEYWORDS = {"print", "printf", "return", "in", "if", "else", "while", "do", "for", "delete", "exit", "next", "nextfile", "case"}
+
     @staticmethod
     def _awk_program_ok(program: str) -> bool:
-        """An awk program that cannot run a command or write a file: nothing of `system`, `getline`, `|` (a pipe, `|&`), `>`
-        (a redirection), `@` (`@load`, `@include`), `ENVIRON`, `close`, `fflush` anywhere in its text — in a string too, since
-        no scan of strings and regular expressions is sure. What passes is `{print $2}` and `$1 == "x"`; a comparison with `>` does not."""
-        return not re.search(r"system|getline|[|>@]|ENVIRON|close|fflush|\bexec\b|PROCINFO|SYMTAB|FUNCTAB", program)
+        """An awk program that cannot run a command or write a file: no `system`, `getline`, `ENVIRON`, `close`, `fflush`, `exec`,
+        `PROCINFO`… anywhere in its text (a string too — no scan of strings is sure for these), and, read as TOKENS (strings,
+        regular expressions and comments cut out), no `@` (`@load`, `@include`), no single `|` (a pipe, `|&`; `||` is "or") and no
+        `>` / `>>` in a `print` / `printf` statement outside parentheses (a redirection to a file). A `>` that compares
+        (`NR>1`, `$1 > 5 {…}`, `print ($1 > 2)`), a `|` in a regular expression or a string (`/a|b/`, `"|"`) are data. What the
+        lexer does not finish (an unterminated string or regex) is refused. `print > "f"`, `print | "cmd"`, `"cmd" | getline` stay
+        refused. What passes is `{print $2}`, `NR>1` and `$1 == "x"`."""
+        if AstGate._AWK_FORBIDDEN_WORDS.search(program):
+            return False
+        n, i = len(program), 0
+        operand = False  # the previous token ends an operand: a `/` is then a division, otherwise it opens a regular expression
+        depth = 0
+        print_depth = -1  # paren depth of the `print` statement being read (-1: none)
+        while i < n:
+            ch = program[i]
+            if ch in " \t\r":
+                i += 1
+            elif ch == "\\" and program[i + 1 : i + 2] == "\n":
+                i += 2
+            elif ch == "#":
+                while i < n and program[i] != "\n":
+                    i += 1
+            elif ch == '"':
+                i += 1
+                while i < n and program[i] != '"':
+                    i += 2 if program[i] == "\\" else 1
+                if i >= n:
+                    return False
+                i += 1
+                operand = True
+            elif ch == "/" and not operand:
+                i += 1
+                in_class = False
+                while i < n and (in_class or program[i] != "/"):
+                    if program[i] == "\n":
+                        return False
+                    if program[i] == "\\":
+                        i += 1
+                    elif program[i] == "[":
+                        in_class = True
+                    elif program[i] == "]":
+                        in_class = False
+                    i += 1
+                if i >= n:
+                    return False
+                i += 1
+                operand = True
+            elif ch == "@":
+                return False
+            elif ch == "|":
+                if program[i + 1 : i + 2] != "|":
+                    return False
+                i += 2
+                operand = False
+            elif ch == ">":
+                if print_depth == depth:
+                    return False
+                i += 1
+                operand = False
+            elif ch in "+-" and program[i + 1 : i + 2] == ch:
+                i += 2  # `i++ / 2`: the operand stays one
+            elif ch.isalpha() or ch == "_":
+                j = i
+                while j < n and (program[j].isalnum() or program[j] == "_"):
+                    j += 1
+                word = program[i:j]
+                if word in ("print", "printf"):
+                    print_depth = depth
+                operand = word not in AstGate._AWK_KEYWORDS
+                i = j
+            elif ch.isdigit() or ch == ".":
+                while i < n and (program[i].isalnum() or program[i] == "."):
+                    i += 1
+                operand = True
+            else:
+                if ch in "([":
+                    depth += 1
+                elif ch in ")]":
+                    depth -= 1
+                elif ch in ";\n}" or ch == "{":
+                    print_depth = -1
+                operand = ch in ")]"
+                i += 1
+        return True
 
     @staticmethod
     def _sed_script_ok(text: str) -> bool:

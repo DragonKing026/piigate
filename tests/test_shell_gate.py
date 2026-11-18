@@ -1349,7 +1349,7 @@ class TestIssueRegressions(Base):
             "sed 's/a/b/w out'", "sed 'w out'", "sed 'r x'", "sed 'R x'", "sed 'W x'", "sed '{p}'", "sed 'p;e'", "sed '2~2p'", "sed '#n'",
             "sed ':a;N;$!ba'", "sed 'a text'", "sed 's/a/b/ge'", "sed -e p -e e", "sed -e 'p;e'", "sed --expression=e", "sed -ee",
             "gawk --fil=x", "gawk --loa=x", "gawk -f x", "gawk -i x '{print}'", "gawk --source '{system(\"sh\")}'", "awk -e '{print}'",
-            "awk '{print > \"x\"}'", "awk '$1 > 5'", "awk '{\"date\" | getline}'", "awk 'BEGIN{getline}'", "awk '{system(\"sh\")}'",
+            "awk '{print > \"x\"}'", "awk '{\"date\" | getline}'", "awk 'BEGIN{getline}'", "awk '{system(\"sh\")}'",
             "awk '@load \"x\"'", "awk '{print ENVIRON[\"X\"]}'", "awk -F: -f x", "awk -v x=1", "awk", "awk $prog", "jq -f x", "jq --from-file x", "jq -L . .a",
             "jq --slurpfile a x .a", "jq --rawfile a x .a", "jq --fro=x", "jq --arg a", "jq .a $f", "less --lesskey-file=x", "sort $f", "sed p $f",
         ):
@@ -1373,6 +1373,7 @@ class TestIssueRegressions(Base):
             'echo "$(date)" | jq --indent 2 -c .',
             'echo "$(date)" | grep -c x',
             'echo "$(date)" | awk "{print \\$2}"',
+            'echo "$(date)" | awk "\\$1 > 5"',  # a comparison, not a redirection (#43: awk is read by tokens)
             'echo "$(date)" | awk -F, -v n="$N" "{print \\$1, n}"',
             'echo "$(date)" | tee >(cat > /dev/null)',
             'echo "$(date)" | less -S',
@@ -1576,6 +1577,39 @@ class TestIssueRegressions(Base):
             with self.subTest(command):
                 self.allow(command)
         self.deny("echo 'cat ../Sensitive-data/people.csv' | tee s.sh; bash s.sh")
+
+    def test_43_awk_is_judged_by_the_tokens_of_its_program_not_by_the_raw_text(self):
+        """False denials: `>` as a comparison and `|` in a regex, a string or `||` are data; a redirection in `print` and a pipe are code."""
+        for command in (
+            "echo \"$x\" | awk 'NR>1'",
+            "echo \"$x\" | awk -F'|' '{print $2}'",
+            "echo \"$x\" | awk '/a|b/'",
+            "echo \"$x\" | awk '$1 > 5 {print $2}'",
+            "echo \"$x\" | awk '$1==\"a\" || $2==\"b\"'",
+            "echo \"$x\" | awk '{ if ($1 > 5) print $1 }'",
+            "echo \"$x\" | awk '{print ($1 > 2)}'",
+            "echo \"$x\" | awk '{print $1 \"|\" $2}'",
+            "echo \"$x\" | awk '{print $1/2}'",
+            "echo \"$x\" | awk '/[/]x/ {print}'",
+        ):
+            with self.subTest(command):
+                self.allow(command)
+        for command in (
+            "echo \"$x\" | awk '{print > \"f\"}'",
+            "echo \"$x\" | awk '{print $1 > $2}'",
+            "echo \"$x\" | awk '{print >> \"f\"}'",
+            "echo \"$x\" | awk '{printf(\"%s\\n\", $1) > \"/dev/stderr\"}'",
+            "echo \"$x\" | awk '{ if ($1 > 5) print $1; else print $2 > \"f\" }'",
+            "echo \"$x\" | awk '{print | \"cmd\"}'",
+            "echo \"$x\" | awk '{print $1 | \"sh\"}'",
+            "echo \"$x\" | awk '{\"cmd\" | getline}'",
+            "echo \"$x\" | awk '{print |& \"cmd\"}'",
+            "echo \"$x\" | awk '@load \"x\"'",
+            "echo \"$x\" | awk '{print \"x}'",  # an unterminated string
+            "echo \"$x\" | awk '/abc'",  # an unterminated regex
+        ):
+            with self.subTest(command):
+                self.deny(command)
 
 
 if __name__ == "__main__":
