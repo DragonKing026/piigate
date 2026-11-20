@@ -383,8 +383,13 @@ at most 60 days, a few KB, in a directory created with mode 0700; a busy lock or
 
 - per day, a count for each of: `same-allow`, `same-deny`, `old-deny-new-allow`, `old-allow-new-deny`, `parse-error`,
   `shadow-error`, `shadow-timeout`;
-- for `old-deny-new-allow`, the cause as a fixed code (`subshell-cd`, `pipeline-cd`, `absolute-cd`, `known-value-resolution`, `other`);
-- for the two disagreement counts, the old (or new) reason as one of a dozen fixed labels (`sensitive-dir`, `human-only`, …);
+- for `old-deny-new-allow`, the cause as a fixed code — the feature of the syntax-tree front-end that, switched off, brings the
+  denial back (`subshell-cd`, `pipeline-cd`, `absolute-cd`, `known-value-resolution`, `eval-argument`, `creates-only`,
+  `human-only-precise`, `tree-tokens`; `other` only when no listed feature explains it);
+- for the two disagreement counts, the old (or new) reason as one of fixed labels, one per rule of the gates (`sensitive-dir`,
+  `data-file`, `human-only`, `built-script`, `stdin-interpreter`, `xargs-program`, `env-assign`, `text-to-shell`, …; the list is
+  `REASON_LABELS` in `lib/piigate/shadow.py`, and a test fails when a denial of either gate falls into `other`, which stays
+  only as a safety net and for counts filed by older versions);
 - for `parse-error`, the kind of the error as a fixed label (`syntax-error:bash`, `syntax-error:zsh`, `too-long`, `shfmt-timeout`, `unsupported-word-part:<shfmt node type>`, …; a node type only from a closed list, else `other`; never the shfmt message);
 - a histogram of the time in milliseconds, in fixed buckets.
 

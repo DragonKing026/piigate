@@ -697,7 +697,7 @@ class TestMonotonicity(Base):
     def test_the_classes_are_few_and_explained(self):
         import shell_monotone
 
-        self.assertLessEqual(len(shell_monotone.CLASSES), 6)
+        self.assertLessEqual(len(shell_monotone.CLASSES), 10)
         self.assertTrue(all(len(v) > 40 for v in shell_monotone.CLASSES.values()))
 
 

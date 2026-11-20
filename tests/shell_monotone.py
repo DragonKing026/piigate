@@ -19,6 +19,14 @@ CLASSES = {
     "`f` in every directory reached so far; the tree gate knows that an absolute `cd` puts the rest of the line in that directory",
     "known-value-resolution": "`cat > \"$S/x\"`, `tee $f`, `cd $d`: a variable of KNOWN value is that value (the old gate treated every "
     "`$` in a write target or a path as unknown)",
+    "eval-argument": "`playwright-cli eval \"[...document.links].map(e=>e.href)\"`: `eval` as an argument of a plain program is text, not the "
+    "builtin, and what follows it is no glob qualifier (#34; the old gate reads every `eval` word as the builtin)",
+    "creates-only": "`cd .. && mkdir Sensitive-data/new`, `mkdir -p S/n && echo a > S/n/n.txt`: a compound line whose every stage only "
+    "creates in a sensitive directory brings no content back (#32; the old gate judges the whole line as one command)",
+    "human-only-precise": "`echo $(date) reverse`, `X=$(…); echo \"$X …/approve\"`: `reverse` / `approve` beside a substitution is data; the "
+    "tree knows where `piigate` RUNS (#26; the old gate takes the word next to any `$(…)` as a call)",
+    "tree-tokens": "`echo '&&' ../S/p.csv`, `echo $((1+2)) …`: the tree knows a quoted operator and an arithmetic expansion are words "
+    "(the old tokenizer splits the line at them and takes the next word for a command)",
 }
 
 
