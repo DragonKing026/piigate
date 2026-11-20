@@ -90,7 +90,6 @@ FEATURE_CASES = {
     "pipeline-cd": "echo | cd ..; cat S*/p*; (cd .)",  # zsh runs the last stage of a pipe in the current shell: the `cd` stays there
     "absolute-cd": "cd ../Sens* && cd /tmp && cat people.csv",
     "known-value-resolution": 'S=/tmp/pgx; cat > "$S/x" <<\'SH\'\necho ok\nSH\nbash "$S/x"',
-    "cd-glob-overflow": "cd ../* && cat people.csv",  # needs more directories than the tree gate follows (TestCauses.setUp)
     "eval-argument": 'playwright-cli eval "[...document.links].map(e=>e.href)"',
     "creates-only": "cd ../ && mkdir Sensitive-data/nowy",
     "human-only-precise": "echo $(date) reverse",
@@ -272,12 +271,40 @@ class TestLabels(World):
         self.assertEqual(others, [])
 
 
-class TestCauses(World):
-    def setUp(self):
-        super().setUp()
-        for n in range(60):  # `cd ../*` names more directories than the tree gate follows (50): it takes the `cd` as to an unknown place
-            (self.root / f"f{n:02d}").mkdir()
+class TestCdOverflow(World):
+    """A `cd PATTERN` naming more directories than the gates follow: a sensitive one may hide among them, so both gates deny
+    the line (fail closed); at the limit both still follow every match (#43)."""
 
+    def _dirs(self, n: int):
+        for i in range(n):
+            (self.root / f"f{i:03d}").mkdir()
+
+    def test_the_limits_are_the_same(self):
+        self.assertEqual(shell.CD_LIMIT, gate.CD_MATCHES)
+
+    def test_over_the_limit_both_gates_deny(self):
+        self._dirs(gate.CD_MATCHES)  # + work and Sensitive-data: over the limit
+        command = "cd ../* && cat people.csv"
+        self.assertIsNotNone(self.old().bash(command))
+        for dialect in shell.DIALECTS:
+            with self.subTest(dialect=dialect):
+                reason = self.new(dialect).bash(command)
+                self.assertIsNotNone(reason, "the tree gate must not take the unfollowed directories as harmless")
+                self.assertEqual(shadow._label(reason), "cd-too-many")
+
+    def test_at_the_limit_both_gates_follow_every_match(self):
+        self._dirs(gate.CD_MATCHES - 2)  # + work and Sensitive-data: exactly the limit
+        self.assertIsNone(self.old().bash("cd ../f* && ls"))
+        self.assertIsNotNone(self.old().bash("cd ../* && cat people.csv"))  # the sensitive one is among them: denied by its rule
+        for dialect in shell.DIALECTS:
+            with self.subTest(dialect=dialect):
+                self.assertIsNone(self.new(dialect).bash("cd ../f* && ls"))
+                reason = self.new(dialect).bash("cd ../* && cat people.csv")
+                self.assertIsNotNone(reason)
+                self.assertNotEqual(shadow._label(reason), "cd-too-many")
+
+
+class TestCauses(World):
     def test_each_feature_names_the_difference_it_causes(self):
         for feature, command in FEATURE_CASES.items():
             for dialect in FEATURE_DIALECTS.get(feature, shell.DIALECTS):

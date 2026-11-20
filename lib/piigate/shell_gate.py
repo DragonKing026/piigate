@@ -610,7 +610,7 @@ class AstGate(gate.Gate):
                 return gate.MCP_PIIGATE  # `piigate ana''lyze x`: the words say it, the raw text does not
             if reason := super().bash(command, files):
                 return reason
-            if "cd-glob-overflow" in shell.ABLATE and self._current.cd_overflow:  # only to name a cause: the old gate refuses it
+            if self._current.cd_overflow:  # fail closed, as the old gate: a sensitive directory may hide among the unfollowed ones
                 return Reason(
                     f"piigate: command denied — a `cd` with a pattern names more than {gate.CD_MATCHES} directories; the gate cannot "
                     f"check them all. {gate.HINT}",

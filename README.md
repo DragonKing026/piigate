@@ -385,7 +385,7 @@ at most 60 days, a few KB, in a directory created with mode 0700; a busy lock or
   `shadow-error`, `shadow-timeout`;
 - for `old-deny-new-allow`, the cause as a fixed code — the feature of the syntax-tree front-end that, switched off, brings the
   denial back (`subshell-cd`, `pipeline-cd`, `absolute-cd`, `known-value-resolution`, `eval-argument`, `creates-only`,
-  `human-only-precise`, `tree-tokens`, `cd-glob-overflow`; `other` only when no listed feature explains it);
+  `human-only-precise`, `tree-tokens`; `other` only when no listed feature explains it);
 - for the two disagreement counts, the old (or new) reason as one of fixed labels, one per rule of the gates (`sensitive-dir`,
   `data-file`, `human-only`, `built-script`, `stdin-interpreter`, `xargs-program`, `env-assign`, `text-to-shell`, …; the list is
   `REASON_LABELS` in `lib/piigate/shadow.py`, and a test fails when a denial of either gate falls into `other`, which stays

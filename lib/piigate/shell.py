@@ -30,7 +30,8 @@ DIALECTS = ("bash", "zsh")  # the grammar shfmt is asked for (`-ln`); the agent'
 DEFAULT_DIALECT = "bash"
 SHFMT_TIMEOUT = 5.0  # seconds; a pathological input must not hang the hook (the shadow mode sets it lower, see shadow.py)
 ABLATE: set[str] = set()  # features switched OFF to find the CAUSE of a difference (shadow.classify_cause); empty in use
-CD_OVERFLOW = False  # a `cd PATTERN` named too many directories to follow (see `_Walker.expand_dirs`): set, never read here (a diagnostic)
+CD_LIMIT = 64  # directories a `cd PATTERN` is followed into — the same as `gate.CD_MATCHES` (a test keeps them equal)
+CD_OVERFLOW = False  # a `cd PATTERN` named more than CD_LIMIT directories (see `_Walker.expand_dirs`): the gate denies the line
 MAX_DEPTH = 4  # nesting of `bash -c '…'` / `eval` scripts that is parsed
 MAX_BYTES = 256 * 1024  # larger commands are refused (fail closed) instead of being parsed
 MAX_CALL_DEPTH = 4  # functions calling functions
@@ -1574,7 +1575,7 @@ class _Walker:
                 for m in glob.iglob(full):
                     if os.path.isdir(m):
                         found.add(os.path.normpath(m))
-                    if len(found) > 50:
+                    if len(found) > CD_LIMIT:
                         CD_OVERFLOW = True
                         return None
         return sorted(found)

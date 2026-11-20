@@ -19,8 +19,6 @@ CLASSES = {
     "`f` in every directory reached so far; the tree gate knows that an absolute `cd` puts the rest of the line in that directory",
     "known-value-resolution": "`cat > \"$S/x\"`, `tee $f`, `cd $d`: a variable of KNOWN value is that value (the old gate treated every "
     "`$` in a write target or a path as unknown)",
-    "cd-glob-overflow": "`cd ../* && cat f` with more directories than the gate follows: the old gate refuses the line (fail closed); the tree "
-    "gate takes the `cd` as to an unknown place and judges `f` where the line may be (a GAP of the shadow gate, named so it is counted)",
     "eval-argument": "`playwright-cli eval \"[...document.links].map(e=>e.href)\"`: `eval` as an argument of a plain program is text, not the "
     "builtin, and what follows it is no glob qualifier (#34; the old gate reads every `eval` word as the builtin)",
     "creates-only": "`cd .. && mkdir Sensitive-data/new`, `mkdir -p S/n && echo a > S/n/n.txt`: a compound line whose every stage only "
