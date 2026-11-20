@@ -90,6 +90,7 @@ FEATURE_CASES = {
     "pipeline-cd": "echo | cd ..; cat S*/p*; (cd .)",  # zsh runs the last stage of a pipe in the current shell: the `cd` stays there
     "absolute-cd": "cd ../Sens* && cd /tmp && cat people.csv",
     "known-value-resolution": 'S=/tmp/pgx; cat > "$S/x" <<\'SH\'\necho ok\nSH\nbash "$S/x"',
+    "cd-glob-overflow": "cd ../* && cat people.csv",  # needs more directories than the tree gate follows (TestCauses.setUp)
     "eval-argument": 'playwright-cli eval "[...document.links].map(e=>e.href)"',
     "creates-only": "cd ../ && mkdir Sensitive-data/nowy",
     "human-only-precise": "echo $(date) reverse",
@@ -272,6 +273,11 @@ class TestLabels(World):
 
 
 class TestCauses(World):
+    def setUp(self):
+        super().setUp()
+        for n in range(60):  # `cd ../*` names more directories than the tree gate follows (50): it takes the `cd` as to an unknown place
+            (self.root / f"f{n:02d}").mkdir()
+
     def test_each_feature_names_the_difference_it_causes(self):
         for feature, command in FEATURE_CASES.items():
             for dialect in FEATURE_DIALECTS.get(feature, shell.DIALECTS):

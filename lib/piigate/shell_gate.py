@@ -147,6 +147,7 @@ class _Parsed:
     dynamic_body: str = ""  # why an unquoted heredoc given to an interpreter holds a value nobody can read
     rest: frozenset = frozenset()  # the words of the command itself (without the text bodies of its heredocs)
     functions: frozenset = frozenset()  # the names of the functions the line declares
+    cd_overflow: bool = False  # a `cd PATTERN` of the line named too many directories to follow (the old gate refuses such a line)
 
 
 class _TooMany(str):
@@ -349,6 +350,7 @@ class AstGate(gate.Gate):
         return None
 
     def _build(self, command: str) -> _Parsed:
+        shell.CD_OVERFLOW = False
         calls = shell.parse(command, cwd=self.cwd, dialect=self.dialect)
         self._index = {id(c): i for i, c in enumerate(calls)}
         self._model = getattr(calls, "model", None) or shell.build_model(calls, getattr(calls, "assigned_in_expansions", ()), self.cwd)
@@ -507,7 +509,10 @@ class AstGate(gate.Gate):
         if any("\x00" in str(t) for t in tokens):
             raise shell.ParseError("a NUL byte in a word", "nul-byte")
         composed = all_text + "".join("\n" + b.text for b in bodies if not b.stripped)
-        return _Parsed(command, calls, tokens, stage_calls, bodies, view, composed, dynamic_body, rest, getattr(calls, "functions", frozenset()))
+        return _Parsed(
+            command, calls, tokens, stage_calls, bodies, view, composed, dynamic_body, rest, getattr(calls, "functions", frozenset()),
+            shell.CD_OVERFLOW,
+        )
 
     def _store(self, command: str) -> _Parsed:
         p = self._build(command)
@@ -605,6 +610,12 @@ class AstGate(gate.Gate):
                 return gate.MCP_PIIGATE  # `piigate ana''lyze x`: the words say it, the raw text does not
             if reason := super().bash(command, files):
                 return reason
+            if "cd-glob-overflow" in shell.ABLATE and self._current.cd_overflow:  # only to name a cause: the old gate refuses it
+                return Reason(
+                    f"piigate: command denied — a `cd` with a pattern names more than {gate.CD_MATCHES} directories; the gate cannot "
+                    f"check them all. {gate.HINT}",
+                    "cd-too-many",
+                )
             if reason := self._substituted_operand(self._current):
                 return reason
             if self.sensitive or self.project_sensitive or self.sensitive_name:

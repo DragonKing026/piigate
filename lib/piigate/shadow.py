@@ -36,7 +36,7 @@ CATEGORIES = (
 # the cause of an old-deny-new-allow: the feature of the syntax-tree gate that, switched off, makes it deny again
 FEATURES = (
     "subshell-cd", "pipeline-cd", "known-value-resolution", "absolute-cd",
-    "eval-argument", "creates-only", "human-only-precise", "tree-tokens",
+    "cd-glob-overflow", "eval-argument", "creates-only", "human-only-precise", "tree-tokens",
 )
 CAUSES = (*FEATURES, "other")
 # the rule behind a denial: each message of the two gates carries one (`gate.Reason`); `other` is only the safety net for a
