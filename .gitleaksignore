@@ -1,0 +1,2 @@
+# Synthetic test data, not secrets (gitleaks fingerprints: commit:file:rule:line).
+ea3fe50c2508092d304f4ece4c04ef9966252229:tests/test_shadow_labels.py:generic-api-key:244

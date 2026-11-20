@@ -241,10 +241,10 @@ class TestLabels(World):
         self.assertEqual(self.label(self.new().bash('cat "$(cat ../../x/y.txt)"')), "substituted-operand")
 
     def test_the_text_of_a_message_never_reaches_the_label(self):
-        secret = "Zmyslowska44051401458"
-        reason = self.old().bash(f"cat ../Sensitive-data/{secret}.csv")
-        self.assertIn(secret, reason)  # the message may name it ...
-        self.assertNotIn(secret, self.label(reason))  # ... the label never does
+        name = "Zmyslowska44051401458"
+        reason = self.old().bash(f"cat ../Sensitive-data/{name}.csv")
+        self.assertIn(name, reason)  # the message may name it ...
+        self.assertNotIn(name, self.label(reason))  # ... the label never does
         self.assertIn(self.label(reason), shadow.REASON_LABELS)
 
     def test_the_reason_travels_as_a_string_and_a_plain_copy_falls_back_to_the_words(self):
