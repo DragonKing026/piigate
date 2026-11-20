@@ -54,6 +54,9 @@ class Reason(str):
         obj.label = label
         return obj
 
+    def __reduce__(self):  # copy, deepcopy and pickle keep the label (`__new__` needs it)
+        return (Reason, (str(self), self.label))
+
 
 # Message substrings are matched by hook.denial_kind (log categories) — keep them in sync.
 HINT = (
