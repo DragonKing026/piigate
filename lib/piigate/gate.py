@@ -26,6 +26,35 @@ from pathlib import Path
 
 from . import config, project, verdict
 
+
+
+# `what` of a denial of kind "sensitive" when it names a rule and not a path (the words of `Gate._touches` and `AstGate`) → its label
+_SENSITIVE_RULES = (
+    ("a script written from text built at run time", "built-script"),
+    ("a file that runs later", "seeding-file"),
+    ("a variable with too many possible values", "too-many-values"),
+    ("braces the gate cannot expand", "unexpanded-braces"),
+)
+
+
+def _sensitive_label(what: str) -> str:
+    """The label of a denial for a sensitive source: the rule when `what` is a description of one, else `sensitive-dir`."""
+    return next((label for needle, label in _SENSITIVE_RULES if needle in what), "sensitive-dir")
+
+
+class Reason(str):
+    """A denial message that carries the FIXED label of the rule that produced it (`shadow.REASON_LABELS`). The shadow mode counts
+    labels, never the text of a message; the label travels with the string (a plain `str` operation drops it — the shadow then
+    falls back to the words of the message, `shadow._label`). The decision never looks at it."""
+
+    label: str
+
+    def __new__(cls, text: str, label: str):
+        obj = super().__new__(cls, text)
+        obj.label = label
+        return obj
+
+
 # Message substrings are matched by hook.denial_kind (log categories) — keep them in sync.
 HINT = (
     "Instead use the piigate MCP tools (their output goes through the filter): piigate_show (a file: CSV/XLSX/ODS → "
@@ -35,10 +64,11 @@ HINT = (
     "you can read directly); in Bash `<command> 2>&1 | piigate table` (SQL results) and `<command> 2>&1 | piigate text`. "
     "The piigate skill describes the rules; working around the gate is forbidden."
 )
-MCP_PIIGATE = (
+MCP_PIIGATE = Reason(
     "piigate: `piigate analyze` / `piigate anonymize` are disabled in Bash — use the MCP tools piigate_analyze / "
     "piigate_anonymize (the piigate plugin's MCP server; parameters: path or mail_query, number, question, mask_columns). "
-    "Their output is filtered."
+    "Their output is filtered.",
+    "mcp-piigate",
 )
 UNFILTERED_HINT = (
     "Its output does not go through the filter. For sensitive data use piigate_analyze (piigate), which filters the "
@@ -1325,6 +1355,15 @@ class Gate:
                 return "extension"
         return None
 
+    def _extension_label(self, s: str) -> str:
+        """The label of a denial for a data file (see `describe_verdict`): a note says why there is no verdict."""
+        note = self.notes.get(_path(s, self.cwd)) or self.notes.get(s) or ""
+        if "this command writes" in note:
+            return "written-data-file"
+        if note:
+            return "too-many-files"
+        return "data-file"
+
     def describe_verdict(self, s: str) -> str:
         """Why a file with an extension is denied — categories and counts or the reason, without values."""
         p = _path(s, self.cwd)
@@ -1753,15 +1792,16 @@ class Gate:
         name = entry["name"]
         kind, what = self._touches(command, tokens if tokens is not None else command.split())
         if kind in ("protected", "sensitive", "command"):
-            return f"piigate: {name} on sensitive data ({what}) denied. {UNFILTERED_HINT}"
+            return Reason(f"piigate: {name} on sensitive data ({what}) denied. {UNFILTERED_HINT}", "unfiltered-tool")
         for option, values in (entry.get("deny_options") or {}).items():
             for v in values:
                 if re.search(rf"(?<![\w-]){re.escape(option)}(?:=|\s+)['\"]?{re.escape(v)}(?![\w-])", command):
-                    return f"piigate: {name} with `{option} {v}` denied. {UNFILTERED_HINT}"
+                    return Reason(f"piigate: {name} with `{option} {v}` denied. {UNFILTERED_HINT}", "unfiltered-option")
         if tokens is None or None in calls or OPAQUE_FORMS.search(command):
-            return (
+            return Reason(
                 f"piigate: {name} with a variable, substitution, eval, `sh -c`, xargs or find -exec denied — the gate "
-                f"cannot check which directory it gets. {UNFILTERED_HINT}"
+                f"cannot check which directory it gets. {UNFILTERED_HINT}",
+                "unfiltered-opaque",
             )
         option = entry.get("dir_option")
         directories = []
@@ -1778,7 +1818,10 @@ class Gate:
                 directories.append(stage[1] if len(stage) > 1 else "~")
         for d in directories:
             if self.path_kind(d, ancestor=True) in ("protected", "sensitive"):
-                return f"piigate: {name} on {d} denied — sensitive data (or a directory containing it). {UNFILTERED_HINT}"
+                return Reason(
+                    f"piigate: {name} on {d} denied — sensitive data (or a directory containing it). {UNFILTERED_HINT}",
+                    "unfiltered-tool",
+                )
         return None
 
     # --- Bash -----------------------------------------------------------------------------------
@@ -2824,9 +2867,10 @@ class Gate:
                 word in stage[k + 1 :] for stage in self._stages_loose(tokens) if (k := self._runs_piigate(stage)) is not None
             )
             if suspicious or call or piigate_stage:
-                return (
+                return Reason(
                     f"piigate: {description} is for a human only, in their own terminal — never through the agent. "
-                    "Show the human the command to run."
+                    "Show the human the command to run.",
+                    "human-only",
                 )
         return None
 
@@ -2933,10 +2977,11 @@ class Gate:
         if len(operands) != 1 or self._marker_only_dir(operands[0]) is None:
             return None
         d = shlex.quote(operands[0].rstrip("/") or operands[0])
-        return (
+        return Reason(
             f"piigate: `rmdir {d}` would fail with \"Directory not empty\" — the directory holds only the piigate marker "
             "`.gitignore`, which the gate recreates on every command. Remove the marker and the directory in one command "
-            f"(rmdir refuses if anything else is in it): `rm {d}/.gitignore && rmdir {d}`."
+            f"(rmdir refuses if anything else is in it): `rm {d}/.gitignore && rmdir {d}`.",
+            "marker-dir",
         )
 
     def _marker_recipe(self, command: str, files: bool) -> bool:
@@ -2953,7 +2998,7 @@ class Gate:
         """None = allow, otherwise the denial reason. files=False (the PostToolUse safety net): data files are not judged
         again — a file the command created is checked through its output instead."""
         if "\x00" in command:
-            return "piigate: command denied — a NUL byte in the command"
+            return Reason("piigate: command denied — a NUL byte in the command", "nul-byte")
         self._raw = command
         command = self._strip_file_heredocs(command)
         tokens = self._tokens(command)
@@ -2966,7 +3011,7 @@ class Gate:
         else:
             found = self._zsh_code(self._heredoc_text(command)[0]) or self._zsh_code(self._without_text_bodies(command), flags=False)
         if found:
-            return f"piigate: command denied — {found}; the gate cannot see what it would read. {HINT}"
+            return Reason(f"piigate: command denied — {found}; the gate cannot see what it would read. {HINT}", "zsh-syntax")
         if reason := self._marker_only_rmdir(tokens):
             return reason
         if self._marker_recipe(command, files):
@@ -2985,28 +3030,29 @@ class Gate:
             kind, _ = self._touches(command, command.split())
             kind = kind or ("sensitive" if self._names_seen else None)
             if kind and (kind != "extension" or files):
-                return (
-                    f"piigate: cannot parse the command (quotes) with a sensitive source. {HINT}"
-                )
+                return Reason(f"piigate: cannot parse the command (quotes) with a sensitive source. {HINT}", "quotes-unparsed")
             return None
         kind, what = self._touches(command, tokens)
         if self._cd_overflow:
-            return (
+            return Reason(
                 f"piigate: command denied — a `cd` with a pattern names more than {CD_MATCHES} directories; the gate cannot "
-                f"check them all. {HINT}"
+                f"check them all. {HINT}",
+                "cd-too-many",
             )
         if kind is None and self._names_seen and not self._names_flow_ok(command, tokens):
-            return (
+            return Reason(
                 "piigate: command denied — the names of files in a sensitive data directory are passed on (xargs, a "
                 "substitution, a loop, a file or another program) and would turn the listing into a read; a listing may "
-                f"be filtered only by grep/head/tail/sort/uniq/cut/wc. {HINT}"
+                f"be filtered only by grep/head/tail/sort/uniq/cut/wc. {HINT}",
+                "names-passed-on",
             )
         if kind is None or (kind == "extension" and not files):
             return None
         if kind == "protected":
-            return (
+            return Reason(
                 f"piigate: the command touches {what} — the pseudonym map, key and filter configuration are off-limits "
-                "to the model (only a human changes them and reverses pseudonyms)."
+                "to the model (only a human changes them and reverses pseudonyms).",
+                "filter-files",
             )
         if kind != "command" and self._no_content(tokens):
             return None
@@ -3035,4 +3081,5 @@ class Gate:
             "command": "output of a database query on a server (production data)",
             "extension": f"{self.describe_verdict(what)} ({what})",
         }[kind]
-        return f"piigate: command denied — {description}; {reason}. {HINT}"
+        label = {"sensitive": _sensitive_label(what), "command": "ssh-query", "extension": self._extension_label(what)}[kind]
+        return Reason(f"piigate: command denied — {description}; {reason}. {HINT}", label)

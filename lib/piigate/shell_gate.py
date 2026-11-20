@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import gate, shell
-from .gate import DIRECT_LAUNCHERS, LAUNCHERS, SHELLS, QuotedToken
+from .gate import DIRECT_LAUNCHERS, LAUNCHERS, SHELLS, QuotedToken, Reason
 
 OPERATOR_WORD = re.compile(r"[;&|()<>\n]+|\d*[<>]+[&|]?\d*-?")  # a WORD that the flat list would show as an operator
 # commands whose arguments are only text or names for the shell itself — a relative path there reads nothing
@@ -185,6 +185,7 @@ class AstGate(gate.Gate):
         self.parse_error = ""
         self.parse_kind = ""  # a fixed label of the parse error (`shell.PARSE_KINDS`), for the shadow's count
         self.internal_error = ""
+        self._code_label = "stdin-receiver"  # the rule of the last `_expanded_into_code` (a fixed label, see `_stdin_refusal`)
         self._cache: dict[str, _Parsed] = {}
         self._index: dict[int, int] = {}
         self._model: shell.VarModel | None = None
@@ -529,8 +530,8 @@ class AstGate(gate.Gate):
         return [*c.argv, *(a.value for a in c.assigns if a.value), *(x for a in c.assigns for x in a.array),
                 *(r.target for r in c.redirects if r.target is not None)]
 
-    def _unjudgeable(self, calls: list[shell.Call]) -> str:
-        """Why the command cannot be judged at all (empty when it can): code or a command name the tree does not hold.
+    def _unjudgeable(self, calls: list[shell.Call]) -> tuple[str, str] | None:
+        """(why, label) the command cannot be judged at all (None when it can): code or a command name the tree does not hold.
         Every construct this module does not understand ends here — a new syntax means a denial, never a pass."""
         names = {c.name for c in calls}
         glob_rules_changed = "shopt" in names or any(a.name.lower() == "globignore" for c in calls for a in c.assigns)
@@ -538,20 +539,23 @@ class AstGate(gate.Gate):
             "fpath" in w.text.lower() for c in calls for w in c.argv
         )
         if "autoload" in names and fpath:
-            return "zsh `autoload` together with `fpath`: the body of the function comes from a file the line does not hold"
+            return "zsh `autoload` together with `fpath`: the body of the function comes from a file the line does not hold", "autoload-fpath"
         for c in calls:
             for w in self._words(c):
                 if "zsh-code" in w.kinds:
-                    return "a zsh glob qualifier or parameter flag that may run code (`(e…)`, `(+…)`, `(#q…)`, `${(e)x}`)"
+                    return "a zsh glob qualifier or parameter flag that may run code (`(e…)`, `(+…)`, `(#q…)`, `${(e)x}`)", "zsh-code"
                 if "exec" in w.kinds:
-                    return "an expansion that runs code (`${x@P}`)"
+                    return "an expansion that runs code (`${x@P}`)", "expansion-runs-code"
                 if glob_rules_changed and "glob" in w.kinds and re.search(r"(?:^|/)\.[^/]*[*?\[]", w.text):
-                    return "a glob with a leading dot where `shopt` / GLOBIGNORE may change what it matches (`.*` reaching `..`)"
+                    return (
+                        "a glob with a leading dot where `shopt` / GLOBIGNORE may change what it matches (`.*` reaching `..`)",
+                        "dot-glob-shopt",
+                    )
             if c.name == "coproc":
-                return "`coproc`: a process that runs beside the line and answers through $COPROC"
+                return "`coproc`: a process that runs beside the line and answers through $COPROC", "coproc"
             if c.name == "print" and any(re.match(r"-[A-Za-z]*P", w.text) for w in c.argv[1:] if w.static):
-                return "`print -P`: prompt expansion runs `$(…)` found in its arguments"
-        return ""
+                return "`print -P`: prompt expansion runs `$(…)` found in its arguments", "print-prompt"
+        return None
 
     # ------------------------------------------------------------------------------------------------ entry
 
@@ -580,18 +584,20 @@ class AstGate(gate.Gate):
             except shell.ParseError as e:
                 self.parse_error = str(e)
                 self.parse_kind = e.kind
-                return f"piigate: command denied — it cannot be parsed with certainty ({e}). {gate.HINT}"
+                return Reason(f"piigate: command denied — it cannot be parsed with certainty ({e}). {gate.HINT}", "cannot-parse")
             for b in self._current.bodies:  # a body written to a file may be run by another call: its text is checked for the
                 if b.stripped and re.search(r"PIIGATE_\w+|XDG_DOCUMENTS_DIR", b.text) or any(  # filter's own files whether or not
                     m in b.text for m in self.protected_markers if b.stripped  # the same line runs it
                 ):
-                    return (
+                    return Reason(
                         "piigate: the command touches a filter file (PIIGATE_* / XDG_DOCUMENTS_DIR / the map, key or "
                         "engine paths) in a script it writes — the pseudonym map, key and filter configuration are "
-                        "off-limits to the model."
+                        "off-limits to the model.",
+                        "filter-files",
                     )
-            if why := self._unjudgeable(self._current.calls):
-                return f"piigate: command denied — {why}; the gate cannot judge what it runs. {gate.HINT}"
+            if unjudgeable := self._unjudgeable(self._current.calls):
+                why, label = unjudgeable
+                return Reason(f"piigate: command denied — {why}; the gate cannot judge what it runs. {gate.HINT}", label)
             composed = self._current.composed
             if composed != command and re.search(r"\b(?:analyze|anonymize)\b", composed) and any(
                 c is None or c[1:2] in (["analyze"], ["anonymize"]) for c in self._invocations(command, {"piigate"})
@@ -604,15 +610,16 @@ class AstGate(gate.Gate):
             if self.sensitive or self.project_sensitive or self.sensitive_name:
                 c = self._expanded_into_code(self._current)
                 if c is not None:
-                    return (
+                    return Reason(
                         f"piigate: command denied — `{c.name or 'a command'}` reads text that a stage of the line builds with an "
                         f"expansion (a substitution or a variable) and is not a known data filter, so it may run it as code; the "
-                        f"gate cannot read that code, and a sensitive source is configured. {gate.HINT}"
+                        f"gate cannot read that code, and a sensitive source is configured. {gate.HINT}",
+                        self._code_label,
                     )
             return None
         except Exception as e:  # whatever the adapter did not foresee: deny, and say so
             self.internal_error = f"{type(e).__name__}: {e}"[:200]
-            return f"piigate: command denied — the shadow gate failed ({type(e).__name__}). {gate.HINT}"
+            return Reason(f"piigate: command denied — the shadow gate failed ({type(e).__name__}). {gate.HINT}", "internal-error")
 
     # ------------------------------------------------------------------------------------------------ operands from a command
 
@@ -674,10 +681,11 @@ class AstGate(gate.Gate):
             if hit is None and (name in READERS or not name or self._stdin_file_receiver(c, p, False)) and not via_xargs:
                 hit = next((w for w in stdin_words if self._expands_command(w) and w.text and not w.text.startswith("<<<")), None)
             if hit is not None:
-                return (
+                return Reason(
                     f"piigate: command denied — `{name or 'a command'}` reads files and one of them is named by a command "
                     f"substitution ({hit.text}): the gate cannot see the path it will get, and a sensitive source is configured. "
-                    f"{gate.HINT}"
+                    f"{gate.HINT}",
+                    "substituted-operand",
                 )
         return None
 
@@ -740,19 +748,21 @@ class AstGate(gate.Gate):
         for c in p.calls:
             own = [r for r in c.redirects if r.op in ("<<<", "<", "<<")]
             from_file = self._stdin_file_receiver(c, p, rebound)  # `< "$f"`: the name is built, the text is not (#43)
-            fed = (
+            built = (
                 any((expands(r.target) and not (from_file and r.op == "<")) or dynamic_heredoc(r) for r in own)
                 or any("proc" in w.kinds and not w.text.startswith(">(") for w in c.argv)
                 or any(feeds(f) for pid, stage in c.pipes if stage for s, f in stages[pid] if s < stage)
-                or transformed(c)
             )
+            text_to_shell = transformed(c)
+            fed = built or text_to_shell
             if c.origin == ">(" and (up := parent.get(id(c))) is not None:  # `tee >(sh)`, `printf "$x" > >(sh)`: its stdin is the output of `up`
                 fed = fed or id(up) in fed_calls or any(
                     expands(w) for w in (*up.argv, *(r.target for r in up.redirects if r.target is not None)) if not w.text.startswith(">(")
                 )
             if fed:
                 fed_calls.add(id(c))
-                if not self._reads_stdin_as_data(c, p, rebound):
+                if (refusal := self._stdin_refusal(c, p, rebound)) is not None:
+                    self._code_label = refusal if built or not text_to_shell else "text-to-shell"
                     return c
         return None
 
@@ -850,52 +860,63 @@ class AstGate(gate.Gate):
         keep it so (FILTER_OPTIONS; for `sed` a script of `_sed_script_ok`, for `awk` a program of `_awk_program_ok`;
         `piigate text` / `table`), possibly behind `xargs` (judged by what it runs; `xargs` alone runs `echo`)? A function, an
         alias, a name nobody can read, a wrapper that is not `command` / `nice` / `time` is not."""
+        return self._stdin_refusal(c, p, rebound) is None
+
+    def _stdin_refusal(self, c: shell.Call, p: _Parsed, rebound: bool) -> str | None:
+        """None when `c` reads its input as data (`_reads_stdin_as_data`); otherwise the fixed label of the rule that refuses it
+        (the shadow mode counts it): the decision is the same as the bool's, the label only says which rule it was."""
         words = shell._effective(c.argv)
-        if rebound or not words or not words[0].static or self._prefix_assignment(c) or self._receiver_environment_changed(p):
-            return False
+        if rebound:
+            return "rebound-names"
+        if not words or not words[0].static:
+            return "unknown-receiver"
+        if self._prefix_assignment(c):
+            return "env-assign"
+        if self._receiver_environment_changed(p):
+            return "receiver-env"
         if len(words) != len(c.argv) and not {
             os.path.basename(w.text) for w in c.argv[: len(c.argv) - len(words)] if w.static
         } <= {"command", "builtin", "noglob", "nocorrect", "time", "nice"}:
-            return False
+            return "wrapper"
         if not self._known_location(words[0].text):
-            return False
+            return "unknown-location"
         via_xargs = False
         if os.path.basename(words[0].text) == "xargs":
             via_xargs = True
             words = self._xargs_command(words)
             if not words:
-                return True
+                return None
             if not words[0].static or not self._known_location(words[0].text):
-                return False
+                return "xargs-program"
             if os.path.basename(words[0].text) in FILTER_OPTIONS:
                 # the input of xargs ends up in the arguments of a filter that takes a program or options — appended
                 # (`printf '%s\n' -e "e $x" | xargs sed p f`) or put in by `-I{}` / `-i` / `--replace` (`xargs -I{} awk {}`): code (#43)
-                return False
+                return "xargs-program"
         name = os.path.basename(words[0].text)
         if name in p.functions:
-            return False
+            return "function"
         if not via_xargs and self._data_receiver(name, words[1:], p):  # (through xargs its input is APPENDED to the arguments: options)
-            return True
+            return None
         if name not in STDIN_DATA:
-            return False
+            return "stdin-interpreter" if c.stdin_interpreter else "stdin-receiver"
         args = words[1:]
         if name == "piigate":
-            return bool(args) and args[0].static and args[0].text in ("text", "table")
+            return None if args and args[0].static and args[0].text in ("text", "table") else "piigate-subcommand"
         spec = FILTER_OPTIONS.get(name)
         if spec is None:
-            return True
+            return None
         scanned = self._scan_options(args, spec)
         if scanned is None:
-            return False
+            return "filter-options"
         operands, values = scanned
         if name in ("less", "more") and any(o.startswith("+") for o in operands):
-            return False  # `less +!cmd`: an operand that starts with `+` is a command of the pager
+            return "pager-command"  # `less +!cmd`: an operand that starts with `+` is a command of the pager
         if name == "sed":
             programs = [v for o, v in values if o in ("e", "--expression")] or [operands[0] if operands else None]
-            return all(t is not None and self._sed_script_ok(t) for t in programs)
+            return None if all(t is not None and self._sed_script_ok(t) for t in programs) else "filter-program"
         if name in ("awk", "gawk", "mawk"):
-            return bool(operands) and self._awk_program_ok(operands[0])
-        return True
+            return None if operands and self._awk_program_ok(operands[0]) else "filter-program"
+        return None
 
     @staticmethod
     def _stdin_flag(texts: list[str | None], short: str, longs: tuple[str, ...]) -> bool:
@@ -1181,7 +1202,7 @@ class AstGate(gate.Gate):
         `reverse` / `approve` in an argument of another program (a URL, a grep pattern, `sorted(…, reverse=True)`), is not one
         (#26). A line the tree cannot tell about is judged by its text, as before."""
         p = self._cache.get(command)
-        if p is None or tokens is None:
+        if p is None or tokens is None or "human-only-precise" in shell.ABLATE:
             return super()._human_only_dynamic(command, tokens, standalone)
         if self._expanded_into_code(p) is not None:
             return True  # text with an expansion given to a shell or an interpreter: code nobody can read (#41)
@@ -1199,6 +1220,8 @@ class AstGate(gate.Gate):
         return False
 
     def _tokens(self, command: str) -> list[str] | None:
+        if "tree-tokens" in shell.ABLATE:
+            return gate.Gate._tokens(command)
         p = self._lookup(command)
         return None if p is None else p.tokens
 
@@ -1236,7 +1259,7 @@ class AstGate(gate.Gate):
         qualifier (#34). Every `eval` word the old tokenizer sees must be accounted for that way — else the line is judged as
         before."""
         cur = self._current
-        if tokens is not None and cur is not None and cur.raw == self._raw:
+        if tokens is not None and cur is not None and cur.raw == self._raw and "eval-argument" not in shell.ABLATE:
             evals = [t for t in tokens if Path(str(t)).name == "eval"]
             if evals and len(evals) == sum(c.eval_as_argument for c in cur.calls):
                 tokens = [t for t in tokens if Path(str(t)).name != "eval"]
@@ -1373,7 +1396,7 @@ class AstGate(gate.Gate):
         `cp/mv/rm` the no-output rule is for — it keeps the old decision (the quoted `&&` used to split the command)."""
         if any(str(t).startswith("\\") and OPERATOR_WORD.fullmatch(str(t)[1:]) for t in tokens):
             return False
-        return super()._no_content(tokens) or self._creates_only(tokens)
+        return super()._no_content(tokens) or ("creates-only" not in shell.ABLATE and self._creates_only(tokens))
 
     def _unvettable_script(self, tokens: list[str]) -> bool:
         """The old rule (`echo "$x" > s.sh; bash s.sh`) plus the same text written by a LATER stage of its pipeline: `echo "$x" |

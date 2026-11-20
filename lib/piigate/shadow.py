@@ -34,11 +34,26 @@ CATEGORIES = (
     "same-allow", "same-deny", "old-deny-new-allow", "old-allow-new-deny", "parse-error", "shadow-error", "shadow-timeout",
 )
 # the cause of an old-deny-new-allow: the feature of the syntax-tree gate that, switched off, makes it deny again
-FEATURES = ("subshell-cd", "pipeline-cd", "known-value-resolution", "absolute-cd")
+FEATURES = (
+    "subshell-cd", "pipeline-cd", "known-value-resolution", "absolute-cd",
+    "eval-argument", "creates-only", "human-only-precise", "tree-tokens",
+)
 CAUSES = (*FEATURES, "other")
+# the rule behind a denial: each message of the two gates carries one (`gate.Reason`); `other` is only the safety net for a
+# message without a label (a plain string, or an old count that was filed before the labels existed)
 REASON_LABELS = (
-    "sensitive-dir", "filter-files", "unfiltered-tool", "data-file", "ssh-query", "mcp-piigate", "marker-dir", "human-only",
-    "cannot-parse", "code-the-tree-cannot-read", "zsh-syntax", "other",
+    # old gate: what the command touches
+    "sensitive-dir", "filter-files", "unfiltered-tool", "unfiltered-option", "unfiltered-opaque", "data-file", "written-data-file",
+    "too-many-files", "ssh-query", "mcp-piigate", "marker-dir", "human-only", "zsh-syntax", "nul-byte", "quotes-unparsed",
+    "cd-too-many", "names-passed-on", "built-script", "seeding-file", "too-many-values", "unexpanded-braces",
+    # the syntax-tree gate: cannot read the line / the code it holds
+    "cannot-parse", "code-the-tree-cannot-read", "autoload-fpath", "zsh-code", "expansion-runs-code", "dot-glob-shopt", "coproc",
+    "print-prompt", "substituted-operand", "internal-error",
+    # the syntax-tree gate: text built with an expansion reaches a program that is no known data filter (the rule that refuses it)
+    "text-to-shell", "stdin-interpreter", "stdin-receiver", "xargs-program", "env-assign", "receiver-env", "wrapper",
+    "unknown-location", "unknown-receiver", "function", "rebound-names", "piigate-subcommand", "filter-options", "pager-command",
+    "filter-program",
+    "other",
 )
 # the kind of a parse-error (`shell.PARSE_KINDS`; `syntax-error:<dialect>`, `unsupported-…:<shfmt node type>` or `:other`)
 _PARSE_LABELS: tuple | None = None
@@ -76,6 +91,9 @@ def _label(reason: str | None) -> str:
     """A reason as one of a few fixed labels (by the fixed words of the gate's messages) — never the text itself."""
     if not reason:
         return "other"
+    label = getattr(reason, "label", None)  # `gate.Reason`: the rule says it itself
+    if label in REASON_LABELS:
+        return label
     table = (
         ("is for a human only", "human-only"),
         ("cannot be parsed", "cannot-parse"),
@@ -89,6 +107,21 @@ def _label(reason: str | None) -> str:
         ("disabled in Bash", "mcp-piigate"),
         ("holds only the piigate marker", "marker-dir"),
         ("personal data", "data-file"),
+        # the messages of the rules added later (the fallback for a reason that lost its label — a plain string)
+        ("cannot parse the command", "quotes-unparsed"),
+        ("a NUL byte", "nul-byte"),
+        ("reads text that a stage of the line builds", "stdin-receiver"),
+        ("named by a command substitution", "substituted-operand"),
+        ("the shadow gate failed", "internal-error"),
+        ("passed on (xargs", "names-passed-on"),
+        ("names more than", "cd-too-many"),
+        ("this command writes", "written-data-file"),
+        ("too many to check", "too-many-files"),
+        ("a data file", "data-file"),
+        ("a script written from text built", "built-script"),
+        ("a file that runs later", "seeding-file"),
+        ("too many possible values", "too-many-values"),
+        ("braces the gate cannot expand", "unexpanded-braces"),
     )
     return next((label for needle, label in table if needle in reason), "other")
 
@@ -202,6 +235,7 @@ def _bump(day: dict, category: str, ms: float | None = None, cause: str | None =
         b = day.setdefault("ms", {})
         b[_bucket(ms)] = b.get(_bucket(ms), 0) + 1
     if cause:
+        cause = cause if cause in CAUSES else "other"  # only the fixed labels are written, whatever the caller passes
         c = day.setdefault("causes", {})
         c[cause] = c.get(cause, 0) + 1
     if kind and category == "parse-error":
@@ -209,6 +243,7 @@ def _bump(day: dict, category: str, ms: float | None = None, cause: str | None =
         k[kind] = k.get(kind, 0) + 1
     label = old if category == "old-deny-new-allow" else new if category == "old-allow-new-deny" else None
     if label:
+        label = label if label in REASON_LABELS else "other"
         r = day.setdefault("reasons", {}).setdefault(category, {})
         r[label] = r.get(label, 0) + 1
 
