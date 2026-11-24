@@ -1625,14 +1625,16 @@ class Gate:
         return None
 
     def _checksum_check(self, tokens: list[str]) -> Reason | None:
-        """`sha384sum -c` (`--check`, `--c`, a group of short flags with `c`, a word nobody can read): the text it is given is a list of
-        files that it opens."""
+        """`sha384sum -c` (`--check`, `--c`, a group of short flags with `c`) or a word nobody can read BEFORE `--` (it may be `-c`): the
+        text such a program is given is a list of files that it opens. After `--` every word is a file name."""
         for st in self._simple_stages(tokens):
-            if Path(st[0]).name in CHECKSUM_PROGRAMS and any(
-                re.match(r"-[^-]*c|--c", t) or "$" in t or "`" in t for t in st[1:]
-            ):
+            if Path(st[0]).name not in CHECKSUM_PROGRAMS:
+                continue
+            options = st[1 : st.index("--")] if "--" in st[1:] and not isinstance(st[st.index("--")], QuotedToken) else st[1:]
+            if any(re.match(r"-[^-]*c|--c", t) or "$" in t or "`" in t for t in options):
                 return Reason(
-                    f"piigate: command denied — a checksum program in check mode (`-c`) opens the files that its input lists. {HINT}",
+                    "piigate: command denied — a checksum program in check mode (`-c`) opens the files that its input lists, and a word "
+                    f"that is built may be that option: put `--` before the file names (`sha256sum -- \"$f\"`). {HINT}",
                     "checksum-check",
                 )
         return None

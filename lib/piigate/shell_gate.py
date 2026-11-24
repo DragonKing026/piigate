@@ -573,12 +573,15 @@ class AstGate(gate.Gate):
                         "dot-glob-shopt",
                     )
             words = shell._effective(c.argv)
+            options = words[1:]
+            if any(w.static and w.text == "--" for w in options):  # after `--` every word is a file name
+                options = options[: next(k for k, w in enumerate(options) if w.static and w.text == "--")]
             if words and words[0].static and os.path.basename(words[0].text) in CHECKSUM_PROGRAMS and any(
-                not w.static or re.match(r"-[^-]*c|--c", w.text) for w in words[1:]
+                not w.static or re.match(r"-[^-]*c|--c", w.text) for w in options
             ):
                 # `-c` / `--check` (abbreviated, in a group, or a word nobody can read): the text it is given, a file or stdin, is a
                 # LIST OF FILES that the program opens
-                return "a checksum program in check mode (`-c`): it opens the files its input names", "checksum-check"
+                return "a checksum program in check mode (`-c`), or a built word before `--` that may be that option (use `sha256sum -- \"$f\"`)", "checksum-check"
             if c.name == "coproc":
                 return "`coproc`: a process that runs beside the line and answers through $COPROC", "coproc"
             if c.name == "print" and any(re.match(r"-[A-Za-z]*P", w.text) for w in c.argv[1:] if w.static):

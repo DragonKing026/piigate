@@ -2261,12 +2261,17 @@ class TestRound9(Base):
 
     def test_checksum_program_in_check_mode(self):
         for name in ("md5sum", "sha1sum", "sha224sum", "sha256sum", "sha384sum", "sha512sum", "b2sum", "cksum"):
-            for options in ("-c", "--check", "--chec", "--c", "--ch", "-bc", "-cw", "-c -", '"$o"'):
+            for options in ("-c", "--check", "--chec", "--c", "--ch", "-bc", "-cw", "-c -", '"$o"', '"$f"', '"$opt" -- x', "-c -- x"):
                 command = f'echo "abc  ln/people.csv" | {name} {options}'
                 with self.subTest(command=command):
                     self.deny(command)
-            with self.subTest(name=name):
-                self.allow(f"echo abc | {name}")
+            for command in (f"echo abc | {name}", f'{name} -- "$f"', f'{name} -b -- "$f" "$g"', f"{name} x.csv"):
+                with self.subTest(command=command):
+                    self.allow(command)
+        self.deny("sha256sum -bc x")
+        self.deny("sha256sum -c x")
+        self.allow('for f in *.md; do sha256sum -- "$f"; done')
+        self.deny('for f in *.md; do sha256sum "$f"; done')
 
     def test_glob_loop_in_a_line_that_creates_files(self):
         for command in (
