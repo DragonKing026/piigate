@@ -348,7 +348,79 @@ def _ansi_c(raw: str) -> str:
     return _ANSI.sub(one, raw)
 
 
-_ZSH_QUALIFIER_CODE = re.compile(r"\([^)]*[e+]|\(#q")  # an `e` or `+` inside the parentheses, or `(#q`: any separator
+_QUALIFIER_CLOSERS = {"(": ")", "[": "]", "{": "}", "<": ">"}
+
+
+def _group_runs_code(s: str) -> bool:
+    """`s` is the text right after a `(` up to the end of the word part. Is the group a zsh glob qualifier list that runs code: an
+    `e` (`e:cmd:`, also after `o`) or a `+` (`+func`) at the place of a qualifier? The qualifiers are read the way zsh reads them, so
+    that what is an ARGUMENT of one is not mistaken for another: `L+1` / `mh-1` (a size, an age: `+` is a sign), `f:u+r:` and
+    `u:name:` (a delimited argument), `[1,3]` (a range), `o` followed by its sort key. An unquoted `|` or `~` in the group makes it a pattern. Whatever cannot
+    be read as a qualifier list and sits in a group that is closed in this text is a PATTERN (`(test|json)`: `e` with an unterminated argument is an error in
+    zsh, not code); an open group (the text goes on in a quoted part) that cannot be read is refused."""
+    closed = ")" in s
+    if re.search(r"(?<!\\)[|~]", s.split(")", 1)[0]):
+        return False  # an unquoted `|` or `~` makes the group a pattern, not qualifiers (zsh: `*(e|echo hi|)` runs nothing)
+    i, n = 0, len(s)
+
+    def argument(at: int) -> int | None:
+        """The index after the delimited argument whose delimiter is s[at], or None when it is not terminated."""
+        j = s.find(_QUALIFIER_CLOSERS.get(s[at], s[at]), at + 1)
+        return None if j < 0 else j + 1
+
+    while i < n:
+        c = s[i]
+        i += 1
+        if c == ")":
+            return False
+        if c == "\\":
+            i += 1
+        elif c == "+":
+            return True  # `+name`: runs the function `name`
+        elif c == "e":
+            if i >= n:
+                return not closed
+            j = argument(i)
+            if j is None:
+                return not closed
+            return True  # `e:code:` is terminated: it runs
+        if c in "Lmac":
+            if i < n and s[i] in ("kKmMgGtTpP" if c == "L" else "smhdwM"):
+                i += 1
+            if i < n and s[i] in "+-":
+                sign = s[i]
+                i += 1
+                if sign == "+" and not (i < n and s[i].isdigit()):
+                    return True  # `m+f`: not a number after the sign
+            while i < n and s[i].isdigit():
+                i += 1
+        elif c in "fugd":
+            if i < n and s[i].isdigit():
+                while i < n and s[i].isdigit():
+                    i += 1
+            elif i < n and s[i] != ")":
+                j = argument(i)
+                if j is None:
+                    return not closed
+                i = j
+        elif c in "oO":
+            if i < n and s[i] in "nLlmacdz":
+                i += 1
+        elif c == "[":
+            j = s.find("]", i)
+            if j < 0:
+                return not closed
+            i = j + 1
+        elif c == "%" and i < n and s[i] in "bcs":
+            i += 1
+    return False
+
+
+def _qualifier_code(raw: str) -> bool:
+    """Does a group in this text read as a glob qualifier list that runs code (`_group_runs_code`), or does `(#q` start one?"""
+    if "(#q" in raw:
+        return True
+    return any(_group_runs_code(raw[m.end() :]) for m in re.finditer(r"(?<!\\)\(", raw))
 
 
 def _has_glob(raw: str) -> bool:
@@ -566,7 +638,7 @@ def _word(node: dict) -> Word:
                 # zsh only: a glob qualifier `*(.)` / `*(e:code:)` / `*(+func)` is kept by shfmt as plain text, it has no
                 # node. Whether it runs code is never read from its separators: any `e`, any `+`, any `#q` inside counts
                 kinds.add("zsh")
-                if _ZSH_QUALIFIER_CODE.search(raw):
+                if _qualifier_code(raw):
                     kinds.add("zsh-code")
             if _has_glob(raw):
                 kinds.add("glob")
@@ -636,7 +708,7 @@ def _expansion_text(p: dict, kinds: set[str]) -> str:
     if t == "ExtGlob":
         kinds.add("extglob")
         kinds.add("zsh")  # zsh reads `(…)` after a pattern as a glob qualifier; the tree has no node for what is inside
-        if _ZSH_QUALIFIER_CODE.search("(" + _text(p.get("Pattern") or {}) + ")"):
+        if _qualifier_code("(" + _text(p.get("Pattern") or {}) + ")"):
             kinds.add("zsh-code")
         return _text(p, "Op") + _text(p.get("Pattern") or {}) + ")"
     raise ParseError(f"unsupported word part {t}", "unsupported-word-part", t)

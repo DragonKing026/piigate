@@ -1997,5 +1997,35 @@ class TestIssueRegressions(Base):
                 self.allow(command)
 
 
+class TestRound8(Base):
+    """Task 380, round after the 1.0.22 measurement: false denials of the tree gate (the old gate allowed these lines)."""
+
+    def deny(self, command: str, dialect: str = "zsh") -> None:
+        self.assertIsNotNone(self.ast(dialect).bash(command), command)
+
+    def allow(self, command: str, dialect: str = "zsh") -> None:
+        g = self.ast(dialect)
+        self.assertIsNone(g.bash(command), (command, g.bash(command)))
+
+    def test_qualifier_that_only_selects_files_is_not_code(self):
+        """`+` in `L+1` and `e` in a pattern group are not a function call or an `e:code:` qualifier (zsh: checked with a real
+        zsh: `*(Lk+0)`, `*.(test|json)`, `(e|a)*` run nothing)."""
+        for command in (
+            "ls *(.L+1)", "ls *(Lk+1)", "ls *(L+1)", "ls *(mh-1)", "ls *(mm+0)", "ls *(m+1)", "ls *(.om[1])", "ls *.(test|json)", "ls *.(jpeg|png)", "ls (e|a)*", "ls *(u:root:)", "ls -d *(/N)", "ls *(^/)",
+            "ls *(a+0)", "ls *(c-1)",
+        ):
+            with self.subTest(command):
+                self.allow(command)
+
+    def test_qualifier_that_runs_code_is_still_denied(self):
+        for command in (
+            "ls *(e:'echo hi':)", "ls *(.e:'echo hi':)", "ls *(oe:'echo hi':)", "ls *(o+f)", "ls *(+f)", "ls *(.+f)",
+            "ls *(f:u+r:e:'echo hi':)", "ls *(f:u+r:+f)", "ls *(L+e:'x':)", "ls *(#q.)", "ls *(m+f)", "ls *(e:\"echo $x\":)", "ls *(e:'a|b':)", "ls *(e:\"a|b\":)",
+            "ls *(Lk+1e:'x':)", "ls *(N,e:'x':)", "ls *([1,2]e:'x':)", "ls *(u:root:e:'x':)", "ls *(e:'a':^e:'b':)",
+        ):
+            with self.subTest(command):
+                self.deny(command)
+
+
 if __name__ == "__main__":
     unittest.main()
