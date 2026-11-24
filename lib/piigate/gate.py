@@ -1572,6 +1572,25 @@ class Gate:
         return "".join(result)
 
     @staticmethod
+    def _spelled_qualifier(text: str, i: int) -> bool:
+        """The `(` at `text[i]` ends a word that holds a glob character and opens a group at the END of that word in which a
+        quote, an escape, a backtick or an expansion can spell what a qualifier needs (`*($'\\145':cmd:)`, `x="e:cmd:"; *($x)`,
+        `*("$x")`): the letters are not in the text, so the group is refused. `*.(test|json)`, `*(.N)`, `*(om[1,5])`, `*.csv(N)`
+        and an escaped paren (`\\(`, skipped by the scan before this) have none of these characters."""
+        start = i
+        while start and text[start - 1] not in " \t\n;&|<>":
+            start -= 1
+        if not re.search(r"[*?\[]", text[start:i]):
+            return False
+        j, n = i + 1, len(text)
+        while j < n and text[j] != ")":
+            j += 2 if text[j] == "\\" else 1
+        group = text[i + 1 : j]
+        if j < n and j + 1 < n and text[j + 1] not in " \t\n;&|<>)":
+            return False  # not at the end of the word: a pattern (`(e:x:)*` runs nothing, checked)
+        return bool(re.search(r"[\\$`'\"]", group))
+
+    @staticmethod
     def _zsh_code(command: str, flags: bool = True) -> str | None:
         """Syntax by which zsh RUNS code from a word: a parameter flag `e` or `%` (`${(e)x}`, nested or in a default,
         also in double quotes) and a glob qualifier `(e…)`, `(+…)`, `(#q…)` that is neither quoted nor escaped (`*(e:…:)`,
@@ -1592,7 +1611,10 @@ class Gate:
                 m = ZSH_FLAGS.match(text, i)
                 if m and re.search(r"[e%]", m.group(1)):
                     return "a zsh parameter flag that runs code (`${(e)…}`, `${(%)…}`)"
-            elif z == "(" and not flags and not double and i and text[i - 1] not in " \t\n;&|(<>=$`" and ZSH_QUALIFIER.match(text, i):
+            elif (
+                z == "(" and not flags and not double and i and text[i - 1] not in " \t\n;&|(<>=$`{"
+                and (ZSH_QUALIFIER.match(text, i) or Gate._spelled_qualifier(text, i))
+            ):
                 return "a zsh glob qualifier that runs code (`(e:…:)`, `(+func)`, `(#q…)`)"
             i += 1
         return None
@@ -1661,7 +1683,7 @@ class Gate:
             return "a zsh parameter flag that runs code (`${(e)…}`, `${(%)…}`)"
         for m in re.finditer(r"\(", text):
             i = m.start()
-            if i and text[i - 1] not in " \t\n;&|(<>=$`\\" and ZSH_QUALIFIER.match(text, i):
+            if i and text[i - 1] not in " \t\n;&|(<>=$`{\\" and (ZSH_QUALIFIER.match(text, i) or Gate._spelled_qualifier(text, i)):
                 return "a zsh glob qualifier that runs code (`(e:…:)`, `(+func)`, `(#q…)`)"
         return None
 

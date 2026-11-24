@@ -2212,5 +2212,39 @@ class TestRound8(Base):
                 self.deny(command)
 
 
+class TestRound9(Base):
+    """Both Bash gates (`Gate`, the one that decides, and `AstGate`) refuse the same lines: forms that the text of a line does not
+    show (a qualifier spelled by a quote, an escape or an expansion), code defined in a `trap`, a checksum program in check mode,
+    a loop over a glob in a line that creates files."""
+
+    def both(self, command: str):
+        old = gate.Gate.bash(self.old(), command, True)
+        return old, self.ast("zsh").bash(command)
+
+    def deny(self, command: str, dialect: str = "zsh") -> None:
+        old, new = self.both(command)
+        self.assertIsNotNone(old, ("Gate", command))
+        self.assertIsNotNone(new, ("AstGate", command))
+
+    def allow(self, command: str, dialect: str = "zsh") -> None:
+        old, new = self.both(command)
+        self.assertIsNone(old, ("Gate", command, old))
+        self.assertIsNone(new, ("AstGate", command, new))
+
+    def test_qualifier_spelled_by_a_quote_an_escape_or_an_expansion(self):
+        for command in (
+            "print *($'\\145':touch\\ M:)", "print *($'\\x65':touch M:)", 'x="e:touch M:"; print *($x)', 'print *("$x")', "print *(${x})",
+            "print *(\\145:touch\\ M:)", "print *(`echo e`:touch M:)",
+        ):
+            with self.subTest(command):
+                self.deny(command)
+        for command in (
+            "ls *.(test|json)", "ls *(.N)", "ls *(om[1,5])", "ls *.csv(N)", "find . \\( -name x \\)", "echo ${(q)x}", "echo $(date)",
+            "f() { :; }", "ls *(.)",
+        ):
+            with self.subTest(command):
+                self.allow(command)
+
+
 if __name__ == "__main__":
     unittest.main()
