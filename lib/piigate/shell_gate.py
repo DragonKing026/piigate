@@ -965,8 +965,10 @@ class AstGate(gate.Gate):
         if scanned is None:
             return "filter-options"
         operands, values = scanned
-        if name == "rg" and not any(w.static and w.text == "--no-config" for w in args):
-            return "filter-options"  # the options of rg also come from a file nobody on this line can see
+        if name == "rg" and not (args and args[0].static and args[0].text == "--no-config"):
+            # the options of rg also come from a file nobody on this line can see; `--no-config` switches that off only as the FIRST
+            # argument (anywhere else it can be the value of an option, `-e --no-config`, or a pattern after `--`)
+            return "filter-options"
         if name in ("less", "more") and any(o.startswith("+") for o in operands):
             return "pager-command"  # `less +!cmd`: an operand that starts with `+` is a command of the pager
         if name == "sed":

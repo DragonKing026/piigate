@@ -2156,14 +2156,17 @@ class TestRound8(Base):
         to them as data. The options that run a program (`rg --pre`), the config file and the environment that a program
         reads (`RIPGREP_CONFIG_PATH`, `BAT_PAGER`) decide nothing here: `bat` is not a receiver, `rg` without `--no-config` is not."""
         for command in (
-            'echo "$x" | rg --no-config foo', 'echo "$x" | rg --no-config -n -i foo', 'echo "$x" | rg -i --no-config -e foo -m 3',
+            'echo "$x" | rg --no-config foo', 'echo "$x" | rg --no-config -n -i foo', 'echo "$x" | rg --no-config -i -e foo -m 3',
             'echo "$x" | rg --no-config --no-heading --color never foo', 'echo "$x" | rg --no-config -c "a|b"',
             'echo "$x" | rg --no-config --max-count=2 foo', 'echo "$x" | sha224sum', 'echo "$x" | sha384sum', 'echo "$x" | sha256sum',
         ):
             with self.subTest(command):
                 self.allow(command)
         for command in (
-            'echo "$x" | rg foo', 'echo "$x" | rg -n -i foo', 'echo "$x" | bat', 'echo "$x" | bat -p --color=never',
+            'echo "$x" | rg foo', 'echo "$x" | rg -n -i foo', 'echo "$x" | rg -i --no-config foo', 'echo "$x" | rg foo --no-config',
+            'echo "$x" | rg -e --no-config -e foo', 'echo "$x" | rg foo -- --no-config', 'echo "$x" | rg --regexp --no-config foo',
+            'echo "$x" | rg -g --no-config foo', 'echo "$x" | rg -A --no-config foo', 'echo "$x" | rg --glob --no-config foo',
+            'echo "$x" | bat', 'echo "$x" | bat -p --color=never',
             'BAT_PAGER=sh echo "$x" | bat --paging=always', 'echo "$x" | bat --paging=always', 'echo "$x" | shasum', 'echo "$x" | shasum -a 256',
             'RIPGREP_CONFIG_PATH=/tmp/c echo "$x" | rg --no-config foo', 'export RIPGREP_CONFIG_PATH=/tmp/c; echo "$x" | rg --no-config foo',
             'export BAT_PAGER=sh; echo "$x" | rg --no-config foo', 'RIPGREP_CONFIG_PATH=/tmp/c; echo "$x" | rg --no-config foo',
