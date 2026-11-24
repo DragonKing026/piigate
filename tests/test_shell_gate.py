@@ -2056,6 +2056,8 @@ class TestRound8(Base):
             "emulate -L zsh; cat $(pwd)/people.csv", "functions pwd; cat $(pwd)/people.csv", "typeset -f pwd; cat $(pwd)/people.csv",
             "unalias pwd; cat $(pwd)/people.csv", "enable -n pwd; cat $(pwd)/people.csv", "builtin eval \"$v\"; cat $(pwd)/people.csv",
             "echo ${functions[pwd]:=x}; cat $(pwd)/people.csv",
+            "trap 'pwd() { echo ln; }' DEBUG; cat $(pwd)/people.csv", "trap \"$body\" EXIT; cat $(pwd)/people.csv",
+            "trap 'rm -f x' EXIT; cat $(pwd)/notes.md",  # any non-empty body may define code
         ):
             with self.subTest(command):
                 self.deny(command)
@@ -2145,6 +2147,17 @@ class TestRound8(Base):
         ):
             with self.subTest(command):
                 self.deny(command)
+
+    def test_a_function_defined_in_a_trap_is_a_function_of_the_line(self):
+        for command in (
+            "trap 'pwd() { echo ln; }' DEBUG; cat $(pwd)/people.csv", "trap 'rg() { sh; }' EXIT; echo \"$x\" | rg --no-config foo",
+            "trap 'sha384sum() { sh; }' EXIT; echo \"$x\" | sha384sum", "trap 'alias sort=sh' EXIT; echo \"$x\" | sort",
+        ):
+            with self.subTest(command):
+                self.deny(command)
+        for command in ("trap -l; cat $(pwd)/notes.md", "trap - EXIT; cat $(pwd)/notes.md"):
+            with self.subTest(command):
+                self.allow(command)
 
     def test_known_filters_that_read_stdin_as_data_are_receivers(self):
         """`rg` (only with `--no-config` and options that select and print) and the coreutils checksum programs read what is piped

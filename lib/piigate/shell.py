@@ -571,7 +571,7 @@ def _expansion_seg(p: dict, kinds: set[str], quoted: bool) -> tuple[str, tuple]:
     """(text, seg) of one expansion part of a word; `kinds` gets what it reads."""
     if _need(p, "Type") == "CmdSubst" and _is_plain_pwd(p):
         # `$(pwd)` is the directory the command runs in, the same value as `$PWD` — unless the line redefines `pwd` or `PWD`
-        # (the gate refuses a word of this kind then: `pwd_substitution_rebound`)
+        # (the gate refuses a word of this kind then: `substituted-operand`)
         kinds.update({"param", "pwdsub"})
         text = _slice(p) or "$(pwd)"
         return text, ("var", "PWD", quoted, text)
@@ -1000,6 +1000,10 @@ def may_define_code(calls) -> bool:
             name = os.path.basename(words[0].text) if words and words[0].static else ""
         if name in CODE_DEFINERS:
             return True
+        if name == "trap":  # the body runs later, in this shell: it may define any function or alias (static or not)
+            body = next((w for w in words[1:] if not (w.static and w.text.startswith("-") and len(w.text) > 1)), None)
+            if body is not None and not (body.static and body.text in ("", "-")):
+                return True
         if name == "eval" and (c.opaque_code or not all(w.static for w in words[1:])):
             return True
         if name in DECLARATIONS:
@@ -1507,6 +1511,8 @@ class _Walker:
         inner = _Walker(self.session, self.depth + 1, self.dialect, self.model)
         if in_this_shell:  # `eval` runs in this shell: it knows the functions (and the arguments) of the line
             inner.functions, inner.positional = self.functions, self.positional
+        elif origin == "trap":  # a trap runs in this shell too: the functions it defines are the line's functions
+            inner.functions = self.functions
         inner.dry = self.dry
         saved_src, _SRC = _SRC, text.encode("utf-8", "surrogateescape")
         try:
