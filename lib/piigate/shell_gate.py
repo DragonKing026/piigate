@@ -16,6 +16,7 @@ a `QuotedToken`. Nested commands follow the command that contains them, after th
 
 from __future__ import annotations
 
+import glob
 import os
 import re
 from dataclasses import dataclass, field
@@ -585,7 +586,9 @@ class AstGate(gate.Gate):
             p = gate._path(k, self.cwd)
             if not p.casefold().endswith(self.extensions):
                 continue
-            pattern = bool(re.search(r"[*?\[]", k))
+            # a pattern that matches files NOW (also as the value of a loop variable, quoted in the body): each match is judged by its
+            # content. A pattern that matches nothing is a file that does not exist yet: the old rule stays.
+            pattern = bool(re.search(r"[*?\[]", k)) and bool(glob.glob(p))
             if p in self._written or (not pattern and not os.path.exists(p) and len(self._appears.get(p, ())) >= 2):
                 return self._note(
                     "extension", p, "a data file that an earlier stage of this command writes — its content cannot be checked before it runs"

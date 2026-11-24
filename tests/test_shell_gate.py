@@ -2147,6 +2147,9 @@ class TestRound8(Base):
             "curl -s https://example.test/e -o out.csv; for f in out.csv; do cat \"$f\"; done",
             "curl -s https://example.test/e -o out.csv; cat out.csv", "curl -s https://example.test/e > out.csv; cat out.csv",
             'f=out.csv; curl -s https://example.test/e -o "$f"; cat "$f"',
+            # a pattern that matches nothing is a file that does not exist yet
+            "python3 gen.py 'new*.csv' && cat 'new*.csv'", "python3 gen.py 'new[1].csv' && cat 'new[1].csv'",
+            "python3 gen.py new*.csv && cat new*.csv", 'for f in new*.csv; do python3 gen.py "$f"; cat "$f"; done',
         ):
             with self.subTest(command):
                 self.deny(command)
