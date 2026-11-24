@@ -72,7 +72,7 @@ CREATE_FLAGS = {
 # an option makes it no filter. A program of the list without an entry here has no option that runs anything (grep, cat, wc…).
 STDIN_DATA = shell.DATA_ONLY | {
     "sort", "tee", "less", "more", "tac", "pr", "fmt", "expand", "unexpand", "diff", "cmp", "comm", "jq", "gojq", "sed",
-    "awk", "gawk", "mawk", "piigate", "pbcopy", "wl-copy", "xclip", "xsel", "rg", "bat", "shasum", "sha224sum", "sha384sum",
+    "awk", "gawk", "mawk", "piigate", "pbcopy", "wl-copy", "xclip", "xsel", "rg", "sha224sum", "sha384sum",
 }
 # name -> (short flags, short options with a value, long flags, long options with the number of words they take)
 _JQ_OPTIONS = ("rcsnCMSaejR", "", frozenset({
@@ -92,8 +92,9 @@ FILTER_OPTIONS = {
     "awk": ("", "Fv", frozenset(), {}),
     "gawk": ("", "Fv", frozenset(), {}),
     "mawk": ("", "Fv", frozenset(), {}),
-    # ripgrep: only options that select and print; not `--pre` / `--pre-glob` / `--hostname-bin` (run a program), `-z` (runs a decompressor),
-    # `-f` / `--file` (reads a file of patterns), `--config-path`
+    # ripgrep: only options that select and print, and `--no-config` is REQUIRED (see `_stdin_refusal`): ripgrep takes more options,
+    # `--pre` among them, from the file named by RIPGREP_CONFIG_PATH, and that file may have been written by an earlier call. Not
+    # `--pre` / `--pre-glob` / `--hostname-bin` (run a program), `-z` (a decompressor), `-f` / `--file` (a file of patterns)
     "rg": ("iSsnNvwxcoFIHhlLqUauPbp0", "emABCgtTrMdE", frozenset({
         "--ignore-case", "--smart-case", "--case-sensitive", "--line-number", "--no-line-number", "--invert-match", "--word-regexp",
         "--line-regexp", "--count", "--only-matching", "--fixed-strings", "--no-filename", "--with-filename", "--files-with-matches",
@@ -102,13 +103,6 @@ FILTER_OPTIONS = {
     }), {
         "--regexp": 1, "--max-count": 1, "--after-context": 1, "--before-context": 1, "--context": 1, "--glob": 1, "--type": 1,
         "--type-not": 1, "--replace": 1, "--max-columns": 1, "--color": 1, "--max-depth": 1,
-    }),
-    # bat: only what displays; not `--pager` (runs a program), `--config-file`, `--diff`
-    "bat": ("pPnAfuUhV", "lrHm", frozenset({
-        "--plain", "--number", "--show-all", "--force-colorization", "--no-paging", "--unbuffered",
-    }), {
-        "--language": 1, "--line-range": 1, "--highlight-line": 1, "--color": 1, "--style": 1, "--paging": 1, "--decorations": 1,
-        "--theme": 1, "--wrap": 1, "--tabs": 1, "--terminal-width": 1,
     }),
     "less": ("NSRrFXiIqQsnwJ", "", frozenset(), {}),
     "more": ("", "", frozenset(), {}),
@@ -139,7 +133,7 @@ PYTHON_PLAIN_FLAGS = {"-u", "-B", "-O", "-OO", "-q", "-I", "-s", "-S", "-E"}  # 
 HARMLESS_ASSIGNMENTS = {"LC_ALL", "LANG", "TZ"}
 # names that, assigned or exported ANYWHERE in the line, change what a data receiver (git, gh, kubectl, openssl) starts
 RECEIVER_ENVIRONMENT = re.compile(
-    r"(?:GIT|GH|KUBE|OPENSSL|LD|MYSQL|NODE)_\w*|PG\w*|PYTHON\w*|PERL5\w*|RUBY\w*|LESS\w*|AWK\w*|HOME|XDG_CONFIG_HOME|PSQLRC|"
+    r"(?:GIT|GH|KUBE|OPENSSL|LD|MYSQL|NODE)_\w*|PG\w*|PYTHON\w*|PERL5\w*|RUBY\w*|LESS\w*|AWK\w*|RIPGREP\w*|BAT\w*|HOME|XDG_CONFIG_HOME|PSQLRC|"
     r"EDITOR|VISUAL|PAGER|BROWSER|PATH|BASH_ENV|ENV|KUBECONFIG"
 )
 NESTED_UNKNOWN = SUBSTITUTION_ORIGINS + ("-c", "eval")  # a call there has arguments the old gate reports as None
@@ -971,6 +965,8 @@ class AstGate(gate.Gate):
         if scanned is None:
             return "filter-options"
         operands, values = scanned
+        if name == "rg" and not any(w.static and w.text == "--no-config" for w in args):
+            return "filter-options"  # the options of rg also come from a file nobody on this line can see
         if name in ("less", "more") and any(o.startswith("+") for o in operands):
             return "pager-command"  # `less +!cmd`: an operand that starts with `+` is a command of the pager
         if name == "sed":
