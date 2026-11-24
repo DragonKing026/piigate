@@ -2316,14 +2316,21 @@ class TestRound9(Base):
             'nohup ln -s x z.csv; for f in *.csv; do cat "$f"; done', 'timeout 5 ln -s x z.csv; for f in *.csv; do cat "$f"; done',
             'source ./f.sh; for f in *.csv; do cat "$f"; done', '. ./f.sh; for f in *.csv; do cat "$f"; done',
             'exec ln -s x z.csv; for f in *.csv; do cat "$f"; done', 'prog; for f in *.csv; do cat "$f"; done',
-            'for f in *.csv; do git -C d status; git commit -a; done', 'for f in *.csv; do python3 -m pip install x; done',
+            # bash evaluates `$(…)` in an array subscript given to these builtins
+            "for f in *.md; do let 'a[$(ln -s ../Sensitive-data/people.csv z.csv)]=1'; done; for g in *.csv; do cat \"$g\"; done",
+            "for f in *.md; do read 'a[$(ln -s ../Sensitive-data/people.csv z.csv)]' <<< 1; done; for g in *.csv; do cat \"$g\"; done",
+            "for f in *.md; do printf -v 'a[$(ln -s ../Sensitive-data/people.csv z.csv)]' x; done; for g in *.csv; do cat \"$g\"; done",
+            "for f in *.md; do [[ 'a[$(ln -s ../Sensitive-data/people.csv z.csv)]' -eq 1 ]]; done; for g in *.csv; do cat \"$g\"; done",
+            "for f in *.md; do [ -v 'a[$(ln -s ../Sensitive-data/people.csv z.csv)]' ]; done; for g in *.csv; do cat \"$g\"; done",
+            "for f in *.md; do test -v 'a[$(ln -s ../Sensitive-data/people.csv z.csv)]'; done; for g in *.csv; do cat \"$g\"; done",
+            'for f in *.csv; do [ -f "$x" ] && echo y; done', 'for f in *.csv; do git -C d status; git commit -a; done', 'for f in *.csv; do python3 -m pip install x; done',
         ):
             with self.subTest(command):
                 self.deny(command)
         for command in (
             'for f in *.csv; do wc -l "$f"; done', 'for f in *.csv; do echo "$f"; done', 'for f in *.csv; do head -2 "$f" 2>/dev/null; done',
             "for f in *.csv; do basename $f .csv; done", 'for f in *.csv; do cat "$f" | wc -l; done', 'for f in a b; do touch "$f"; done',
-            "for f in *.csv; do [ -f \"$f\" ] && echo y; done", "for f in *.md; do sed -i 's/a/b/' \"$f\"; done",
+            "for f in *.csv; do [ -f x.csv ] && echo y; done", "for f in *.csv; do printf '%s\\n' \"$f\"; done", "for f in *.md; do sed -i 's/a/b/' \"$f\"; done",
             'for f in *.py; do python3 -m py_compile "$f"; done', 'for f in *.json; do python3 -m json.tool "$f"; done',
             'for d in x*/; do (cd "$d" && git status -s); done', 'for f in *.sh; do shellcheck "$f"; done',
             'for f in *.md; do rg foo "$f"; done', "for f in *.md; do sed -n '1,3p' \"$f\"; done",

@@ -147,12 +147,14 @@ CD_MATCHES = 64  # directories a `cd PATTERN` is followed into
 CHECKSUM_PROGRAMS = {"md5sum", "sha1sum", "sha224sum", "sha256sum", "sha384sum", "sha512sum", "b2sum", "cksum"}
 # In a line with a loop over a glob (sensitive source configured) EVERY call must be on this list, or the line is refused: the pattern
 # is expanded when the line RUNS, so a file that any other command makes (directly, behind a wrapper, a launcher, `find -exec`, `xargs`,
-# `eval`, an interpreter, `awk`, a downloader, an archiver…) can be what it matches. A program is listed only when nothing it does with
-# the options the line gives it writes a file or runs a command; the ones with such an option have their options checked below.
+# `eval`, an interpreter, `awk`, a downloader, an archiver…) can be what it matches. A program is listed only when the options and
+# operands the line gives it cannot write a file or run a command; those with such an option or operand have them checked below.
+# Not listed: `let`, `read`, `[[` (bash evaluates `$(…)` in an array subscript they are given); `[` / `test` and `printf -v` only
+# without a built word.
 GLOB_LOOP_PROGRAMS = {
     "echo", "printf", "cat", "head", "tail", "wc", "grep", "egrep", "fgrep", "rg", "basename", "dirname", "ls", "stat", "file", "sort",
-    "uniq", "cut", "tr", "test", "[", "[[", "true", "false", ":", "pwd", "date", "read", "shift", "jq", "yq", "diff", "cmp", "du",
-    "realpath", "readlink", "nl", "column", "seq", "cd", "pushd", "popd", "break", "continue", "exit", "return", "let", "expr", "sed",
+    "uniq", "cut", "tr", "test", "[", "true", "false", ":", "pwd", "date", "shift", "jq", "yq", "diff", "cmp", "du",
+    "realpath", "readlink", "nl", "column", "seq", "cd", "pushd", "popd", "break", "continue", "exit", "return", "expr", "sed",
     "shellcheck", "ruff", "git", "python", "python3", *CHECKSUM_PROGRAMS,
 }
 GLOB_LOOP_GIT = {"status", "diff", "log", "show", "ls-files", "blame", "rev-parse"}
@@ -1717,6 +1719,10 @@ class Gate:
         if base not in GLOB_LOOP_PROGRAMS:
             return False
         args = [str(t) for t in st[1:]]
+        if base in ("[", "test"):  # a word with `$`, a backtick or a `[` inside may be an array subscript that bash evaluates
+            return not any(a not in ("[", "]") and re.search(r"[$`\[]", a) for a in args)
+        if base == "printf":
+            return not any(a.startswith("-v") for a in args)
         if base == "sed":
             return Gate._sed_ok(args)
         if base == "git":
