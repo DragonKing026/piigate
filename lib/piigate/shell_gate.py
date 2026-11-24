@@ -545,8 +545,11 @@ class AstGate(gate.Gate):
         )
         if "autoload" in names and fpath:
             return "zsh `autoload` together with `fpath`: the body of the function comes from a file the line does not hold", "autoload-fpath"
+        pwd_rebound = self._pwd_rebound(calls)
         for c in calls:
             for w in self._words(c):
+                if "pwdsub" in w.kinds and pwd_rebound:
+                    return "`$(pwd)` in a line that redefines `pwd` or `PWD` (a function, an alias, an assignment)", "substituted-operand"
                 if "zsh-code" in w.kinds:
                     return "a zsh glob qualifier or parameter flag that may run code (`(e…)`, `(+…)`, `(#q…)`, `${(e)x}`)", "zsh-code"
                 if "exec" in w.kinds:
@@ -561,6 +564,21 @@ class AstGate(gate.Gate):
             if c.name == "print" and any(re.match(r"-[A-Za-z]*P", w.text) for w in c.argv[1:] if w.static):
                 return "`print -P`: prompt expansion runs `$(…)` found in its arguments", "print-prompt"
         return None
+
+    def _pwd_rebound(self, calls: list) -> bool:
+        """Does the line redefine what `$(pwd)` prints — a function or an alias or a builtin switch named for it, or any way of
+        assigning `PWD`? The model reads `$(pwd)` as `$PWD`; that is only true while nothing changes either."""
+        if self._current is not None and "pwd" in self._current.functions:
+            return True
+        model = self._model
+        if model is not None and ("PWD" in model.sites or "PWD" in model.unknown):
+            return True
+        for c in calls:
+            if c.name in ("alias", "enable", "disable", "hash", "unhash", "unalias") or any(a.name == "PWD" for a in c.assigns):
+                return True
+            if any(w.static and re.fullmatch(r"PWD(=.*)?", w.text) for w in c.argv[1:]):
+                return True
+        return False
 
     # ------------------------------------------------------------------------------------------------ entry
 

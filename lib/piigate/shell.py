@@ -618,8 +618,27 @@ def _apply_spec(spec, value: str) -> str | None:
 _PLAIN_PARAM_KEYS = {"Type", "Short", "Param", "Pos", "End", "Dollar", "Rbrace", "Position", "ValuePos", "ValueEnd"}
 
 
+def _is_plain_pwd(p: dict) -> bool:
+    """`$(pwd)` / `` `pwd` ``: one command `pwd` with no argument, no redirection, no assignment, nothing around it."""
+    stmts = p.get("Stmts") or []
+    if len(stmts) != 1 or p.get("Last") or stmts[0].get("Negated") or stmts[0].get("Background") or stmts[0].get("Redirs"):
+        return False
+    cmd = stmts[0].get("Cmd") or {}
+    args = cmd.get("Args") or []
+    return (
+        cmd.get("Type") == "CallExpr" and not cmd.get("Assigns") and len(args) == 1
+        and [(x.get("Type"), x.get("Value")) for x in args[0].get("Parts") or []] == [("Lit", "pwd")]
+    )
+
+
 def _expansion_seg(p: dict, kinds: set[str], quoted: bool) -> tuple[str, tuple]:
     """(text, seg) of one expansion part of a word; `kinds` gets what it reads."""
+    if _need(p, "Type") == "CmdSubst" and _is_plain_pwd(p):
+        # `$(pwd)` is the directory the command runs in, the same value as `$PWD` — unless the line redefines `pwd` or `PWD`
+        # (the gate refuses a word of this kind then: `pwd_substitution_rebound`)
+        kinds.update({"param", "pwdsub"})
+        text = _slice(p) or "$(pwd)"
+        return text, ("var", "PWD", quoted, text)
     if _need(p, "Type") == "ParamExp" and p.keys() <= _PLAIN_PARAM_KEYS:
         name = _text(p.get("Param") or {})
         text = _expansion_text(p, kinds)

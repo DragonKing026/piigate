@@ -412,7 +412,7 @@ class TestRound5(Base):
     def test_unknown_values_are_text_and_nothing_is_replaced_by_a_letter(self):
         for command, expected in (
             ("cat $USER", ["cat", "$USER"]), ("cat ${USER/*/P}", ["cat", "${USER/*/P}"]), ("cat ${USER:-x}y", ["cat", "${USER:-x}y"]),
-            ("cat $(pwd)/x", ["cat", "$", "(", "pwd", ")", "/x"]), ("cat $PATH", ["cat", "$PATH"]), ("pwd() { echo x; }; cat $(pwd)", None),
+            ("cat $(pwd)/x", ["cat", f"{self.work}/x"]), ("cat $PATH", ["cat", "$PATH"]), ("pwd() { echo x; }; cat $(pwd)", None),
         ):
             g = self.ast()
             g.bash(command)
@@ -2022,6 +2022,25 @@ class TestRound8(Base):
             "ls *(e:'echo hi':)", "ls *(.e:'echo hi':)", "ls *(oe:'echo hi':)", "ls *(o+f)", "ls *(+f)", "ls *(.+f)",
             "ls *(f:u+r:e:'echo hi':)", "ls *(f:u+r:+f)", "ls *(L+e:'x':)", "ls *(#q.)", "ls *(m+f)", "ls *(e:\"echo $x\":)", "ls *(e:'a|b':)", "ls *(e:\"a|b\":)",
             "ls *(Lk+1e:'x':)", "ls *(N,e:'x':)", "ls *([1,2]e:'x':)", "ls *(u:root:e:'x':)", "ls *(e:'a':^e:'b':)",
+        ):
+            with self.subTest(command):
+                self.deny(command)
+
+    def test_pwd_substitution_is_the_directory_like_pwd(self):
+        """`$(pwd)` in an operand is `$PWD` (the directory the command runs in), not a path nobody can see."""
+        for command in (
+            'cat $(pwd)/notes.md', 'cat "$(pwd)/notes.md"', 'cat `pwd`/notes.md', 'grep foo $(pwd)/src', 'cd .. && cat $(pwd)/work/notes.md',
+            'd=$(pwd); cat "$d/notes.md"',
+        ):
+            with self.subTest(command):
+                self.allow(command)
+        for command in (
+            "cd ../Sensitive-data && cat $(pwd)/people.csv", "cat $(pwd)/../Sensitive-data/people.csv",
+            "cat \"$(pwd)/../Sensitive-data/people.csv\"", "cd ../Sensitive-data; cat `pwd`/people.csv",
+            "pwd() { echo ../Sensitive-data; }; cat $(pwd)/people.csv", "alias pwd='echo ../Sensitive-data'; cat $(pwd)/people.csv",
+            "PWD=../Sensitive-data; cat $(pwd)/people.csv", "export PWD=../Sensitive-data; cat $(pwd)/people.csv",
+            "cat $(pwd -P)/notes.md", "cat $(pwd; echo x)/notes.md", "cat $(pwd | cat)/notes.md", "cat $(pwd >/dev/null)/notes.md",
+            "cat $(cd ../Sensitive-data; pwd)/people.csv",
         ):
             with self.subTest(command):
                 self.deny(command)
