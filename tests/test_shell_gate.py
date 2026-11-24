@@ -2147,11 +2147,10 @@ class TestRound8(Base):
             with self.subTest(command):
                 self.deny(command)
 
-    def test_a_glob_loop_gets_no_relief_from_the_pending_write_rule(self):
-        """The line may create or replace a file that the pattern matches (a link to a sensitive file, `touch z.csv`): a loop over a
-        data-file pattern is refused like the old gate refuses it."""
+    def test_a_glob_loop_is_refused_when_the_line_may_create_the_files_it_matches(self):
+        """The line may create or replace a file that the pattern matches (a link to a sensitive file, `touch z.csv`): such a loop is
+        refused. A loop of plain readers passes in both gates (see TestRound9)."""
         for command in (
-            'for f in *.csv; do echo "$f"; done', 'for f in *.csv; do wc -l "$f"; done',
             'ln -s "$(echo ln)/people.csv" z.csv; for f in *.csv; do cat "$f"; done',
             'for f in *.csv; do ln -sf ../Sensitive-data/people.csv "$f"; cat "$f"; done', 'touch z.csv; for f in *.csv; do cat "$f"; done',
             "curl -s https://example.test/e -o out.csv; cat out.csv", "python3 gen.py 'new*.csv' && cat 'new*.csv'",
@@ -2274,24 +2273,38 @@ class TestRound9(Base):
             'ln -s "$(echo ln)/people.csv" z.csv; for f in *.csv; do cat "$f"; done',
             'for f in *.csv; do ln -sf ../Sensitive-data/people.csv "$f"; cat "$f"; done', 'touch z.csv; for f in *.csv; do cat "$f"; done',
             'cp a z.csv; for f in *.csv; do cat "$f"; done', 'mv a z.csv; for f in *.csv; do cat "$f"; done',
-            'install a z.csv; for f in *.csv; do cat "$f"; done', 'echo x | tee z.csv; for f in *.csv; do cat "$f"; done',
-            'rsync a z.csv; for f in *.csv; do cat "$f"; done', 'tar xf a.tar; for f in *.csv; do cat "$f"; done',
-            'unzip a.zip; for f in *.csv; do cat "$f"; done', 'echo x > z.csv; for f in *.csv; do cat "$f"; done',
-            'echo x >z.csv; for f in *.csv; do cat "$f"; done', 'echo x &>z.csv; for f in *.csv; do cat "$f"; done',
-            'python3 gen.py; for f in *.csv; do cat "$f"; done', 'prog; for f in *.csv; do cat "$f"; done',
-            'for f in *.csv; do cat "$f"; done > out.txt', 'for f in *.csv; do cat "$f" >> out.txt; done',
-            '$c; for f in *.csv; do cat "$f"; done',
+            'rename a z z.csv; for f in *.csv; do cat "$f"; done', 'install a z.csv; for f in *.csv; do cat "$f"; done',
+            'mkfifo z.csv; for f in *.csv; do cat "$f"; done', 'echo x | tee z.csv; for f in *.csv; do cat "$f"; done',
+            'rsync a z.csv; for f in *.csv; do cat "$f"; done', 'scp h:a z.csv; for f in *.csv; do cat "$f"; done',
+            'tar xf a.tar; for f in *.csv; do cat "$f"; done', 'unzip a.zip; for f in *.csv; do cat "$f"; done',
+            '7z x a.7z; for f in *.csv; do cat "$f"; done', 'gunzip a.gz; for f in *.csv; do cat "$f"; done',
+            'gzip -d a.gz; for f in *.csv; do cat "$f"; done', 'zcat a.gz > z.csv; for f in *.csv; do cat "$f"; done',
+            'dd if=a of=z.csv; for f in *.csv; do cat "$f"; done', 'ditto a z.csv; for f in *.csv; do cat "$f"; done',
+            'curl -o z.csv https://example.test/e; for f in *.csv; do cat "$f"; done', 'curl https://example.test/e; for f in *.csv; do cat "$f"; done',
+            'wget https://example.test/e; for f in *.csv; do cat "$f"; done',
+            'git checkout x; for f in *.csv; do cat "$f"; done', 'git -C d restore .; for f in *.csv; do cat "$f"; done',
+            'git stash pop; for f in *.csv; do cat "$f"; done', 'git pull; for f in *.csv; do cat "$f"; done',
+            'python3 gen.py && for f in *.csv; do cat "$f"; done', "python3 -c 'x' ; for f in *.csv; do cat \"$f\"; done",
+            'node gen.js; for f in *.csv; do cat "$f"; done', 'bash gen.sh; for f in *.csv; do cat "$f"; done',
+            'make; for f in *.csv; do cat "$f"; done', 'npm run gen; for f in *.csv; do cat "$f"; done',
+            'echo x > z.csv; for f in *.csv; do cat "$f"; done', 'echo x >z.csv; for f in *.csv; do cat "$f"; done',
+            'echo x &>z.csv; for f in *.csv; do cat "$f"; done', 'for f in *.csv; do cat "$f"; done > out.txt',
+            'for f in *.csv; do cat "$f" >> out.txt; done', '$c; for f in *.csv; do cat "$f"; done',
+            'f() { ln -s x z.csv; }; f; for g in *.csv; do cat "$g"; done', 'alias a=ln; a -s x z.csv; for g in *.csv; do cat "$g"; done',
+            'for f in *.csv; do $cmd "$f"; done',
         ):
             with self.subTest(command):
                 self.deny(command)
         for command in (
             'for f in *.csv; do wc -l "$f"; done', 'for f in *.csv; do echo "$f"; done', 'for f in *.csv; do head -2 "$f" 2>/dev/null; done',
             "for f in *.csv; do basename $f .csv; done", 'for f in *.csv; do cat "$f" | wc -l; done', 'for f in a b; do touch "$f"; done',
-            "for f in *.csv; do [ -f \"$f\" ] && echo y; done",
+            "for f in *.csv; do [ -f \"$f\" ] && echo y; done", "for f in *.md; do sed -i 's/a/b/' \"$f\"; done",
+            'for f in *.py; do python3 -m py_compile "$f"; done', 'for f in *.json; do python3 -m json.tool "$f"; done',
+            'for d in x*/; do (cd "$d" && git status -s); done', 'for f in *.sh; do shellcheck "$f"; done',
+            'for f in *.png; do convert "$f" "${f%.png}.jpg"; done', 'for f in *.md; do rg foo "$f"; done',
         ):
             with self.subTest(command):
-                # the decision of `Gate` (a loop of readers is judged as before); `AstGate` keeps its own refusal of a pattern named twice
-                self.assertIsNone(gate.Gate.bash(self.old(), command, True), command)
+                self.allow(command)
 
 
 if __name__ == "__main__":

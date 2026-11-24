@@ -585,6 +585,22 @@ class AstGate(gate.Gate):
                 return "`print -P`: prompt expansion runs `$(…)` found in its arguments", "print-prompt"
         return None
 
+    def _pending_write(self, t: str) -> tuple[str, str] | None:
+        """The old rule, except that in a line with a `for` loop over a glob a PATTERN is no data file that does not exist yet: the
+        tree gate puts the value of the loop variable back into the body, so the pattern is named in two stages. What such a line may
+        create is `Gate._glob_loop_writes`' business (it refuses the line before this runs); a file the line writes (`-o out.csv`,
+        `> out.csv`) is still refused here."""
+        for k in dict.fromkeys((t, t.split("=", 1)[-1])):
+            p = gate._path(k, self.cwd)
+            if not p.casefold().endswith(self.extensions):
+                continue
+            pattern = self._glob_loop and bool(re.search(r"[*?\[]", k))
+            if p in self._written or (not pattern and not os.path.exists(p) and len(self._appears.get(p, ())) >= 2):
+                return self._note(
+                    "extension", p, "a data file that an earlier stage of this command writes — its content cannot be checked before it runs"
+                )
+        return None
+
     def _pwd_rebound(self, calls: list) -> bool:
         """Does the line redefine what `$(pwd)` prints: a function named `pwd`, any way of assigning `PWD`, or code the model cannot
         see (`shell.may_define_code`)? The model reads `$(pwd)` as `$PWD`; that is only true while nothing changes either."""

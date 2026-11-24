@@ -145,14 +145,14 @@ ZSH_FLAGS = re.compile(r"\$\{[#^~=+]*\(([^)]*)\)")  # `${(flags)name}`
 ZSH_QUALIFIER = re.compile(r"\((?:#q|[^()\s|]*?(?:e[^\w|)\s(]|\+[A-Za-z_]))")
 CD_MATCHES = 64  # directories a `cd PATTERN` is followed into
 CHECKSUM_PROGRAMS = {"md5sum", "sha1sum", "sha224sum", "sha256sum", "sha384sum", "sha512sum", "b2sum", "cksum"}
-# the commands of a line with a loop over a glob that create nothing: any other command (a link, a copy, an interpreter, a program
-# nobody knows) or a redirection to a file may create or replace a file that the pattern then matches (checked at run time, not now)
-GLOB_LOOP_READERS = {
-    "echo", "printf", "cat", "head", "tail", "wc", "grep", "egrep", "fgrep", "rg", "basename", "dirname", "ls", "stat", "file", "sort",
-    "uniq", "cut", "tr", "test", "[", "[[", "true", "false", ":", "pwd", "date", "read", "shift", "jq", "diff", "cmp", "du", "realpath",
-    "readlink", "nl", "column", "seq", "cd", "break", "continue", "exit", "return", "set", "export", "unset", "local", "let", "expr",
-    *CHECKSUM_PROGRAMS,
+# commands that can create or replace a file, in a line with a loop over a glob: the pattern is expanded when the line RUNS, so a file
+# they make can be what it matches
+GLOB_LOOP_CREATORS = {
+    "ln", "cp", "mv", "rename", "touch", "install", "mkfifo", "mknod", "tee", "rsync", "scp", "tar", "unzip", "7z", "7za", "7zr",
+    "gunzip", "gzip", "ditto", "dd", "curl", "wget", "make", "npm", "npx", "pnpm", "yarn", "uv", "alias", "unalias", "function",
 }
+GLOB_LOOP_GIT = {"checkout", "restore", "switch", "reset", "stash", "apply", "am", "pull", "clone", "worktree"}
+GLOB_LOOP_INTERPRETERS = re.compile(r"(?:python[\d.]*|node|nodejs|perl|ruby|php|sh|bash|zsh|dash|ksh)")
 # what a `trap` body must not hold: a definition of a function, an alias or any other code (the body runs later, in this shell)
 TRAP_DEFINES = re.compile(
     r"\w\s*\(\s*\)|\bfunction\b|\b(?:alias|unalias|functions|aliases|galiases|saliases|eval|source|autoload|emulate|enable|disable|hash|"
@@ -1585,6 +1585,8 @@ class Gate:
             i += 1
         return "".join(result)
 
+    _glob_loop = False  # the last line judged has a `for` loop over a glob (set by `_glob_loop_writes`)
+
     @staticmethod
     def _simple_stages(tokens: list[str]) -> list[list[str]]:
         """The simple commands of a token list: split at the operators, the leading keywords and assignments dropped."""
@@ -1636,11 +1638,10 @@ class Gate:
         return None
 
     def _glob_loop_writes(self, tokens: list[str]) -> Reason | None:
-        """A `for` loop over a glob in a line that may create or replace files (a link, a copy, `touch`, a redirection, an interpreter,
-        a program nobody knows): the pattern is expanded when the line RUNS, so a file it makes can be the sensitive one and the gate
-        judged the files that existed before. Only with a sensitive source configured. A loop in a line of readers is judged as before."""
-        if not (self.sensitive or self.project_sensitive or self.sensitive_name):
-            return None
+        """A `for` loop over a glob, with a sensitive source configured, in a line that may create or replace a file: a link, a copy,
+        `touch`, a download, an archive, `git checkout`, an interpreter that runs code, a redirection to a file, a command whose name
+        nobody can read, a function or an alias. The pattern is expanded when the line RUNS, so such a file can be what it matches
+        and the gate judged only the files that existed before. `sed -i`, `shellcheck`, `git status` and readers pass."""
         globbed = False
         i = 0
         while i < len(tokens):
@@ -1652,23 +1653,44 @@ class Gate:
                     j += 1
                 i = j
             i += 1
-        if not globbed:
+        self._glob_loop = globbed
+        if not globbed or not (self.sensitive or self.project_sensitive or self.sensitive_name):
             return None
-        writes = any(
+        creates = any(
             (re.fullmatch(r"\d*(?:>>?|>\|)|&>>?", t) and k + 1 < len(tokens) and not str(tokens[k + 1]).startswith(("/dev/", "&")))
             or re.match(r"\d*(?:>>?|>\|)(?!&)[^>\s]", t) and not t.lstrip("0123456789>|").startswith("/dev/")
             or re.match(r"&>>?[^>\s]", t)
             for k, t in enumerate(tokens)
             if not isinstance(t, QuotedToken)
-        )
-        if writes or any(Path(st[0]).name not in GLOB_LOOP_READERS or isinstance(st[0], QuotedToken) for st in self._simple_stages(tokens)):
+        ) or any(tokens[k + 1 : k + 3] == ["(", ")"] or tokens[k] == "function" for k in range(len(tokens)))
+        if not creates:
+            creates = any(self._may_create_files(st) for st in self._simple_stages(tokens))
+        if creates:
             return Reason(
                 "piigate: command denied — a loop over a glob in a line that may create or replace files (a link, a copy, `touch`, a "
-                "redirection, an interpreter, a program the gate does not know): the pattern is expanded when the line runs, not "
-                f"now. {HINT}",
+                "download, an archive, `git checkout`, an interpreter that runs code, a redirection, a function or an alias, a "
+                f"command whose name is built): the pattern is expanded when the line runs, not now. {HINT}",
                 "glob-loop-writes",
             )
         return None
+
+    @staticmethod
+    def _may_create_files(st: list[str]) -> bool:
+        name = str(st[0])
+        if isinstance(st[0], QuotedToken) and ("$" in name or "`" in name) or "$" in name or "`" in name:
+            return True
+        base = Path(name).name
+        args = [str(t) for t in st[1:]]
+        if base in GLOB_LOOP_CREATORS:
+            return True
+        if base == "git":
+            k = 0
+            while k < len(args) and args[k].startswith("-"):
+                k += 2 if args[k] in ("-C", "-c") else 1
+            return k < len(args) and args[k] in GLOB_LOOP_GIT
+        if GLOB_LOOP_INTERPRETERS.fullmatch(base):
+            return not (base.startswith("python") and args[:2] in (["-m", "py_compile"], ["-m", "json.tool"]))
+        return False
 
     @staticmethod
     def _spelled_qualifier(text: str, i: int) -> bool:
