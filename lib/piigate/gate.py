@@ -149,10 +149,10 @@ CHECKSUM_PROGRAMS = {"md5sum", "sha1sum", "sha224sum", "sha256sum", "sha384sum",
 # is expanded when the line RUNS, so a file that any other command makes (directly, behind a wrapper, a launcher, `find -exec`, `xargs`,
 # `eval`, an interpreter, `awk`, a downloader, an archiver…) can be what it matches. A program is listed only when the options and
 # operands the line gives it cannot write a file or run a command; those with such an option or operand have them checked below.
-# Not listed: `let`, `read`, `[[` (bash evaluates `$(…)` in an array subscript they are given); `[` / `test` and `printf -v` only
-# without a built word.
+# Not listed: `let`, `read`, `[[`, `printf` (bash evaluates `$(…)` in an array subscript they are given, `printf -v` among them, also
+# when the option itself is a built word); `[` / `test` only without a word that holds `$`, a backtick or a `[`.
 GLOB_LOOP_PROGRAMS = {
-    "echo", "printf", "cat", "head", "tail", "wc", "grep", "egrep", "fgrep", "rg", "basename", "dirname", "ls", "stat", "file", "sort",
+    "echo", "cat", "head", "tail", "wc", "grep", "egrep", "fgrep", "rg", "basename", "dirname", "ls", "stat", "file", "sort",
     "uniq", "cut", "tr", "test", "[", "true", "false", ":", "pwd", "date", "shift", "jq", "yq", "diff", "cmp", "du",
     "realpath", "readlink", "nl", "column", "seq", "cd", "pushd", "popd", "break", "continue", "exit", "return", "expr", "sed",
     "shellcheck", "ruff", "git", "python", "python3", *CHECKSUM_PROGRAMS,
@@ -1732,8 +1732,6 @@ class Gate:
         args = [str(t) for t in st[1:]]
         if base in ("[", "test"):  # a word with `$`, a backtick or a `[` inside may be an array subscript that bash evaluates
             return not any(a not in ("[", "]") and re.search(r"[$`\[]", a) for a in args)
-        if base == "printf":
-            return not any(a.startswith("-v") for a in args)
         if base == "sed":
             return Gate._sed_ok(args)
         if base == "git":
