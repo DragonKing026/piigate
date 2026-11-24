@@ -2126,6 +2126,17 @@ class TestRound8(Base):
             if suspect and not covered:
                 self.assertTrue(shell._qualifier_code(raw), raw)
 
+    def test_qualifier_spelled_by_a_quote_an_escape_or_an_expansion_is_refused(self):
+        for command in (
+            "print *($'\\145':touch\\ MARK:)", "print *($'\\x65':touch MARK:)", 'x="e:touch MARK:"; print *($x)', 'print *(${x})',
+            'print *("$x")', "print *(`echo e`:touch\\ MARK:)", "print *(\\145:touch\\ MARK:)",
+        ):
+            with self.subTest(command):
+                self.deny(command)
+        for command in ("ls *.(test|json)", "ls *(.N)", "ls *(om[1,5])", "ls *.csv(N)", "find . \\( -name x -o -name y \\)", "ls $(pwd)/*(.)"):
+            with self.subTest(command):
+                self.allow(command)
+
     def test_qualifier_forms_with_escapes_quotes_and_modes_are_refused(self):
         for command in (
             "ls *(e:touch\\ x\\;\\):)", "ls *(e(touch\\ x))", "ls *(e:\\):,e:'touch x':)", "ls *(f=644e:'echo hi':)",

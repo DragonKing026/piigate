@@ -364,10 +364,16 @@ _QUALIFIER_LIST = re.compile(r"\(" + _QUALIFIER + r"+\)")
 _QUALIFIER_ALTERNATION = re.compile(r"\([A-Za-z0-9_.*?-]*\|[A-Za-z0-9_.*?|-]*\)[^()\\\"'$`]*")
 
 
-def _qualifier_code(raw: str) -> bool:
+def _qualifier_code(raw: str, more_parts: bool = False) -> bool:
     """Does this text of a word may hold a glob qualifier that runs code? Only a group that the broad test (`_QUALIFIER_BROAD`)
     suspects is looked at; it passes only when everything from its `(` to the end of the text is a list of selecting qualifiers or a
     pattern group (the two forms above). `e:cmd:`, `+func`, `(#q`, a backslash, a quote or any form not listed is refused."""
+    for m in re.finditer(r"(?<!\\)\(", raw):
+        # a group whose letters are not in the text: a quote, an escape, a backtick or an expansion can spell the `e` (`*($'\\145':cmd:)`,
+        # `x="e:cmd:"; *($x)`), and a group that is still open where this part of the word ends goes on in a quote or an expansion
+        head, closed, _ = raw[m.start() :].partition(")")
+        if re.search(r"[\\$`'\"]", head) or (not closed and more_parts):
+            return True
     for m in re.finditer(r"\(", raw):
         if not _QUALIFIER_BROAD.match(raw, m.start()):
             continue
@@ -611,7 +617,7 @@ def _word(node: dict) -> Word:
                 # zsh only: a glob qualifier `*(.)` / `*(e:code:)` / `*(+func)` is kept by shfmt as plain text, it has no
                 # node. Whether it runs code is never read from its separators: any `e`, any `+`, any `#q` inside counts
                 kinds.add("zsh")
-                if _qualifier_code(raw):
+                if _qualifier_code(raw, i < len(node.get("Parts") or []) - 1):
                     kinds.add("zsh-code")
             if _has_glob(raw):
                 kinds.add("glob")
