@@ -1721,6 +1721,39 @@ class Gate:
         )
 
     @staticmethod
+    def _test_ok(base: str, words: list[str]) -> bool:
+        """`[` / `test` evaluate `$(…)` in an array subscript they are given with `-v` and with the arithmetic operators. Only the forms
+        `[ OP x ]`, `[ x OP y ]`, `[ ! OP x ]`, `[ ! x ]`, `[ x ]` with a file or string test (`-f`, `-d`, `-n`, `-z`…) or `= == != -nt -ot -ef` are
+        accepted. An operator is a static word; an operand is static or a double-quoted expansion (an unquoted one may split into an
+        operator and a subscript)."""
+        if base == "[":
+            if not words or str(words[-1]) != "]":
+                return False
+            words = words[:-1]
+        unary = {"-e", "-f", "-d", "-s", "-r", "-w", "-x", "-L", "-h", "-p", "-S", "-b", "-c", "-n", "-z", "-O", "-G", "-N"}
+        binary = {"=", "==", "!=", "-nt", "-ot", "-ef"}
+
+        def operand(w) -> bool:
+            t = str(w)
+            if "`" in t:
+                return False
+            return not re.search(r"[$\[]", t) or (isinstance(w, QuotedToken) and getattr(w, "quote", "") != "'" and not re.search(r"[\[`]", t))
+
+        def static(w) -> bool:
+            return not isinstance(w, QuotedToken) and not re.search(r"[$`\[]", str(w))
+
+        n = len(words)
+        if n == 1:
+            return operand(words[0])
+        if n == 2:
+            return (static(words[0]) and str(words[0]) in unary or str(words[0]) == "!" and static(words[0])) and operand(words[1])
+        if n == 3:
+            if static(words[0]) and str(words[0]) == "!":
+                return static(words[1]) and str(words[1]) in unary and operand(words[2])
+            return operand(words[0]) and static(words[1]) and str(words[1]) in binary and operand(words[2])
+        return False
+
+    @staticmethod
     def _glob_loop_call_ok(st: list[str]) -> bool:
         """Is this call on the list of programs that create nothing and run nothing (`GLOB_LOOP_PROGRAMS`), with options that keep it so?"""
         name = str(st[0])
@@ -1730,8 +1763,8 @@ class Gate:
         if base not in GLOB_LOOP_PROGRAMS:
             return False
         args = [str(t) for t in st[1:]]
-        if base in ("[", "test"):  # a word with `$`, a backtick or a `[` inside may be an array subscript that bash evaluates
-            return not any(a not in ("[", "]") and re.search(r"[$`\[]", a) for a in args)
+        if base in ("[", "test"):
+            return Gate._test_ok(base, st[1:])
         if base == "sed":
             return Gate._sed_ok(args)
         if base == "git":

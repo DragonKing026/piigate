@@ -2273,6 +2273,12 @@ class TestRound9(Base):
         self.allow('for f in *.md; do sha256sum -- "$f"; done')
         self.deny('for f in *.md; do sha256sum "$f"; done')
 
+    def test_unquoted_operand_of_a_test_in_a_glob_loop(self):
+        """`[ -f $f ]`: an unquoted expansion may split into an operator and an array subscript. `AstGate` substitutes the value it
+        knows for a loop variable (a static pattern), so only `Gate` sees the written form."""
+        self.assertIsNotNone(gate.Gate.bash(self.old(), 'for f in *.md; do [ -f $f ]; done', True))
+        self.assertIsNotNone(gate.Gate.bash(self.old(), 'for f in *.md; do [ -f $f ] && wc -l "$f"; done', True))
+
     def test_glob_loop_in_a_line_that_creates_files(self):
         for command in (
             'ln -s "$(echo ln)/people.csv" z.csv; for f in *.csv; do cat "$f"; done',
@@ -2328,7 +2334,9 @@ class TestRound9(Base):
             "o=-v; for f in *.md; do printf \"$o\" 'a[$(ln -s ../Sensitive-data/people.csv z.csv)]' x; done; for g in *.csv; do cat \"$g\"; done",
             "o=-v; for f in *.md; do printf ${o} 'a[$(ln -s ../Sensitive-data/people.csv z.csv)]' x; done; for g in *.csv; do cat \"$g\"; done",
             "for f in *.md; do printf '%s' \"$f\"; done", "for f in *.md; do [ $o 'a[$(ln -s x z.csv)]' ]; done",
-            'for f in *.csv; do [ -f "$x" ] && echo y; done', # options and environment of listed programs that write a file, load code or run a program
+            'for f in *.md; do [ -v "$f" ]; done', 'for f in *.md; do [ "$f" -eq 1 ]; done', 'for f in *.md; do [ $o "$f" ]; done',
+            'for f in *.md; do test "$o" -f x; done', 'for f in *.md; do [ -f "$f" -a -r "$f" ]; done', 'for f in *.md; do [ -f "$f"; done',
+            'for f in *.md; do [ "$f" -ne 1 ]; done', 'for f in *.md; do [ "$f" -lt 1 ]; done', 'for f in *.md; do test -v "$f"; done', # options and environment of listed programs that write a file, load code or run a program
             "for f in *.md; do sed -i.csv s/a/b/ \"$f\"; done", "for f in *.md; do sed -i'*' s/a/b/ \"$f\"; done",
             "for f in *.md; do sed --in-place=x s/a/b/ \"$f\"; done", "for f in *.md; do sed -ni s/a/b/p \"$f\"; done",
             'python3 -m json.tool a.json z.csv; for g in *.csv; do cat "$g"; done', 'python3 -m json.tool --output z.csv a.json; for g in *.csv; do cat "$g"; done',
@@ -2354,7 +2362,9 @@ class TestRound9(Base):
         for command in (
             'for f in *.csv; do wc -l "$f"; done', 'for f in *.csv; do echo "$f"; done', 'for f in *.csv; do head -2 "$f" 2>/dev/null; done',
             "for f in *.csv; do basename $f .csv; done", 'for f in *.csv; do cat "$f" | wc -l; done', 'for f in a b; do touch "$f"; done',
-            "for f in *.csv; do [ -f x.csv ] && echo y; done", "for f in *.md; do sed -i 's/a/b/' \"$f\"; done",
+            "for f in *.csv; do [ -f x.csv ] && echo y; done", 'for f in *.md; do [ -f "$f" ] && wc -l "$f"; done',
+            'for f in *.md; do test -s "$f"; done', 'for f in *.md; do [ "$f" != x.md ]; done', 'for f in *.md; do [ ! -d "$f" ]; done',
+            'for f in *.md; do [ "$f" ] && echo y; done', "for f in *.md; do sed -i 's/a/b/' \"$f\"; done",
             'for f in *.py; do python3 -m py_compile "$f"; done', 'for f in *.json; do python3 -m json.tool "$f"; done',
             'for d in x*/; do (cd "$d" && git status -s); done', 'for f in *.sh; do shellcheck "$f"; done',
             'for f in *.md; do rg foo "$f"; done', "for f in *.md; do sed -n '1,3p' \"$f\"; done",
