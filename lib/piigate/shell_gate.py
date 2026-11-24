@@ -16,7 +16,6 @@ a `QuotedToken`. Nested commands follow the command that contains them, after th
 
 from __future__ import annotations
 
-import glob
 import os
 import re
 from dataclasses import dataclass, field
@@ -576,23 +575,6 @@ class AstGate(gate.Gate):
                 return "`coproc`: a process that runs beside the line and answers through $COPROC", "coproc"
             if c.name == "print" and any(re.match(r"-[A-Za-z]*P", w.text) for w in c.argv[1:] if w.static):
                 return "`print -P`: prompt expansion runs `$(…)` found in its arguments", "print-prompt"
-        return None
-
-    def _pending_write(self, t: str) -> tuple[str, str] | None:
-        """The old rule, except that a PATTERN (`*.csv`) is no data file that does not exist yet: the tree gate puts the value of a
-        loop variable back into the body, so `for f in *.csv; do wc -l "$f"; done` names the pattern in two stages. A pattern is
-        expanded and every match judged by its content; a file the line writes (`-o out.csv`, `> out.csv`) is still refused."""
-        for k in dict.fromkeys((t, t.split("=", 1)[-1])):
-            p = gate._path(k, self.cwd)
-            if not p.casefold().endswith(self.extensions):
-                continue
-            # a pattern that matches files NOW (also as the value of a loop variable, quoted in the body): each match is judged by its
-            # content. A pattern that matches nothing is a file that does not exist yet: the old rule stays.
-            pattern = bool(re.search(r"[*?\[]", k)) and bool(glob.glob(p))
-            if p in self._written or (not pattern and not os.path.exists(p) and len(self._appears.get(p, ())) >= 2):
-                return self._note(
-                    "extension", p, "a data file that an earlier stage of this command writes — its content cannot be checked before it runs"
-                )
         return None
 
     def _pwd_rebound(self, calls: list) -> bool:
