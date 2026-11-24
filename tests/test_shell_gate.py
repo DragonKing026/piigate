@@ -2235,6 +2235,8 @@ class TestRound9(Base):
         for command in (
             "print *($'\\145':touch\\ M:)", "print *($'\\x65':touch M:)", 'x="e:touch M:"; print *($x)', 'print *("$x")', "print *(${x})",
             "print *(\\145:touch\\ M:)", "print *(`echo e`:touch M:)",
+            # an unpaired `{` is a literal in zsh: the group still ends the word
+            "print *{(e:touch M:)", "print *{(+f)", "print *{(#qe:touch M:)", "print *{($x)",
         ):
             with self.subTest(command):
                 self.deny(command)

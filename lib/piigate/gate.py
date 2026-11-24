@@ -1612,7 +1612,7 @@ class Gate:
                 if m and re.search(r"[e%]", m.group(1)):
                     return "a zsh parameter flag that runs code (`${(e)…}`, `${(%)…}`)"
             elif (
-                z == "(" and not flags and not double and i and text[i - 1] not in " \t\n;&|(<>=$`{"
+                z == "(" and not flags and not double and i and text[i - 1] not in " \t\n;&|(<>=$`" and text[i - 2 : i] != "${"
                 and (ZSH_QUALIFIER.match(text, i) or Gate._spelled_qualifier(text, i))
             ):
                 return "a zsh glob qualifier that runs code (`(e:…:)`, `(+func)`, `(#q…)`)"
@@ -1683,7 +1683,7 @@ class Gate:
             return "a zsh parameter flag that runs code (`${(e)…}`, `${(%)…}`)"
         for m in re.finditer(r"\(", text):
             i = m.start()
-            if i and text[i - 1] not in " \t\n;&|(<>=$`{\\" and (ZSH_QUALIFIER.match(text, i) or Gate._spelled_qualifier(text, i)):
+            if i and text[i - 1] not in " \t\n;&|(<>=$`\\" and text[i - 2 : i] != "${" and (ZSH_QUALIFIER.match(text, i) or Gate._spelled_qualifier(text, i)):
                 return "a zsh glob qualifier that runs code (`(e:…:)`, `(+func)`, `(#q…)`)"
         return None
 
