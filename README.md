@@ -352,6 +352,14 @@ through the full text filter.
   is checked only by the directory walk of [Using it](#using-it), which follows no symlinks, skips `.git` and
   `node_modules` and stops after three levels.
   The gate is a seat belt against mistakes and shortcuts, not a sandbox.
+  What it does not claim to stop is a command built on purpose to get past it. Classes of such commands (no recipes): a file
+  created or replaced in the same line and then read through a pattern, because a pattern is expanded when the line runs (the
+  gate refuses a loop over a glob in a line that has any call outside a short list of programs that write and run nothing,
+  but not every line shape); code that the shell evaluates in places the text does not show as code (array subscripts, glob
+  qualifiers, `trap` bodies, parameter flags); programs that load configuration, a pager, a driver or a module from the
+  working directory or the environment (git config, `LESSOPEN`, `RIPGREP_CONFIG_PATH`, jq/yq imports); and wrappers or
+  names that are built at run time. The output filter (the pseudonym map) and the password on `piigate reverse` /
+  `project approve` are what protect there.
 - **The syntax-tree front-end (shadow mode only, not the gate).** A second Bash front-end, built on the syntax tree of the
   bundled `shfmt`, judges commands next to the gate in [shadow mode](#shadow-mode); it decides nothing. It reads the
   structure of a line, not what a program does with it, so it shares the limits above and adds its own: a name that is

@@ -27,5 +27,5 @@ filter misses for formats the README lists as supported, pseudonym map or key ex
 Known limitations (see README, "Limitations") are not vulnerabilities: e.g. code that assembles a path at
 run time, deliberate obfuscation of a command (environment variables that steer a program such as `LESSOPEN`
 or `PATH`, transformed literals; the Bash gate stops accidental reads, and the output filter and the password on
-`reverse`/`project approve` cover the rest), nicknames, names written in lower case, data inside images. Reports that show a cheap way to
+`reverse`/`project approve` cover the rest), a file created or replaced in the same line and read through a pattern, code the shell evaluates in places the text does not show as code (array subscripts, glob qualifiers, `trap` bodies), programs that load configuration, a pager or modules from the working directory, nicknames, names written in lower case, data inside images. Reports that show a cheap way to
 close one of them are still welcome as regular issues.
