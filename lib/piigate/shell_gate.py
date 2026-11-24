@@ -565,6 +565,21 @@ class AstGate(gate.Gate):
                 return "`print -P`: prompt expansion runs `$(…)` found in its arguments", "print-prompt"
         return None
 
+    def _pending_write(self, t: str) -> tuple[str, str] | None:
+        """The old rule, except that a PATTERN (`*.csv`) is no data file that does not exist yet: the tree gate puts the value of a
+        loop variable back into the body, so `for f in *.csv; do wc -l "$f"; done` names the pattern in two stages. A pattern is
+        expanded and every match judged by its content; a file the line writes (`-o out.csv`, `> out.csv`) is still refused."""
+        for k in dict.fromkeys((t, t.split("=", 1)[-1])):
+            p = gate._path(k, self.cwd)
+            if not p.casefold().endswith(self.extensions):
+                continue
+            pattern = bool(re.search(r"[*?\[]", k))
+            if p in self._written or (not pattern and not os.path.exists(p) and len(self._appears.get(p, ())) >= 2):
+                return self._note(
+                    "extension", p, "a data file that an earlier stage of this command writes — its content cannot be checked before it runs"
+                )
+        return None
+
     def _pwd_rebound(self, calls: list) -> bool:
         """Does the line redefine what `$(pwd)` prints — a function or an alias or a builtin switch named for it, or any way of
         assigning `PWD`? The model reads `$(pwd)` as `$PWD`; that is only true while nothing changes either."""

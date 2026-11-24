@@ -2072,6 +2072,23 @@ class TestRound8(Base):
             with self.subTest(command):
                 self.deny(command)
 
+    def test_a_glob_loop_is_not_a_data_file_written_in_the_line(self):
+        """`for f in *.csv; do …"$f"…; done` names the PATTERN twice (in the list and, through `$f`, in the body); a pattern is no
+        data file that does not exist yet. A file that really is written and read in the line is still refused."""
+        for command in (
+            'for f in *.csv; do echo "$f"; done', 'for f in *.csv; do wc -l "$f"; done', "for f in *.csv; do basename $f .csv; done",
+            'for f in *.csv; do mv "$f" "${f%.csv}.bak"; done',
+        ):
+            with self.subTest(command):
+                self.allow(command)
+        for command in (
+            "curl -s https://example.test/e -o out.csv; for f in out.csv; do cat \"$f\"; done",
+            "curl -s https://example.test/e -o out.csv; cat out.csv", "curl -s https://example.test/e > out.csv; cat out.csv",
+            'f=out.csv; curl -s https://example.test/e -o "$f"; cat "$f"',
+        ):
+            with self.subTest(command):
+                self.deny(command)
+
 
 if __name__ == "__main__":
     unittest.main()
