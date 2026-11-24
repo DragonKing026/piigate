@@ -74,6 +74,7 @@ STDIN_DATA = shell.DATA_ONLY | {
     "sort", "tee", "less", "more", "tac", "pr", "fmt", "expand", "unexpand", "diff", "cmp", "comm", "jq", "gojq", "sed",
     "awk", "gawk", "mawk", "piigate", "pbcopy", "wl-copy", "xclip", "xsel", "rg", "sha224sum", "sha384sum",
 }
+CHECKSUM_PROGRAMS = {"md5sum", "sha1sum", "sha224sum", "sha256sum", "sha384sum", "sha512sum", "b2sum", "cksum"}
 # name -> (short flags, short options with a value, long flags, long options with the number of words they take)
 _JQ_OPTIONS = ("rcsnCMSaejR", "", frozenset({
     "--raw-output", "--compact-output", "--slurp", "--null-input", "--color-output", "--monochrome-output", "--sort-keys",
@@ -571,6 +572,13 @@ class AstGate(gate.Gate):
                         "a glob with a leading dot where `shopt` / GLOBIGNORE may change what it matches (`.*` reaching `..`)",
                         "dot-glob-shopt",
                     )
+            words = shell._effective(c.argv)
+            if words and words[0].static and os.path.basename(words[0].text) in CHECKSUM_PROGRAMS and any(
+                not w.static or re.match(r"-[^-]*c|--c", w.text) for w in words[1:]
+            ):
+                # `-c` / `--check` (abbreviated, in a group, or a word nobody can read): the text it is given, a file or stdin, is a
+                # LIST OF FILES that the program opens
+                return "a checksum program in check mode (`-c`): it opens the files its input names", "filter-options"
             if c.name == "coproc":
                 return "`coproc`: a process that runs beside the line and answers through $COPROC", "coproc"
             if c.name == "print" and any(re.match(r"-[A-Za-z]*P", w.text) for w in c.argv[1:] if w.static):

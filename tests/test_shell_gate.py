@@ -2170,6 +2170,17 @@ class TestRound8(Base):
             with self.subTest(command):
                 self.allow(command)
 
+    def test_checksum_programs_do_not_read_a_list_of_files_from_stdin(self):
+        for name in ("md5sum", "sha1sum", "sha224sum", "sha256sum", "sha384sum", "sha512sum", "b2sum", "cksum"):
+            for options in ("-c", "--check", "--chec", "-bc", "-cw", "--ch", "--c", "-c -"):
+                command = f'echo "abc  ln/people.csv" | {name} {options}'
+                with self.subTest(command=command):
+                    self.deny(command)
+            with self.subTest(name=name):
+                self.allow(f'echo "$x" | {name}')
+                self.allow(f'echo "$x" | {name} -b')
+        self.deny('echo "abc  ln/people.csv" | sha384sum -c')
+
     def test_known_filters_that_read_stdin_as_data_are_receivers(self):
         """`rg` (only with `--no-config` and options that select and print) and the coreutils checksum programs read what is piped
         to them as data. The options that run a program (`rg --pre`), the config file and the environment that a program
