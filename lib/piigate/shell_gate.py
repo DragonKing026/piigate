@@ -578,7 +578,7 @@ class AstGate(gate.Gate):
             ):
                 # `-c` / `--check` (abbreviated, in a group, or a word nobody can read): the text it is given, a file or stdin, is a
                 # LIST OF FILES that the program opens
-                return "a checksum program in check mode (`-c`): it opens the files its input names", "filter-options"
+                return "a checksum program in check mode (`-c`): it opens the files its input names", "checksum-check"
             if c.name == "coproc":
                 return "`coproc`: a process that runs beside the line and answers through $COPROC", "coproc"
             if c.name == "print" and any(re.match(r"-[A-Za-z]*P", w.text) for w in c.argv[1:] if w.static):

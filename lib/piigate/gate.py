@@ -144,6 +144,20 @@ ZSH_FLAGS = re.compile(r"\$\{[#^~=+]*\(([^)]*)\)")  # `${(flags)name}`
 # an `e` followed by a separator, or `+` and a letter. Parentheses of `+(a|b)`, `*(.)`, `(L0)`, `(e|f)` do not contain them.
 ZSH_QUALIFIER = re.compile(r"\((?:#q|[^()\s|]*?(?:e[^\w|)\s(]|\+[A-Za-z_]))")
 CD_MATCHES = 64  # directories a `cd PATTERN` is followed into
+CHECKSUM_PROGRAMS = {"md5sum", "sha1sum", "sha224sum", "sha256sum", "sha384sum", "sha512sum", "b2sum", "cksum"}
+# the commands of a line with a loop over a glob that create nothing: any other command (a link, a copy, an interpreter, a program
+# nobody knows) or a redirection to a file may create or replace a file that the pattern then matches (checked at run time, not now)
+GLOB_LOOP_READERS = {
+    "echo", "printf", "cat", "head", "tail", "wc", "grep", "egrep", "fgrep", "rg", "basename", "dirname", "ls", "stat", "file", "sort",
+    "uniq", "cut", "tr", "test", "[", "[[", "true", "false", ":", "pwd", "date", "read", "shift", "jq", "diff", "cmp", "du", "realpath",
+    "readlink", "nl", "column", "seq", "cd", "break", "continue", "exit", "return", "set", "export", "unset", "local", "let", "expr",
+    *CHECKSUM_PROGRAMS,
+}
+# what a `trap` body must not hold: a definition of a function, an alias or any other code (the body runs later, in this shell)
+TRAP_DEFINES = re.compile(
+    r"\w\s*\(\s*\)|\bfunction\b|\b(?:alias|unalias|functions|aliases|galiases|saliases|eval|source|autoload|emulate|enable|disable|hash|"
+    r"unhash|typeset|declare|builtin)\b|(?:^|[;&|({]\s*)\.\s|\$\(|`|(?:^|[;&|({]\s*)\$"
+)
 REDIRECTS = {">", ">>", ">&", "&>", "&>>", ">|", "<", "<<", "<>", "<&"}
 QUOTED_REDIRECT = re.compile(r"\d*[<>]+[&|]?\d*|&>>?")  # a quoted/escaped word of this shape is not a redirection
 PIIGATE_SUBCOMMANDS = {"show", "list", "table", "text", "status", "shadow", "help", "--help", "-h"}  # `shadow`: counts only
@@ -1570,6 +1584,91 @@ class Gate:
                 result.append(z)
             i += 1
         return "".join(result)
+
+    @staticmethod
+    def _simple_stages(tokens: list[str]) -> list[list[str]]:
+        """The simple commands of a token list: split at the operators, the leading keywords and assignments dropped."""
+        stages: list[list[str]] = [[]]
+        for t in tokens:
+            if not isinstance(t, QuotedToken) and re.fullmatch(r"[;&|()\n]+|&&|\|\|", t):
+                stages.append([])
+            else:
+                stages[-1].append(t)
+        out = []
+        for st in stages:
+            if st and not isinstance(st[0], QuotedToken) and st[0] in ("for", "select", "case"):
+                continue  # `for f in WORDS`: the words are no command
+            k = 0
+            while k < len(st) and not isinstance(st[k], QuotedToken) and (st[k] in SHELL_KEYWORDS or re.fullmatch(r"\w+=.*", st[k])):
+                k += 1
+            if st[k:]:
+                out.append(st[k:])
+        return out
+
+    def _defined_code(self, tokens: list[str]) -> Reason | None:
+        """A `trap` with a body that defines a function, an alias or other code (or builds its text with an expansion): the body runs
+        later in this shell, so a name the rest of the line trusts (`pwd`, a filter) may no longer be what it was."""
+        for st in self._simple_stages(tokens):
+            if Path(st[0]).name != "trap":
+                continue
+            body = next((t for t in st[1:] if isinstance(t, QuotedToken) or not t.startswith("-") or t == "-"), None)
+            if body is None or body in ("", "-"):
+                continue
+            if TRAP_DEFINES.search(str(body)) or (not isinstance(body, QuotedToken) and "$" in body):
+                return Reason(
+                    f"piigate: command denied — a `trap` whose body defines code or is built by an expansion; the gate cannot "
+                    f"judge what it runs. {HINT}",
+                    "defined-code",
+                )
+        return None
+
+    def _checksum_check(self, tokens: list[str]) -> Reason | None:
+        """`sha384sum -c` (`--check`, `--c`, a group of short flags with `c`, a word nobody can read): the text it is given is a list of
+        files that it opens."""
+        for st in self._simple_stages(tokens):
+            if Path(st[0]).name in CHECKSUM_PROGRAMS and any(
+                re.match(r"-[^-]*c|--c", t) or "$" in t or "`" in t for t in st[1:]
+            ):
+                return Reason(
+                    f"piigate: command denied — a checksum program in check mode (`-c`) opens the files that its input lists. {HINT}",
+                    "checksum-check",
+                )
+        return None
+
+    def _glob_loop_writes(self, tokens: list[str]) -> Reason | None:
+        """A `for` loop over a glob in a line that may create or replace files (a link, a copy, `touch`, a redirection, an interpreter,
+        a program nobody knows): the pattern is expanded when the line RUNS, so a file it makes can be the sensitive one and the gate
+        judged the files that existed before. Only with a sensitive source configured. A loop in a line of readers is judged as before."""
+        if not (self.sensitive or self.project_sensitive or self.sensitive_name):
+            return None
+        globbed = False
+        i = 0
+        while i < len(tokens):
+            if tokens[i] == "for" and not isinstance(tokens[i], QuotedToken):
+                j = i + 1
+                while j < len(tokens) and tokens[j] not in (";", "\n", "do"):
+                    if not isinstance(tokens[j], QuotedToken) and re.search(r"[*?\[]", tokens[j]):
+                        globbed = True
+                    j += 1
+                i = j
+            i += 1
+        if not globbed:
+            return None
+        writes = any(
+            (re.fullmatch(r"\d*(?:>>?|>\|)|&>>?", t) and k + 1 < len(tokens) and not str(tokens[k + 1]).startswith(("/dev/", "&")))
+            or re.match(r"\d*(?:>>?|>\|)(?!&)[^>\s]", t) and not t.lstrip("0123456789>|").startswith("/dev/")
+            or re.match(r"&>>?[^>\s]", t)
+            for k, t in enumerate(tokens)
+            if not isinstance(t, QuotedToken)
+        )
+        if writes or any(Path(st[0]).name not in GLOB_LOOP_READERS or isinstance(st[0], QuotedToken) for st in self._simple_stages(tokens)):
+            return Reason(
+                "piigate: command denied — a loop over a glob in a line that may create or replace files (a link, a copy, `touch`, a "
+                "redirection, an interpreter, a program the gate does not know): the pattern is expanded when the line runs, not "
+                f"now. {HINT}",
+                "glob-loop-writes",
+            )
+        return None
 
     @staticmethod
     def _spelled_qualifier(text: str, i: int) -> bool:
@@ -3037,6 +3136,10 @@ class Gate:
             found = self._zsh_code(self._heredoc_text(command)[0]) or self._zsh_code(self._without_text_bodies(command), flags=False)
         if found:
             return Reason(f"piigate: command denied — {found}; the gate cannot see what it would read. {HINT}", "zsh-syntax")
+        if tokens is not None:
+            for check in (self._defined_code, self._checksum_check, self._glob_loop_writes):
+                if reason := check(tokens):
+                    return reason
         if reason := self._marker_only_rmdir(tokens):
             return reason
         if self._marker_recipe(command, files):

@@ -46,6 +46,7 @@ REASON_LABELS = (
     "sensitive-dir", "filter-files", "unfiltered-tool", "unfiltered-option", "unfiltered-opaque", "data-file", "written-data-file",
     "too-many-files", "ssh-query", "mcp-piigate", "marker-dir", "human-only", "zsh-syntax", "nul-byte", "quotes-unparsed",
     "cd-too-many", "names-passed-on", "built-script", "seeding-file", "too-many-values", "unexpanded-braces",
+    "defined-code", "checksum-check", "glob-loop-writes",
     # the syntax-tree gate: cannot read the line / the code it holds
     "cannot-parse", "code-the-tree-cannot-read", "autoload-fpath", "zsh-code", "expansion-runs-code", "dot-glob-shopt", "coproc",
     "print-prompt", "substituted-operand", "internal-error",

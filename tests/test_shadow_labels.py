@@ -54,6 +54,9 @@ CASES = (
     ("local-agent --dir ../Sensitive-data", "unfiltered-tool", "unfiltered-tool"),
     ("local-agent --profile phi", "unfiltered-option", "unfiltered-option"),
     ('local-agent --dir "$d"', "unfiltered-opaque", "unfiltered-opaque"),
+    ("trap 'f() { :; }' EXIT", "defined-code", "defined-code"),
+    ("echo abc | sha256sum -c", "checksum-check", "checksum-check"),
+    ('touch z.csv; for f in *.csv; do cat "$f"; done', "glob-loop-writes", "glob-loop-writes"),
     # the line cannot be read
     ("ls *(e:'echo hi':)", "zsh-syntax", "zsh-code"),
     ("cat 'unterminated ../Sensitive-data/people.csv", "quotes-unparsed", "cannot-parse"),

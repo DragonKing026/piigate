@@ -2247,6 +2247,52 @@ class TestRound9(Base):
             with self.subTest(command):
                 self.allow(command)
 
+    def test_trap_that_defines_code(self):
+        for command in (
+            "trap 'pwd() { echo ln; }' DEBUG; cat $(pwd)/people.csv", "trap 'rg() { sh; }' EXIT; echo \"$x\" | rg --no-config foo",
+            "trap 'sha384sum() { sh; }' EXIT; echo \"$x\" | sha384sum", "trap 'alias sort=sh' EXIT; echo \"$x\" | sort",
+            "trap 'function pwd { echo ln; }' EXIT; cat $(pwd)/p", "trap \"$body\" EXIT; cat $(pwd)/p", "trap $body EXIT",
+            "trap 'eval \"$v\"' EXIT", "trap 'source ./f' EXIT", "trap 'functions[pwd]=x' EXIT", "trap '$(cmd)' EXIT",
+        ):
+            with self.subTest(command):
+                self.deny(command)
+        for command in ("trap 'rm -f \"$tmp\"' EXIT", "trap - EXIT", "trap -l", "trap 'echo bye' EXIT INT", "trap '' INT"):
+            with self.subTest(command):
+                self.allow(command)
+
+    def test_checksum_program_in_check_mode(self):
+        for name in ("md5sum", "sha1sum", "sha224sum", "sha256sum", "sha384sum", "sha512sum", "b2sum", "cksum"):
+            for options in ("-c", "--check", "--chec", "--c", "--ch", "-bc", "-cw", "-c -", '"$o"'):
+                command = f'echo "abc  ln/people.csv" | {name} {options}'
+                with self.subTest(command=command):
+                    self.deny(command)
+            with self.subTest(name=name):
+                self.allow(f"echo abc | {name}")
+
+    def test_glob_loop_in_a_line_that_creates_files(self):
+        for command in (
+            'ln -s "$(echo ln)/people.csv" z.csv; for f in *.csv; do cat "$f"; done',
+            'for f in *.csv; do ln -sf ../Sensitive-data/people.csv "$f"; cat "$f"; done', 'touch z.csv; for f in *.csv; do cat "$f"; done',
+            'cp a z.csv; for f in *.csv; do cat "$f"; done', 'mv a z.csv; for f in *.csv; do cat "$f"; done',
+            'install a z.csv; for f in *.csv; do cat "$f"; done', 'echo x | tee z.csv; for f in *.csv; do cat "$f"; done',
+            'rsync a z.csv; for f in *.csv; do cat "$f"; done', 'tar xf a.tar; for f in *.csv; do cat "$f"; done',
+            'unzip a.zip; for f in *.csv; do cat "$f"; done', 'echo x > z.csv; for f in *.csv; do cat "$f"; done',
+            'echo x >z.csv; for f in *.csv; do cat "$f"; done', 'echo x &>z.csv; for f in *.csv; do cat "$f"; done',
+            'python3 gen.py; for f in *.csv; do cat "$f"; done', 'prog; for f in *.csv; do cat "$f"; done',
+            'for f in *.csv; do cat "$f"; done > out.txt', 'for f in *.csv; do cat "$f" >> out.txt; done',
+            '$c; for f in *.csv; do cat "$f"; done',
+        ):
+            with self.subTest(command):
+                self.deny(command)
+        for command in (
+            'for f in *.csv; do wc -l "$f"; done', 'for f in *.csv; do echo "$f"; done', 'for f in *.csv; do head -2 "$f" 2>/dev/null; done',
+            "for f in *.csv; do basename $f .csv; done", 'for f in *.csv; do cat "$f" | wc -l; done', 'for f in a b; do touch "$f"; done',
+            "for f in *.csv; do [ -f \"$f\" ] && echo y; done",
+        ):
+            with self.subTest(command):
+                # the decision of `Gate` (a loop of readers is judged as before); `AstGate` keeps its own refusal of a pattern named twice
+                self.assertIsNone(gate.Gate.bash(self.old(), command, True), command)
+
 
 if __name__ == "__main__":
     unittest.main()
