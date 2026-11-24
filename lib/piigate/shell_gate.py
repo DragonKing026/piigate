@@ -72,7 +72,7 @@ CREATE_FLAGS = {
 # an option makes it no filter. A program of the list without an entry here has no option that runs anything (grep, cat, wc…).
 STDIN_DATA = shell.DATA_ONLY | {
     "sort", "tee", "less", "more", "tac", "pr", "fmt", "expand", "unexpand", "diff", "cmp", "comm", "jq", "gojq", "sed",
-    "awk", "gawk", "mawk", "piigate", "pbcopy", "wl-copy", "xclip", "xsel",
+    "awk", "gawk", "mawk", "piigate", "pbcopy", "wl-copy", "xclip", "xsel", "rg", "bat", "shasum", "sha224sum", "sha384sum",
 }
 # name -> (short flags, short options with a value, long flags, long options with the number of words they take)
 _JQ_OPTIONS = ("rcsnCMSaejR", "", frozenset({
@@ -92,6 +92,24 @@ FILTER_OPTIONS = {
     "awk": ("", "Fv", frozenset(), {}),
     "gawk": ("", "Fv", frozenset(), {}),
     "mawk": ("", "Fv", frozenset(), {}),
+    # ripgrep: only options that select and print; not `--pre` / `--pre-glob` / `--hostname-bin` (run a program), `-z` (runs a decompressor),
+    # `-f` / `--file` (reads a file of patterns), `--config-path`
+    "rg": ("iSsnNvwxcoFIHhlLqUauPbp0", "emABCgtTrMdE", frozenset({
+        "--ignore-case", "--smart-case", "--case-sensitive", "--line-number", "--no-line-number", "--invert-match", "--word-regexp",
+        "--line-regexp", "--count", "--only-matching", "--fixed-strings", "--no-filename", "--with-filename", "--files-with-matches",
+        "--files-without-match", "--quiet", "--no-heading", "--heading", "--text", "--multiline", "--pcre2", "--no-messages", "--null",
+        "--column", "--trim", "--no-config", "--no-ignore", "--hidden",
+    }), {
+        "--regexp": 1, "--max-count": 1, "--after-context": 1, "--before-context": 1, "--context": 1, "--glob": 1, "--type": 1,
+        "--type-not": 1, "--replace": 1, "--max-columns": 1, "--color": 1, "--max-depth": 1,
+    }),
+    # bat: only what displays; not `--pager` (runs a program), `--config-file`, `--diff`
+    "bat": ("pPnAfuUhV", "lrHm", frozenset({
+        "--plain", "--number", "--show-all", "--force-colorization", "--no-paging", "--unbuffered",
+    }), {
+        "--language": 1, "--line-range": 1, "--highlight-line": 1, "--color": 1, "--style": 1, "--paging": 1, "--decorations": 1,
+        "--theme": 1, "--wrap": 1, "--tabs": 1, "--terminal-width": 1,
+    }),
     "less": ("NSRrFXiIqQsnwJ", "", frozenset(), {}),
     "more": ("", "", frozenset(), {}),
 }

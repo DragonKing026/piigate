@@ -2151,6 +2151,28 @@ class TestRound8(Base):
             with self.subTest(command):
                 self.deny(command)
 
+    def test_known_filters_that_read_stdin_as_data_are_receivers(self):
+        """`rg`, `bat` (with the options that only select or display) and the checksum programs read what is piped to them as data;
+        the options that run a program (`rg --pre`, `bat --pager`) or read a file for patterns are not on the list."""
+        for command in (
+            'echo "$x" | rg foo', 'echo "$x" | rg -n -i foo', 'echo "$x" | rg -i -e foo -m 3', 'echo "$x" | rg --no-heading --color never foo',
+            'echo "$x" | rg -c "a|b"', 'echo "$x" | rg --max-count=2 foo', 'echo "$x" | bat', 'echo "$x" | bat -p --color=never',
+            'echo "$x" | bat -l json -n', 'echo "$x" | bat --paging=never --style=plain', 'echo "$x" | shasum', 'echo "$x" | shasum -a 256',
+            'echo "$x" | sha224sum', 'echo "$x" | sha384sum',
+        ):
+            with self.subTest(command):
+                self.allow(command)
+        for command in (
+            'echo "$x" | rg --pre sh foo', 'echo "$x" | rg --pre=sh foo', 'echo "$x" | rg -z foo', 'echo "$x" | rg --search-zip foo',
+            'echo "$x" | rg --hostname-bin sh foo', 'echo "$x" | rg -f patterns', 'echo "$x" | rg --file=patterns', 'echo "$x" | rg "$p"',
+            'echo "$x" | rg foo "$f"', 'echo "$x" | rg --pr sh foo', 'echo "$x" | bat --pager sh', 'echo "$x" | bat --pager=sh',
+            'echo "$x" | bat --config-file x', 'echo "$x" | bat "$f"', 'echo "$x" | bat --pa sh', 'echo "$x" | xargs rg foo',
+            'echo "$x" | FOO=1 rg foo', 'echo "$x" | env rg foo', 'echo "$x" | ./rg foo', 'f() { sh; }; rg() { sh; }; echo "$x" | rg foo',
+            'alias rg=sh; echo "$x" | rg foo', "aliases[rg]=sh; echo \"$x\" | rg foo", 'source ./f.sh; echo "$x" | rg foo',
+        ):
+            with self.subTest(command):
+                self.deny(command)
+
 
 if __name__ == "__main__":
     unittest.main()
