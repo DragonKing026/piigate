@@ -5,6 +5,7 @@ The data are synthetic: a throw-away directory with a dummy sensitive directory.
 
 import ast
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -1997,6 +1998,12 @@ class TestIssueRegressions(Base):
                 self.allow(command)
 
 
+SELECTING_RE = (
+    r"[/.@=p*rwxAIERWXsStNDMTn^,-]|%[bcs]?|L[kKmMgGtTpP]?[+-]?\d+|[mac][smhdwM]?[+-]?\d+|[oO][nNLlamcdz]"
+    r"|\[-?\d+(?:,-?\d+)?\]|[ugd]\d+|f[=-]?[0-7]{1,4}|Y\d+"
+)
+
+
 class TestRound8(Base):
     """Task 380, round after the 1.0.22 measurement: false denials of the tree gate (the old gate allowed these lines)."""
 
@@ -2070,29 +2077,59 @@ class TestRound8(Base):
         g.bash("echo hi")
         self.assertFalse(shell.may_define_code(g._current.calls))
 
-    def test_qualifier_reader_never_hides_a_qualifier_that_runs_code(self):
-        """Fail closed: after ANY readable qualifier (with its argument in every form zsh knows), a following `e:x:` or `+g` is
-        found; a qualifier the reader cannot read ends in a refusal, never in a skipped part. (zsh: `*(f=644e:x:)` runs x.)"""
-        readable = (
-            "/", ".", "@", "=", "p", "*", "r", "w", "x", "A", "I", "E", "R", "W", "X", "s", "S", "t", "N", "D", "M", "T", "n", "^",
-            "-", ",", "%", "%b", "%c", "%s", "L0", "L+1", "L-1", "Lk+1", "Lm1", "LP-2", "m1", "m-1", "m+1", "mh-1", "mM+2", "a+0", "ad1",
-            "cw-3", "f644", "f=644", "f+644", "f-644", "f?644", "f:u+rw:", "f:gu+w,o-rx:", "u501", "u:root:", "g100", "g:wheel:",
-            "d12", "d:dev:", "on", "On", "oN", "oL", "om", "oa", "oc", "od", "oz", "ol", "[1]", "[1,3]", "[-1]", "[2,-1]", "Y3",
-        )
-        for prefix in readable:
-            self.assertFalse(shell._group_runs_code(prefix + ")"), prefix)
-            for suffix in ("e:x:", "+g", "e,x,", "e/x/", "e!x!"):
-                self.assertTrue(shell._group_runs_code(prefix + suffix + ")"), prefix + suffix)
-                self.assertTrue(shell._group_runs_code("." + prefix + "N" + suffix + ")"), prefix + suffix)
-                for other in ("/", "L+1", "f=644", "f:u+r:", "om"):
-                    self.assertTrue(shell._group_runs_code(prefix + other + suffix + ")"), (prefix, other, suffix))
-        for broken in ("f=", "f+", "f-e:x:", "f?e:x:", "Le:x:", "L+e:x:", "m+e:x:", "oe:x:", "o+f", "o", "u", "u:root", "f:u+r", "[1", "Qe:x:", "\\e:x:"):
-            self.assertTrue(shell._group_runs_code(broken + ")"), broken)
+    # the tokens of the strict grammar, written here once more and apart from shell.py (the property tests check against it)
+    SELECTING = (
+        "/", ".", "@", "=", "p", "*", "r", "w", "x", "A", "I", "E", "R", "W", "X", "s", "S", "t", "N", "D", "M", "T", "n", "^", "-", ",",
+        "%", "%b", "%c", "%s", "L0", "L+1", "L-1", "Lk+1", "Lm1", "LP-2", "m1", "m-1", "m+1", "mh-1", "mM+2", "a+0", "ad1", "cw-3",
+        "f644", "f=644", "f-644", "u501", "g100", "d12", "on", "On", "oN", "oL", "om", "oa", "oc", "od", "oz", "ol", "[1]", "[1,3]",
+        "[-1]", "[2,-1]", "Y3",
+    )
 
-    def test_qualifier_with_a_mode_sign_is_not_skipped(self):
+    def test_qualifier_that_only_selects_files_is_not_code_for_every_listed_form(self):
+        for token in self.SELECTING:
+            with self.subTest(token=token):
+                self.assertFalse(shell._qualifier_code(f"*.csv({token})"), token)
+                self.assertFalse(shell._qualifier_code(f"*({token}{token})"), token)
         for command in (
-            "ls *(f=644e:'echo hi':)", "ls *(f-644e:'echo hi':)", "ls *(f+644+g)", "ls *(f?644e:'echo hi':)", "ls *(f:u+rw:e:'echo hi':)",
-            "ls *(f:u+rw:+g)", "ls *(.f=644+g)",
+            "ls *(.)", "ls *(.N)", "ls *(om[1,5])", "ls *(mh-1)", "ls *(L+1)", "ls *(Lk+1)", "ls *(oN)", "ls *.(test|json)",
+            "ls *(.om[1])", "ls *(/N)", "ls *(^/)",
+        ):
+            with self.subTest(command=command):
+                self.allow(command)
+
+    def test_qualifier_never_runs_code_behind_a_listed_form(self):
+        """After ANY listed form (alone or several) an `e:x:`, a `+g` or a form that is not listed (and holds an `e` or a `+`) ends in a refusal; so does every
+        random group that the broad test suspects and the two listed forms do not cover."""
+        import random
+
+        rnd = random.Random(380)
+        tails = (
+            "e:x:", "+g", "e,x,", "e/x/", "e!x!", "e(x)", "e:\\):,e:x:", "e:touch\\ x\;\\):", "#qe:x:", "f:u+rw:", "f+644", "u:peter:",
+            "Le:x:", "L+e:x:", "m+f", "o+f", "oe:x:", "\\e:x:", "'e':x:",
+        )
+        for _ in range(400):
+            head = "".join(rnd.choice(self.SELECTING) for _ in range(rnd.randint(0, 4)))
+            tail = rnd.choice(tails)
+            tail2 = "".join(rnd.choice(self.SELECTING) for _ in range(rnd.randint(0, 2)))
+            self.assertTrue(shell._qualifier_code(f"*({head}{tail}{tail2})"), (head, tail, tail2))
+            self.assertTrue(shell._qualifier_code(f"*({head}{tail}{tail2}"), (head, tail, tail2))  # open: the text goes on in a quote
+        listed = re.compile(
+            r"\((?:" + SELECTING_RE + r")+\)|\([A-Za-z0-9_.*?-]*\|[A-Za-z0-9_.*?|-]*\)[^()\\\"'$`]*"
+        )
+        alphabet = "e+\\)'\"$`:|abc012[]/.(*-,#qf=oLmN"
+        for _ in range(3000):
+            raw = "*(" + "".join(rnd.choice(alphabet) for _ in range(rnd.randint(1, 12)))
+            suspect = [m.start() for m in re.finditer(r"\(", raw) if re.match(r"\((?:#q|[^)]*[e+])", raw[m.start() :])]
+            covered = len(suspect) == 1 and listed.fullmatch(raw[suspect[0] :])
+            if suspect and not covered:
+                self.assertTrue(shell._qualifier_code(raw), raw)
+
+    def test_qualifier_forms_with_escapes_quotes_and_modes_are_refused(self):
+        for command in (
+            "ls *(e:touch\\ x\;\\):)", "ls *(e(touch\\ x))", "ls *(e:\\):,e:'touch x':)", "ls *(f=644e:'echo hi':)",
+            "ls *(f-644e:'echo hi':)", "ls *(f+644+g)", "ls *(f?644e:'echo hi':)", "ls *(f:u+rw:e:'echo hi':)", "ls *(f:u+rw:+g)",
+            "ls *(.f=644+g)", 'ls *("e":"echo hi":)', "ls *('e':'echo hi':)", "ls *(${x}:'echo hi':)", "ls *(${:-e}:'echo hi':)",
+            'ls *("+"f)',
         ):
             with self.subTest(command):
                 self.deny(command)
