@@ -2104,7 +2104,7 @@ class TestRound8(Base):
 
         rnd = random.Random(380)
         tails = (
-            "e:x:", "+g", "e,x,", "e/x/", "e!x!", "e(x)", "e:\\):,e:x:", "e:touch\\ x\;\\):", "#qe:x:", "f:u+rw:", "f+644", "u:peter:",
+            "e:x:", "+g", "e,x,", "e/x/", "e!x!", "e(x)", "e:\\):,e:x:", "e:touch\\ x\\;\\):", "#qe:x:", "f:u+rw:", "f+644", "u:peter:",
             "Le:x:", "L+e:x:", "m+f", "o+f", "oe:x:", "\\e:x:", "'e':x:",
         )
         for _ in range(400):
@@ -2126,7 +2126,7 @@ class TestRound8(Base):
 
     def test_qualifier_forms_with_escapes_quotes_and_modes_are_refused(self):
         for command in (
-            "ls *(e:touch\\ x\;\\):)", "ls *(e(touch\\ x))", "ls *(e:\\):,e:'touch x':)", "ls *(f=644e:'echo hi':)",
+            "ls *(e:touch\\ x\\;\\):)", "ls *(e(touch\\ x))", "ls *(e:\\):,e:'touch x':)", "ls *(f=644e:'echo hi':)",
             "ls *(f-644e:'echo hi':)", "ls *(f+644+g)", "ls *(f?644e:'echo hi':)", "ls *(f:u+rw:e:'echo hi':)", "ls *(f:u+rw:+g)",
             "ls *(.f=644+g)", 'ls *("e":"echo hi":)', "ls *('e':'echo hi':)", "ls *(${x}:'echo hi':)", "ls *(${:-e}:'echo hi':)",
             'ls *("+"f)',
