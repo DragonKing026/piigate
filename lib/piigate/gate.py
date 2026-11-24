@@ -157,7 +157,8 @@ GLOB_LOOP_PROGRAMS = {
     "realpath", "readlink", "nl", "column", "seq", "cd", "pushd", "popd", "break", "continue", "exit", "return", "expr", "sed",
     "shellcheck", "ruff", "git", "python", "python3", *CHECKSUM_PROGRAMS,
 }
-GLOB_LOOP_GIT = {"status", "diff", "log", "show", "ls-files", "blame", "rev-parse"}
+# (no `diff` / `log` / `show`: they run the external diff driver and textconv filters named in a config the line cannot see)
+GLOB_LOOP_GIT = {"status", "ls-files", "blame", "rev-parse"}
 # `sed` scripts without a command that writes or runs something: addresses, then `s/…/…/flags`, `d`, `p`, `y/…/…/`, joined by `;`
 _SED_SAFE = re.compile(
     r"\s*(?:[0-9$]+(?:,[0-9$]+)?!?\s*)?(?:s/(?:[^/\\;]|\\.)*/(?:[^/\\;]|\\.)*/[gpiI0-9]*|[dpP=]|y/[^/\\;]*/[^/\\;]*/)\s*"
@@ -1667,6 +1668,16 @@ class Gate:
         self._glob_loop = globbed
         if not globbed or not (self.sensitive or self.project_sensitive or self.sensitive_name):
             return None
+        if any(
+            not isinstance(t, QuotedToken) and re.match(r"(?:GIT_|RIPGREP|PYTHON|LESS|PERL5|LD_|XDG_|PAGER=|EDITOR=|VISUAL=|PATH=|HOME=)", t)
+            and "=" in t
+            for t in tokens
+        ):  # a variable that changes what a listed program loads or runs
+            return Reason(
+                f"piigate: command denied — a loop over a glob in a line that sets a variable a program reads its configuration, pager or "
+                f"modules from. {HINT}",
+                "glob-loop-writes",
+            )
         creates = any(
             (re.fullmatch(r"\d*(?:>>?|>\|)|&>>?", t) and k + 1 < len(tokens) and not str(tokens[k + 1]).startswith(("/dev/", "&")))
             or re.match(r"\d*(?:>>?|>\|)(?!&)[^>\s]", t) and not t.lstrip("0123456789>|").startswith("/dev/")
@@ -1697,7 +1708,7 @@ class Gate:
                     return False
                 scripts.append(args[k + 1])
                 skip = True
-            elif re.fullmatch(r"-[nEr]+|-i[^\s=]*|--in-place|--quiet|--silent|--regexp-extended", t):
+            elif re.fullmatch(r"-[nEr]+|-i|--in-place|--quiet|--silent|--regexp-extended", t):
                 continue
             elif t.startswith("-") and t != "-":
                 return False  # -f, --file, -s, -z, --follow-symlinks, --expression=…: unknown
@@ -1731,17 +1742,22 @@ class Gate:
                 k += 2 if args[k] == "-C" else 1
             return k < len(args) and args[k] in GLOB_LOOP_GIT and not any(a.startswith("--output") for a in args)
         if base in ("python", "python3"):
-            return args[:2] in (["-m", "py_compile"], ["-m", "json.tool"])
-        if base == "yq":
-            return not any(re.fullmatch(r"-[^-]*i[^-]*|--inplace", a) for a in args)
+            if args[:2] == ["-m", "py_compile"]:
+                return True
+            # json.tool takes an input file and an OUTPUT file: at most one positional word, no option that could name one
+            return args[:2] == ["-m", "json.tool"] and len([a for a in args[2:] if not a.startswith("-")]) <= 1 and not any(
+                a.startswith(("-o", "--o")) for a in args[2:]
+            )
+        if base == "yq":  # -i / --in-place*, -s / --split-exp*, and anything that starts like them
+            return not any(re.fullmatch(r"-[^-]*[is][^-]*|--(?:s|in)[\w-]*", a) for a in args)
         if base == "ruff":
-            return args[:1] == ["check"] and not any(a.startswith(("--fix", "--add-noqa", "--unsafe")) for a in args)
-        if base == "sort":
-            return not any(re.fullmatch(r"-[^-]*o.*|--o.*|--compress-program.*", a) for a in args)
+            return args[:1] == ["check"] and not any(re.match(r"--[oafu]", a) for a in args)  # --output*, --fix*, --add-noqa, --unsafe*
+        if base == "sort":  # -o / --o*, -T / --t*, --c* (--compress-program): each writes a file or runs a program
+            return not any(re.fullmatch(r"-[^-]*[oT].*|--[cot].*", a) for a in args)
         if base == "uniq":
             return len([a for a in args if not a.startswith("-")]) <= 1
-        if base == "rg":
-            return not any(a.startswith(("--p", "--hostname", "--search-zip")) or re.fullmatch(r"-[^-]*z[^-]*", a) for a in args)
+        if base == "rg":  # --pre*, --pre-glob, --hostname*, -z, --search-zip, and their abbreviations
+            return not any(re.match(r"--(?:p|ho|hostname|se)", a) or re.fullmatch(r"-[^-]*z[^-]*", a) for a in args)
         return True
 
     @staticmethod

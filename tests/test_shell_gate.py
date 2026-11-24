@@ -2323,7 +2323,26 @@ class TestRound9(Base):
             "for f in *.md; do [[ 'a[$(ln -s ../Sensitive-data/people.csv z.csv)]' -eq 1 ]]; done; for g in *.csv; do cat \"$g\"; done",
             "for f in *.md; do [ -v 'a[$(ln -s ../Sensitive-data/people.csv z.csv)]' ]; done; for g in *.csv; do cat \"$g\"; done",
             "for f in *.md; do test -v 'a[$(ln -s ../Sensitive-data/people.csv z.csv)]'; done; for g in *.csv; do cat \"$g\"; done",
-            'for f in *.csv; do [ -f "$x" ] && echo y; done', 'for f in *.csv; do git -C d status; git commit -a; done', 'for f in *.csv; do python3 -m pip install x; done',
+            'for f in *.csv; do [ -f "$x" ] && echo y; done', # options and environment of listed programs that write a file, load code or run a program
+            "for f in *.md; do sed -i.csv s/a/b/ \"$f\"; done", "for f in *.md; do sed -i'*' s/a/b/ \"$f\"; done",
+            "for f in *.md; do sed --in-place=x s/a/b/ \"$f\"; done", "for f in *.md; do sed -ni s/a/b/p \"$f\"; done",
+            'python3 -m json.tool a.json z.csv; for g in *.csv; do cat "$g"; done', 'python3 -m json.tool --output z.csv a.json; for g in *.csv; do cat "$g"; done',
+            'ruff check --output-file z.csv .; for g in *.csv; do cat "$g"; done', 'ruff check --output-f z.csv .; for g in *.csv; do cat "$g"; done',
+            'ruff check --o z.csv .; for g in *.csv; do cat "$g"; done',
+            'yq -s . a.yml; for g in *.csv; do cat "$g"; done', 'yq --split-exp . a.yml; for g in *.csv; do cat "$g"; done',
+            'yq --in-place . a.yml; for g in *.csv; do cat "$g"; done', 'yq --inplace . a.yml; for g in *.csv; do cat "$g"; done',
+            'yq -n -i . a.yml; for g in *.csv; do cat "$g"; done',
+            'sort --compress-prog=./x a; for g in *.csv; do cat "$g"; done', 'sort --co=./x a; for g in *.csv; do cat "$g"; done',
+            'sort -T d a; for g in *.csv; do cat "$g"; done', 'sort --temporary-directory=d a; for g in *.csv; do cat "$g"; done',
+            'sort --output=z.csv a; for g in *.csv; do cat "$g"; done', 'sort --out=z.csv a; for g in *.csv; do cat "$g"; done',
+            'rg --pre-glob x foo; for g in *.csv; do cat "$g"; done', 'rg --pre=./x foo; for g in *.csv; do cat "$g"; done',
+            'rg --hostname-bin ./x foo; for g in *.csv; do cat "$g"; done', 'rg -z foo; for g in *.csv; do cat "$g"; done',
+            'rg --search-zip foo; for g in *.csv; do cat "$g"; done',
+            'for f in *.csv; do git diff "$f"; done', 'for f in *.csv; do git log -p "$f"; done', 'for f in *.csv; do git show "$f"; done',
+            'GIT_EXTERNAL_DIFF=./x git status; for g in *.csv; do cat "$g"; done', 'RIPGREP_CONFIG_PATH=c rg foo; for g in *.csv; do cat "$g"; done',
+            'PYTHONPATH=. python3 -m py_compile a; for g in *.csv; do cat "$g"; done', 'PAGER=./x git status; for g in *.csv; do cat "$g"; done',
+            'EDITOR=./x ls; for g in *.csv; do cat "$g"; done', 'LESSOPEN=./x ls; for g in *.csv; do cat "$g"; done',
+            'for f in *.csv; do git -C d status; git commit -a; done', 'for f in *.csv; do python3 -m pip install x; done',
         ):
             with self.subTest(command):
                 self.deny(command)
@@ -2334,7 +2353,7 @@ class TestRound9(Base):
             'for f in *.py; do python3 -m py_compile "$f"; done', 'for f in *.json; do python3 -m json.tool "$f"; done',
             'for d in x*/; do (cd "$d" && git status -s); done', 'for f in *.sh; do shellcheck "$f"; done',
             'for f in *.md; do rg foo "$f"; done', "for f in *.md; do sed -n '1,3p' \"$f\"; done",
-            "for f in *.md; do sed -i.bak -e 's/a/b/g' \"$f\"; done", 'for f in *.md; do git -C d log -1; done',
+            "for f in *.md; do sed -i -e 's/a/b/g' \"$f\"; done", 'for f in *.md; do git -C d rev-parse HEAD; done', 'for f in *.md; do git blame "$f"; done',
             'for f in *.py; do ruff check "$f"; done', 'for f in *.yml; do yq .a "$f"; done', 'for f in *.csv; do sort -u "$f"; done',
         ):
             with self.subTest(command):
