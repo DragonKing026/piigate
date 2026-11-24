@@ -581,19 +581,19 @@ class AstGate(gate.Gate):
         return None
 
     def _pwd_rebound(self, calls: list) -> bool:
-        """Does the line redefine what `$(pwd)` prints — a function or an alias or a builtin switch named for it, or any way of
-        assigning `PWD`? The model reads `$(pwd)` as `$PWD`; that is only true while nothing changes either."""
+        """Does the line redefine what `$(pwd)` prints: a function named `pwd`, any way of assigning `PWD`, or code the model cannot
+        see (`shell.may_define_code`)? The model reads `$(pwd)` as `$PWD`; that is only true while nothing changes either."""
         if self._current is not None and "pwd" in self._current.functions:
             return True
         model = self._model
         if model is not None and ("PWD" in model.sites or "PWD" in model.unknown):
             return True
-        for c in calls:
-            if c.name in ("alias", "enable", "disable", "hash", "unhash", "unalias") or any(a.name == "PWD" for a in c.assigns):
-                return True
-            if any(w.static and re.fullmatch(r"PWD(=.*)?", w.text) for w in c.argv[1:]):
-                return True
-        return False
+        if shell.may_define_code(calls):
+            return True
+        return any(
+            any(a.name == "PWD" for a in c.assigns) or any(w.static and re.fullmatch(r"PWD(=.*)?", w.text) for w in c.argv[1:])
+            for c in calls
+        )
 
     # ------------------------------------------------------------------------------------------------ entry
 
@@ -767,7 +767,7 @@ class AstGate(gate.Gate):
         for c in p.calls:
             for pid, stage in c.pipes:
                 stages.setdefault(pid, []).append((stage, c))
-        rebound = any(c.name == "alias" or any(a.name in shell.CODE_ARRAYS for a in c.assigns) for c in p.calls)
+        rebound = shell.may_define_code(p.calls)
 
         def literal(f: shell.Call) -> bool:
             """A stage that is the plain `echo` / `printf` / `cat` of a LITERAL text: every word static (no variable, no glob, no
@@ -1250,7 +1250,7 @@ class AstGate(gate.Gate):
             return super()._human_only_dynamic(command, tokens, standalone)
         if self._expanded_into_code(p) is not None:
             return True  # text with an expansion given to a shell or an interpreter: code nobody can read (#41)
-        rebound = any(c.name == "alias" or any(a.name in shell.CODE_ARRAYS for a in c.assigns) for c in p.calls)
+        rebound = shell.may_define_code(p.calls)
         for c in p.calls:
             if c.opaque_code:
                 return True

@@ -2041,9 +2041,34 @@ class TestRound8(Base):
             "PWD=../Sensitive-data; cat $(pwd)/people.csv", "export PWD=../Sensitive-data; cat $(pwd)/people.csv",
             "cat $(pwd -P)/notes.md", "cat $(pwd; echo x)/notes.md", "cat $(pwd | cat)/notes.md", "cat $(pwd >/dev/null)/notes.md",
             "cat $(cd ../Sensitive-data; pwd)/people.csv",
+            # a line that may define code the model cannot see: a known name is no longer what it usually is
+            "functions[pwd]='echo ../Sensitive-data'; cat $(pwd)/people.csv", "aliases[pwd]='echo ../Sensitive-data'; cat $(pwd)/people.csv",
+            "typeset -A functions; functions[pwd]='echo ../Sensitive-data'; cat $(pwd)/people.csv",
+            "typeset functions[pwd]='echo ../Sensitive-data'; cat $(pwd)/people.csv", "source ./f.sh; cat $(pwd)/people.csv",
+            ". ./f.sh; cat $(pwd)/people.csv", 'eval "$v"; cat $(pwd)/people.csv', "autoload pwd; cat $(pwd)/people.csv",
+            "emulate -L zsh; cat $(pwd)/people.csv", "functions pwd; cat $(pwd)/people.csv", "typeset -f pwd; cat $(pwd)/people.csv",
+            "unalias pwd; cat $(pwd)/people.csv", "enable -n pwd; cat $(pwd)/people.csv", "builtin eval \"$v\"; cat $(pwd)/people.csv",
+            "echo ${functions[pwd]:=x}; cat $(pwd)/people.csv",
         ):
             with self.subTest(command):
                 self.deny(command)
+
+    def test_code_the_line_may_define_is_one_question_for_every_known_name(self):
+        """`shell.may_define_code`: alias, function tables, source, eval of a built text, autoload… — one predicate, used by the
+        stdin-receiver rule, the human-only rule, `plain_program` and `$(pwd)`."""
+        for command in ("aliases[sort]=sh; echo \"$x\" | sort", "source ./f.sh; echo \"$x\" | sort", 'eval "$v"; echo "$x" | sort',
+                        "autoload sort; echo \"$x\" | sort", "typeset -A functions; functions[sort]=sh; echo \"$x\" | sort"):
+            with self.subTest(command):
+                self.deny(command)
+        for command in ("echo \"$x\" | sort", "export LC_ALL=C; echo \"$x\" | sort", "x=1; echo \"$x\" | sort",
+                        "export X=$(date); echo \"$x\" | sort", "local y=$(pwd); echo \"$x\" | sort"):
+            with self.subTest(command):
+                self.allow(command)
+        g = self.ast("zsh")
+        g.bash("alias a=b")
+        self.assertTrue(shell.may_define_code(g._current.calls))
+        g.bash("echo hi")
+        self.assertFalse(shell.may_define_code(g._current.calls))
 
     def test_qualifier_reader_never_hides_a_qualifier_that_runs_code(self):
         """Fail closed: after ANY readable qualifier (with its argument in every form zsh knows), a following `e:x:` or `+g` is

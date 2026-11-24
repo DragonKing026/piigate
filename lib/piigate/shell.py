@@ -1039,6 +1039,41 @@ def _resolve(target: str, base: str, tilde: bool = True) -> str:
     return os.path.normpath(target if os.path.isabs(target) else os.path.join(base, target))
 
 
+# builtins that define or change code the model does not see (an alias, a function from a file, the options of the shell): after
+# any of them a name means what the line says, not what it usually means
+CODE_DEFINERS = {"alias", "unalias", "enable", "disable", "hash", "unhash", "functions", "autoload", "source", ".", "emulate"}
+
+
+def may_define_code(calls) -> bool:
+    """Can the line define or replace code that the model cannot see — so that a name (a program, `pwd`, a filter) no longer
+    means what it usually does? ONE question for every rule that trusts a known name: an alias, a builtin that defines or hides
+    a command (CODE_DEFINERS), an assignment to the code tables of zsh (`functions[x]=…`, `aliases[x]=…`, also through `typeset`,
+    `declare`, `local`, `export` and `${functions[x]:=…}`), `typeset -f` / `-g`, an `eval` of text nobody can read. A function the
+    line declares is not part of the question: it is a known name (`calls.functions`), checked by name where it is used."""
+    if set(getattr(calls, "assigned_in_expansions", ())) & CODE_ARRAYS:
+        return True
+    for c in calls:
+        if any(a.name in CODE_ARRAYS for a in c.assigns):
+            return True
+        words = _effective(c.argv)
+        if not words or not words[0].static:
+            continue
+        name = os.path.basename(words[0].text)
+        if name == "builtin" or name == "command":  # (`builtin alias`, `command eval`: not in WRAPPERS' value stripping)
+            words = words[1:]
+            name = os.path.basename(words[0].text) if words and words[0].static else ""
+        if name in CODE_DEFINERS:
+            return True
+        if name == "eval" and (c.opaque_code or not all(w.static for w in words[1:])):
+            return True
+        if name in DECLARATIONS:
+            for w in words[1:]:
+                # (a word made by an expansion from its first character on may name anything; `FOO=$(date)` names FOO)
+                if w.text.startswith(("$", "`")) or re.match(r"-\w*[fg]", w.text) or re.split(r"[=\[]", w.text, maxsplit=1)[0] in CODE_ARRAYS:
+                    return True
+    return False
+
+
 def _effective(argv: list[Word]) -> list[Word]:
     """The command with the wrappers (`sudo -u x`, `env A=1`, `nice -n 5`, `exec`, `time`…) stripped."""
     words = list(argv)
@@ -1494,7 +1529,7 @@ class _Walker:
         name = os.path.basename(argv[at].text)
         if name in ARGUMENT_RUNNERS or argv[at].text in self.functions or name in self.functions:
             return False
-        return not any(c.name == "alias" or any(a.name in CODE_ARRAYS for a in c.assigns) for c in self.calls)
+        return not may_define_code(self.calls)
 
     def nested_script(self, call: Call, st: _State) -> _State | None:
         """The scripts the command runs: `bash -c S`, `eval S` — and the same behind a launcher in its arguments
