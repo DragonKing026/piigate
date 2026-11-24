@@ -349,19 +349,29 @@ def _ansi_c(raw: str) -> str:
 
 
 _QUALIFIER_CLOSERS = {"(": ")", "[": "]", "{": "}", "<": ">"}
+_QUALIFIER_FLAGS = set("/.@=p*rwxAIERWXsStNDMTn^-,")  # one letter, no argument
+_QUALIFIER_SORT_KEYS = "nNLlamcdz"  # after `o` / `O`; `e` and `+` there run code, so they are not in the list
+_SIZE_UNITS, _TIME_UNITS = "kKmMgGtTpP", "smhdwM"
 
 
 def _group_runs_code(s: str) -> bool:
-    """`s` is the text right after a `(` up to the end of the word part. Is the group a zsh glob qualifier list that runs code: an
-    `e` (`e:cmd:`, also after `o`) or a `+` (`+func`) at the place of a qualifier? The qualifiers are read the way zsh reads them, so
-    that what is an ARGUMENT of one is not mistaken for another: `L+1` / `mh-1` (a size, an age: `+` is a sign), `f:u+r:` and
-    `u:name:` (a delimited argument), `[1,3]` (a range), `o` followed by its sort key. An unquoted `|` or `~` in the group makes it a pattern. Whatever cannot
-    be read as a qualifier list and sits in a group that is closed in this text is a PATTERN (`(test|json)`: `e` with an unterminated argument is an error in
-    zsh, not code); an open group (the text goes on in a quoted part) that cannot be read is refused."""
-    closed = ")" in s
-    if re.search(r"(?<!\\)[|~]", s.split(")", 1)[0]):
-        return False  # an unquoted `|` or `~` makes the group a pattern, not qualifiers (zsh: `*(e|echo hi|)` runs nothing)
+    """`s` is the text right after a `(` up to the end of the word part. Does the group hold anything that is not certainly a zsh
+    glob qualifier that only selects files? True means refuse: `e:cmd:` (also after `o`), `+func`, and EVERY part that cannot be
+    read as a known qualifier with its argument — an unknown letter, a sign without a number, a delimited argument that is not
+    terminated, an octal mode with a sign (`f=644`, `f+644`) — because the next characters may be a qualifier that runs code and
+    a reader that eats a character it should not hides it. Read the way zsh reads them: `L+1` / `mh-1` (a size, an age: `+` is a
+    sign), `f:u+r:` and `u:name:` (a delimited argument), `[1,3]` (a range), `o` followed by its sort key. An unquoted `|` or `~`
+    in the group makes it a pattern (zsh: `*(e|echo hi|)` runs nothing): `*.(test|json)` is no qualifier list; a group that is not at
+    the end of the word is a pattern too."""
+    head, close, rest = s.partition(")")
+    if re.search(r"(?<!\\)[|~]", head) or (close and rest):
+        return False  # (qualifiers are only read at the END of a word: zsh runs nothing for `(e:x:)*`, checked)
     i, n = 0, len(s)
+
+    def digits(at: int) -> int:
+        while at < n and s[at].isdigit():
+            at += 1
+        return at
 
     def argument(at: int) -> int | None:
         """The index after the delimited argument whose delimiter is s[at], or None when it is not terminated."""
@@ -373,54 +383,62 @@ def _group_runs_code(s: str) -> bool:
         i += 1
         if c == ")":
             return False
-        if c == "\\":
-            i += 1
-        elif c == "+":
-            return True  # `+name`: runs the function `name`
-        elif c == "e":
-            if i >= n:
-                return not closed
-            j = argument(i)
-            if j is None:
-                return not closed
-            return True  # `e:code:` is terminated: it runs
+        if c in _QUALIFIER_FLAGS:
+            continue
         if c in "Lmac":
-            if i < n and s[i] in ("kKmMgGtTpP" if c == "L" else "smhdwM"):
+            if i < n and s[i] in (_SIZE_UNITS if c == "L" else _TIME_UNITS):
                 i += 1
             if i < n and s[i] in "+-":
-                sign = s[i]
                 i += 1
-                if sign == "+" and not (i < n and s[i].isdigit()):
-                    return True  # `m+f`: not a number after the sign
-            while i < n and s[i].isdigit():
-                i += 1
+            j = digits(i)
+            if j == i:
+                return True  # a sign or a unit without a number (`m+f`, `Le`)
+            i = j
         elif c in "fugd":
-            if i < n and s[i].isdigit():
-                while i < n and s[i].isdigit():
-                    i += 1
-            elif i < n and s[i] != ")":
-                j = argument(i)
+            if i >= n or s[i] == ")":
+                return True
+            if s[i].isdigit():
+                i = digits(i)
+            elif c == "f" and s[i] in "=+-?":
+                j = digits(i + 1)  # `f=644`, `f+644`, `f-644`, `f?644`: an octal mode with a sign; no digits: unknown form
+                if j == i + 1:
+                    return True
+                i = j
+            else:
+                j = argument(i)  # `f:u+r:`, `u:name:`: skipped; one that is not terminated hides what follows
                 if j is None:
-                    return not closed
+                    return True
                 i = j
         elif c in "oO":
-            if i < n and s[i] in "nLlmacdz":
-                i += 1
-        elif c == "[":
-            j = s.find("]", i)
-            if j < 0:
-                return not closed
-            i = j + 1
-        elif c == "%" and i < n and s[i] in "bcs":
+            if i >= n or s[i] not in _QUALIFIER_SORT_KEYS:
+                return True  # `oe:code:`, `o+func` and anything else
             i += 1
+        elif c == "[":
+            m = re.match(r"-?\d+(?:,-?\d+)?\]", s[i:])
+            if not m:
+                return True
+            i += m.end()
+        elif c == "%":
+            if i < n and s[i] in "bcs":
+                i += 1
+        elif c == "Y":
+            j = digits(i)
+            if j == i:
+                return True
+            i = j
+        else:
+            return True  # `e`, `+`, an escape, a letter that is no qualifier: refused
     return False
 
 
-def _qualifier_code(raw: str) -> bool:
-    """Does a group in this text read as a glob qualifier list that runs code (`_group_runs_code`), or does `(#q` start one?"""
+def _qualifier_code(raw: str, word_start: bool = False) -> bool:
+    """Does a group in this text read as a glob qualifier list that runs code (`_group_runs_code`), or does `(#q` start one?
+    A `(` that begins the word (`foreach f (a b)`) follows no pattern: it is no qualifier."""
     if "(#q" in raw:
         return True
-    return any(_group_runs_code(raw[m.end() :]) for m in re.finditer(r"(?<!\\)\(", raw))
+    return any(
+        _group_runs_code(raw[m.end() :]) for m in re.finditer(r"(?<!\\)\(", raw) if not (word_start and m.start() == 0)
+    )
 
 
 def _has_glob(raw: str) -> bool:
@@ -638,7 +656,7 @@ def _word(node: dict) -> Word:
                 # zsh only: a glob qualifier `*(.)` / `*(e:code:)` / `*(+func)` is kept by shfmt as plain text, it has no
                 # node. Whether it runs code is never read from its separators: any `e`, any `+`, any `#q` inside counts
                 kinds.add("zsh")
-                if _qualifier_code(raw):
+                if _qualifier_code(raw, i == 0):
                     kinds.add("zsh-code")
             if _has_glob(raw):
                 kinds.add("glob")

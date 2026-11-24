@@ -2026,6 +2026,33 @@ class TestRound8(Base):
             with self.subTest(command):
                 self.deny(command)
 
+    def test_qualifier_reader_never_hides_a_qualifier_that_runs_code(self):
+        """Fail closed: after ANY readable qualifier (with its argument in every form zsh knows), a following `e:x:` or `+g` is
+        found; a qualifier the reader cannot read ends in a refusal, never in a skipped part. (zsh: `*(f=644e:x:)` runs x.)"""
+        readable = (
+            "/", ".", "@", "=", "p", "*", "r", "w", "x", "A", "I", "E", "R", "W", "X", "s", "S", "t", "N", "D", "M", "T", "n", "^",
+            "-", ",", "%", "%b", "%c", "%s", "L0", "L+1", "L-1", "Lk+1", "Lm1", "LP-2", "m1", "m-1", "m+1", "mh-1", "mM+2", "a+0", "ad1",
+            "cw-3", "f644", "f=644", "f+644", "f-644", "f?644", "f:u+rw:", "f:gu+w,o-rx:", "u501", "u:root:", "g100", "g:wheel:",
+            "d12", "d:dev:", "on", "On", "oN", "oL", "om", "oa", "oc", "od", "oz", "ol", "[1]", "[1,3]", "[-1]", "[2,-1]", "Y3",
+        )
+        for prefix in readable:
+            self.assertFalse(shell._group_runs_code(prefix + ")"), prefix)
+            for suffix in ("e:x:", "+g", "e,x,", "e/x/", "e!x!"):
+                self.assertTrue(shell._group_runs_code(prefix + suffix + ")"), prefix + suffix)
+                self.assertTrue(shell._group_runs_code("." + prefix + "N" + suffix + ")"), prefix + suffix)
+                for other in ("/", "L+1", "f=644", "f:u+r:", "om"):
+                    self.assertTrue(shell._group_runs_code(prefix + other + suffix + ")"), (prefix, other, suffix))
+        for broken in ("f=", "f+", "f-e:x:", "f?e:x:", "Le:x:", "L+e:x:", "m+e:x:", "oe:x:", "o+f", "o", "u", "u:root", "f:u+r", "[1", "Qe:x:", "\\e:x:"):
+            self.assertTrue(shell._group_runs_code(broken + ")"), broken)
+
+    def test_qualifier_with_a_mode_sign_is_not_skipped(self):
+        for command in (
+            "ls *(f=644e:'echo hi':)", "ls *(f-644e:'echo hi':)", "ls *(f+644+g)", "ls *(f?644e:'echo hi':)", "ls *(f:u+rw:e:'echo hi':)",
+            "ls *(f:u+rw:+g)", "ls *(.f=644+g)",
+        ):
+            with self.subTest(command):
+                self.deny(command)
+
 
 if __name__ == "__main__":
     unittest.main()
