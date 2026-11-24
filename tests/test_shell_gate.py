@@ -2297,6 +2297,26 @@ class TestRound9(Base):
             'for f in *.csv; do cat "$f" >> out.txt; done', '$c; for f in *.csv; do cat "$f"; done',
             'f() { ln -s x z.csv; }; f; for g in *.csv; do cat "$g"; done', 'alias a=ln; a -s x z.csv; for g in *.csv; do cat "$g"; done',
             'for f in *.csv; do $cmd "$f"; done',
+            # wrappers, launchers and other programs that make files (the line is refused unless every call is on the list)
+            'env ln -s "$(echo ../Sensitive-data)/people.csv" z.csv; for f in *.csv; do cat "$f"; done',
+            'command ln -s ../Sensitive-data/people.csv z.csv; for f in *.csv; do cat "$f"; done',
+            "eval 'ln -s ../Sensitive-data/people.csv z.csv'; for f in *.csv; do cat \"$f\"; done",
+            'find . -maxdepth 0 -exec ln -s ../Sensitive-data/people.csv z.csv \\;; for f in *.csv; do cat "$f"; done',
+            'echo z.csv | xargs ln -s ../Sensitive-data/people.csv; for f in *.csv; do cat "$f"; done',
+            'busybox ln -s x z.csv; for f in *.csv; do cat "$f"; done', 'xz -d a.xz; for f in *.csv; do cat "$f"; done',
+            'zstd -d a.zst; for f in *.csv; do cat "$f"; done', 'bunzip2 a.bz2; for f in *.csv; do cat "$f"; done',
+            'cpio -i < a; for f in *.csv; do cat "$f"; done', 'bsdtar xf a; for f in *.csv; do cat "$f"; done',
+            'patch < a.diff; for f in *.csv; do cat "$f"; done', "awk 'BEGIN{system(\"ln -s x z.csv\")}'; for f in *.csv; do cat \"$f\"; done",
+            "sed 'w z.csv' a; for f in *.csv; do cat \"$f\"; done", "sed 's/a/b/w z.csv' a; for f in *.csv; do cat \"$f\"; done",
+            "sed -f s.sed a; for f in *.csv; do cat \"$f\"; done", "sed 'e' a; for f in *.csv; do cat \"$f\"; done",
+            "sed -n '1e ln -s x z.csv' a; for f in *.csv; do cat \"$f\"; done", 'sort -o z.csv a; for f in *.csv; do cat "$f"; done',
+            'uniq a z.csv; for f in *.csv; do cat "$f"; done', 'rg --pre ./x foo a; for f in *.csv; do cat "$f"; done',
+            'yq -i . a.yml; for f in *.csv; do cat "$f"; done', 'git diff --output=z.csv; for f in *.csv; do cat "$f"; done',
+            'ruff check --fix .; for f in *.csv; do cat "$f"; done', 'sudo ln -s x z.csv; for f in *.csv; do cat "$f"; done',
+            'nohup ln -s x z.csv; for f in *.csv; do cat "$f"; done', 'timeout 5 ln -s x z.csv; for f in *.csv; do cat "$f"; done',
+            'source ./f.sh; for f in *.csv; do cat "$f"; done', '. ./f.sh; for f in *.csv; do cat "$f"; done',
+            'exec ln -s x z.csv; for f in *.csv; do cat "$f"; done', 'prog; for f in *.csv; do cat "$f"; done',
+            'for f in *.csv; do git -C d status; git commit -a; done', 'for f in *.csv; do python3 -m pip install x; done',
         ):
             with self.subTest(command):
                 self.deny(command)
@@ -2306,7 +2326,9 @@ class TestRound9(Base):
             "for f in *.csv; do [ -f \"$f\" ] && echo y; done", "for f in *.md; do sed -i 's/a/b/' \"$f\"; done",
             'for f in *.py; do python3 -m py_compile "$f"; done', 'for f in *.json; do python3 -m json.tool "$f"; done',
             'for d in x*/; do (cd "$d" && git status -s); done', 'for f in *.sh; do shellcheck "$f"; done',
-            'for f in *.png; do convert "$f" "${f%.png}.jpg"; done', 'for f in *.md; do rg foo "$f"; done',
+            'for f in *.md; do rg foo "$f"; done', "for f in *.md; do sed -n '1,3p' \"$f\"; done",
+            "for f in *.md; do sed -i.bak -e 's/a/b/g' \"$f\"; done", 'for f in *.md; do git -C d log -1; done',
+            'for f in *.py; do ruff check "$f"; done', 'for f in *.yml; do yq .a "$f"; done', 'for f in *.csv; do sort -u "$f"; done',
         ):
             with self.subTest(command):
                 self.allow(command)

@@ -145,14 +145,21 @@ ZSH_FLAGS = re.compile(r"\$\{[#^~=+]*\(([^)]*)\)")  # `${(flags)name}`
 ZSH_QUALIFIER = re.compile(r"\((?:#q|[^()\s|]*?(?:e[^\w|)\s(]|\+[A-Za-z_]))")
 CD_MATCHES = 64  # directories a `cd PATTERN` is followed into
 CHECKSUM_PROGRAMS = {"md5sum", "sha1sum", "sha224sum", "sha256sum", "sha384sum", "sha512sum", "b2sum", "cksum"}
-# commands that can create or replace a file, in a line with a loop over a glob: the pattern is expanded when the line RUNS, so a file
-# they make can be what it matches
-GLOB_LOOP_CREATORS = {
-    "ln", "cp", "mv", "rename", "touch", "install", "mkfifo", "mknod", "tee", "rsync", "scp", "tar", "unzip", "7z", "7za", "7zr",
-    "gunzip", "gzip", "ditto", "dd", "curl", "wget", "make", "npm", "npx", "pnpm", "yarn", "uv", "alias", "unalias", "function",
+# In a line with a loop over a glob (sensitive source configured) EVERY call must be on this list, or the line is refused: the pattern
+# is expanded when the line RUNS, so a file that any other command makes (directly, behind a wrapper, a launcher, `find -exec`, `xargs`,
+# `eval`, an interpreter, `awk`, a downloader, an archiver…) can be what it matches. A program is listed only when nothing it does with
+# the options the line gives it writes a file or runs a command; the ones with such an option have their options checked below.
+GLOB_LOOP_PROGRAMS = {
+    "echo", "printf", "cat", "head", "tail", "wc", "grep", "egrep", "fgrep", "rg", "basename", "dirname", "ls", "stat", "file", "sort",
+    "uniq", "cut", "tr", "test", "[", "[[", "true", "false", ":", "pwd", "date", "read", "shift", "jq", "yq", "diff", "cmp", "du",
+    "realpath", "readlink", "nl", "column", "seq", "cd", "pushd", "popd", "break", "continue", "exit", "return", "let", "expr", "sed",
+    "shellcheck", "ruff", "git", "python", "python3", *CHECKSUM_PROGRAMS,
 }
-GLOB_LOOP_GIT = {"checkout", "restore", "switch", "reset", "stash", "apply", "am", "pull", "clone", "worktree"}
-GLOB_LOOP_INTERPRETERS = re.compile(r"(?:python[\d.]*|node|nodejs|perl|ruby|php|sh|bash|zsh|dash|ksh)")
+GLOB_LOOP_GIT = {"status", "diff", "log", "show", "ls-files", "blame", "rev-parse"}
+# `sed` scripts without a command that writes or runs something: addresses, then `s/…/…/flags`, `d`, `p`, `y/…/…/`, joined by `;`
+_SED_SAFE = re.compile(
+    r"\s*(?:[0-9$]+(?:,[0-9$]+)?!?\s*)?(?:s/(?:[^/\\;]|\\.)*/(?:[^/\\;]|\\.)*/[gpiI0-9]*|[dpP=]|y/[^/\\;]*/[^/\\;]*/)\s*"
+)
 # what a `trap` body must not hold: a definition of a function, an alias or any other code (the body runs later, in this shell)
 TRAP_DEFINES = re.compile(
     r"\w\s*\(\s*\)|\bfunction\b|\b(?:alias|unalias|functions|aliases|galiases|saliases|eval|source|autoload|emulate|enable|disable|hash|"
@@ -1666,33 +1673,70 @@ class Gate:
             if not isinstance(t, QuotedToken)
         ) or any(tokens[k + 1 : k + 3] == ["(", ")"] or tokens[k] == "function" for k in range(len(tokens)))
         if not creates:
-            creates = any(self._may_create_files(st) for st in self._simple_stages(tokens))
+            creates = not all(self._glob_loop_call_ok(st) for st in self._simple_stages(tokens))
         if creates:
             return Reason(
                 "piigate: command denied — a loop over a glob in a line that may create or replace files (a link, a copy, `touch`, a "
-                "download, an archive, `git checkout`, an interpreter that runs code, a redirection, a function or an alias, a "
-                f"command whose name is built): the pattern is expanded when the line runs, not now. {HINT}",
+                "download, an archive, `git checkout`, an interpreter, a wrapper, a redirection, a function or an alias, any "
+                f"program the gate does not know to write nothing): the pattern is expanded when the line runs, not now. {HINT}",
                 "glob-loop-writes",
             )
         return None
 
     @staticmethod
-    def _may_create_files(st: list[str]) -> bool:
+    def _sed_ok(args: list[str]) -> bool:
+        scripts, skip, operands = [], False, []
+        for k, t in enumerate(args):
+            if skip:
+                skip = False
+                continue
+            if t in ("-e", "--expression"):
+                if k + 1 >= len(args):
+                    return False
+                scripts.append(args[k + 1])
+                skip = True
+            elif re.fullmatch(r"-[nEr]+|-i[^\s=]*|--in-place|--quiet|--silent|--regexp-extended", t):
+                continue
+            elif t.startswith("-") and t != "-":
+                return False  # -f, --file, -s, -z, --follow-symlinks, --expression=…: unknown
+            else:
+                operands.append(t)
+        if not scripts:
+            scripts = operands[:1]
+        return bool(scripts) and all(
+            all(_SED_SAFE.fullmatch(part) for part in re.split(r";", sc)) for sc in scripts
+        )
+
+    @staticmethod
+    def _glob_loop_call_ok(st: list[str]) -> bool:
+        """Is this call on the list of programs that create nothing and run nothing (`GLOB_LOOP_PROGRAMS`), with options that keep it so?"""
         name = str(st[0])
-        if isinstance(st[0], QuotedToken) and ("$" in name or "`" in name) or "$" in name or "`" in name:
-            return True
+        if "$" in name or "`" in name or (os.sep in name and os.path.dirname(name) not in ("/usr/bin", "/bin", "/usr/local/bin")):
+            return False
         base = Path(name).name
+        if base not in GLOB_LOOP_PROGRAMS:
+            return False
         args = [str(t) for t in st[1:]]
-        if base in GLOB_LOOP_CREATORS:
-            return True
+        if base == "sed":
+            return Gate._sed_ok(args)
         if base == "git":
             k = 0
-            while k < len(args) and args[k].startswith("-"):
-                k += 2 if args[k] in ("-C", "-c") else 1
-            return k < len(args) and args[k] in GLOB_LOOP_GIT
-        if GLOB_LOOP_INTERPRETERS.fullmatch(base):
-            return not (base.startswith("python") and args[:2] in (["-m", "py_compile"], ["-m", "json.tool"]))
-        return False
+            while k < len(args) and args[k] in ("-C", "--no-pager"):
+                k += 2 if args[k] == "-C" else 1
+            return k < len(args) and args[k] in GLOB_LOOP_GIT and not any(a.startswith("--output") for a in args)
+        if base in ("python", "python3"):
+            return args[:2] in (["-m", "py_compile"], ["-m", "json.tool"])
+        if base == "yq":
+            return not any(re.fullmatch(r"-[^-]*i[^-]*|--inplace", a) for a in args)
+        if base == "ruff":
+            return args[:1] == ["check"] and not any(a.startswith(("--fix", "--add-noqa", "--unsafe")) for a in args)
+        if base == "sort":
+            return not any(re.fullmatch(r"-[^-]*o.*|--o.*|--compress-program.*", a) for a in args)
+        if base == "uniq":
+            return len([a for a in args if not a.startswith("-")]) <= 1
+        if base == "rg":
+            return not any(a.startswith(("--p", "--hostname", "--search-zip")) or re.fullmatch(r"-[^-]*z[^-]*", a) for a in args)
+        return True
 
     @staticmethod
     def _spelled_qualifier(text: str, i: int) -> bool:
